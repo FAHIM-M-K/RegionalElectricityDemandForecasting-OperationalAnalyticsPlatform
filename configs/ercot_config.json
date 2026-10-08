@@ -1,0 +1,60 @@
+{
+  "region": {
+    "code": "ERCO",
+    "name": "Electric Reliability Council of Texas",
+    "timezone": "America/Chicago",
+    "default_peak_threshold_mw": 75000.0
+  },
+  "eia": {
+    "base_url": "https://api.eia.gov/v2/",
+    "route": "electricity/rto/region-data/data/",
+    "respondent": "ERCO",
+    "series_types": ["D", "DF"],
+    "frequency": "hourly",
+    "page_size": 5000,
+    "default_start_date": "2021-01-01T00"
+  },
+  "weather": {
+    "archive_base_url": "https://archive-api.open-meteo.com/v1/archive",
+    "forecast_base_url": "https://api.open-meteo.com/v1/forecast",
+    "hourly_variables": [
+      "temperature_2m",
+      "relative_humidity_2m",
+      "dew_point_2m",
+      "apparent_temperature",
+      "precipitation",
+      "wind_speed_10m",
+      "direct_normal_irradiance"
+    ],
+    "stations": [
+      {
+        "station_id": "houston",
+        "name": "Houston",
+        "latitude": 29.7604,
+        "longitude": -95.3698,
+        "weight": 0.35
+      },
+      {
+        "station_id": "dfw",
+        "name": "Dallas-Fort Worth",
+        "latitude": 32.7767,
+        "longitude": -96.7970,
+        "weight": 0.35
+      },
+      {
+        "station_id": "san_antonio",
+        "name": "San Antonio",
+        "latitude": 29.4241,
+        "longitude": -98.4936,
+        "weight": 0.15
+      },
+      {
+        "station_id": "austin",
+        "name": "Austin",
+        "latitude": 30.2672,
+        "longitude": -97.7431,
+        "weight": 0.15
+      }
+    ]
+  }
+}
