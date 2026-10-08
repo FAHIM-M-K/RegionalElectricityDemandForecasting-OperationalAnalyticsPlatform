@@ -27,15 +27,31 @@ import urllib.parse
 from pyspark.sql import functions as F
 
 CATALOG = dbutils.widgets.get("catalog").strip()
-EIA_API_KEY = dbutils.widgets.get("eia_api_key").strip()
 INGEST_MODE = dbutils.widgets.get("ingest_mode").strip()
 BACKFILL_START = dbutils.widgets.get("backfill_start_date").strip()
 INCREMENTAL_DAYS = int(dbutils.widgets.get("incremental_days").strip())
 
+# Retrieve API Key securely: Secret Scope -> Cluster Env Var -> Optional Widget
+EIA_API_KEY = None
+try:
+    EIA_API_KEY = dbutils.secrets.get(scope="ercot_platform", key="eia_api_key")
+except Exception:
+    pass
+
 if not EIA_API_KEY:
     EIA_API_KEY = os.getenv("EIA_API_KEY", "")
 
-assert EIA_API_KEY, "EIA_API_KEY is required to fetch EIA data."
+if not EIA_API_KEY:
+    try:
+        EIA_API_KEY = dbutils.widgets.get("eia_api_key").strip()
+    except Exception:
+        pass
+
+assert EIA_API_KEY, (
+    "EIA_API_KEY is required. Configure it via Databricks Secret Scope "
+    "(scope='ercot_platform', key='eia_api_key'), cluster environment variable 'EIA_API_KEY', "
+    "or provide it in the widget."
+)
 
 spark.sql(f"USE CATALOG {CATALOG}")
 spark.sql("USE SCHEMA bronze")
