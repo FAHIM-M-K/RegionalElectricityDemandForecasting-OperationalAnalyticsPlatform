@@ -34,7 +34,7 @@ INCREMENTAL_DAYS = int(dbutils.widgets.get("incremental_days").strip())
 # Retrieve API Key securely: Secret Scope -> Cluster Env Var -> Optional Widget
 EIA_API_KEY = None
 try:
-    EIA_API_KEY = dbutils.secrets.get(scope="ercot_platform", key="eia_api_key")
+    EIA_API_KEY = dbutils.secrets.get(scope="grid_platform", key="eia_api_key")
 except Exception:
     pass
 
@@ -49,7 +49,7 @@ if not EIA_API_KEY:
 
 assert EIA_API_KEY, (
     "EIA_API_KEY is required. Configure it via Databricks Secret Scope "
-    "(scope='ercot_platform', key='eia_api_key'), cluster environment variable 'EIA_API_KEY', "
+    "(scope='grid_platform', key='eia_api_key'), cluster environment variable 'EIA_API_KEY', "
     "or provide it in the widget."
 )
 
