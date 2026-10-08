@@ -142,8 +142,12 @@ if eia_data:
         json.dump(eia_data, f)
     print(f"Archived raw source payload to Volume: {raw_file_path}")
 
-    # 2. Convert to Spark DataFrame & attach provenance metadata
+    # 2. Convert to Spark DataFrame & sanitize hyphenated column names (e.g., type-name -> type_name)
     df_raw = spark.createDataFrame(eia_data)
+    for c in df_raw.columns:
+        if "-" in c:
+            df_raw = df_raw.withColumnRenamed(c, c.replace("-", "_"))
+
     df_bronze = df_raw \
         .withColumn("_ingested_at_utc", F.current_timestamp()) \
         .withColumn("_source", F.lit("EIA_v2_region_data")) \

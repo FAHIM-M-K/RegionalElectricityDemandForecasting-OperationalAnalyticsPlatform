@@ -15,6 +15,7 @@ dbutils.widgets.text("backfill_start_date", "2021-01-01", "Backfill Start Date (
 dbutils.widgets.text("incremental_days", "14", "Incremental Lookback (Days)")
 
 # COMMAND ----------
+import os
 import json
 import time
 import datetime
