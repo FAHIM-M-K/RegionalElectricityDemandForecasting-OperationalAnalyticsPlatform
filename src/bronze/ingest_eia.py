@@ -126,19 +126,30 @@ def fetch_eia_records(api_key: str, start: str, end: str, page_size: int = 5000)
     return records
 
 # COMMAND ----------
-# DBTITLE 1,Fetch & Land into Bronze Delta Table
+# DBTITLE 1,Land Raw to Volume & Append to Bronze Delta Table
 eia_data = fetch_eia_records(EIA_API_KEY, start_param, end_param)
 print(f"Total EIA records fetched: {len(eia_data)}")
 
 if eia_data:
-    df_raw = spark.createDataFrame(eia_data)
+    # 1. Production Landing: Save raw JSON payload to Volume for replayability & audit
+    raw_landing_dir = f"/Volumes/{CATALOG}/bronze/raw_landing/eia"
+    os.makedirs(raw_landing_dir, exist_ok=True)
+    timestamp_epoch = int(time.time())
+    raw_file_name = f"eia_erco_{start_date_str}_{end_date_str}_{timestamp_epoch}.json"
+    raw_file_path = f"{raw_landing_dir}/{raw_file_name}"
     
-    # Audit metadata
+    with open(raw_file_path, "w", encoding="utf-8") as f:
+        json.dump(eia_data, f)
+    print(f"Archived raw source payload to Volume: {raw_file_path}")
+
+    # 2. Convert to Spark DataFrame & attach provenance metadata
+    df_raw = spark.createDataFrame(eia_data)
     df_bronze = df_raw \
         .withColumn("_ingested_at_utc", F.current_timestamp()) \
-        .withColumn("_source", F.lit("EIA_v2_region_data"))
+        .withColumn("_source", F.lit("EIA_v2_region_data")) \
+        .withColumn("_raw_payload_path", F.lit(raw_file_path))
     
-    # Append to Bronze table
+    # 3. Append to Bronze Delta table
     df_bronze.write \
         .format("delta") \
         .mode("append") \

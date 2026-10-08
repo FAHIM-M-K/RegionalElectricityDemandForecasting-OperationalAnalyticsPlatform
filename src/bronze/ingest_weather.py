@@ -102,13 +102,27 @@ for st in weather_stations:
 print(f"Total weather station hourly records fetched: {len(all_weather_rows)}")
 
 # COMMAND ----------
-# DBTITLE 1,Write to Bronze Delta Table
+# DBTITLE 1,Land Raw to Volume & Append to Bronze Delta Table
 if all_weather_rows:
+    # 1. Production Landing: Save raw multi-station weather payload to Volume
+    raw_weather_dir = f"/Volumes/{CATALOG}/bronze/raw_landing/weather"
+    os.makedirs(raw_weather_dir, exist_ok=True)
+    timestamp_epoch = int(time.time())
+    raw_weather_file = f"weather_ercot_panel_{start_date_str}_{end_date_str}_{timestamp_epoch}.json"
+    raw_weather_path = f"{raw_weather_dir}/{raw_weather_file}"
+    
+    with open(raw_weather_path, "w", encoding="utf-8") as f:
+        json.dump(all_weather_rows, f)
+    print(f"Archived raw weather payload to Volume: {raw_weather_path}")
+
+    # 2. Convert to Spark DataFrame & attach provenance metadata
     df_weather = spark.createDataFrame(all_weather_rows)
     df_bronze_weather = df_weather \
         .withColumn("_ingested_at_utc", F.current_timestamp()) \
-        .withColumn("_source", F.lit("Open-Meteo-Archive"))
+        .withColumn("_source", F.lit("Open-Meteo-Archive")) \
+        .withColumn("_raw_payload_path", F.lit(raw_weather_path))
         
+    # 3. Append to Bronze Delta table
     df_bronze_weather.write \
         .format("delta") \
         .mode("append") \
