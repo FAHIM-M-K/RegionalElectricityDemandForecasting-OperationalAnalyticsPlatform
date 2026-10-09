@@ -44,6 +44,41 @@ spark.sql(f"USE CATALOG {CATALOG}")
 spark.sql("USE SCHEMA bronze")
 
 # COMMAND ----------
+# DBTITLE 1,Load Configuration & Establish Boundaries
+def load_platform_config(filename="ercot_config.json"):
+    # 1. Search relative to current working directory and parent paths
+    curr = os.getcwd()
+    for _ in range(5):
+        test_path = os.path.join(curr, "configs", filename)
+        if os.path.exists(test_path):
+            with open(test_path, "r", encoding="utf-8") as f:
+                print(f"Loaded platform config from {test_path}")
+                return json.load(f)
+        parent = os.path.dirname(curr)
+        if parent == curr:
+            break
+        curr = parent
+        
+    # 2. Check if running inside Databricks Repos
+    repo_candidate = f"/Workspace/Repos/configs/{filename}"
+    if os.path.exists(repo_candidate):
+        with open(repo_candidate, "r", encoding="utf-8") as f:
+            print(f"Loaded platform config from {repo_candidate}")
+            return json.load(f)
+            
+    raise FileNotFoundError(
+        f"Critical Configuration Error: Could not locate 'configs/{filename}'. "
+        "Ensure the repository is synced properly in Databricks Repos."
+    )
+
+config = load_platform_config("ercot_config.json")
+eia_cfg = config.get("eia", {})
+EIA_RESPONDENT = eia_cfg.get("respondent", "ERCO")
+EIA_SERIES_TYPES = eia_cfg.get("series_types", ["D", "DF"])
+EIA_PAGE_SIZE = eia_cfg.get("page_size", 5000)
+EIA_BASE_URL = urllib.parse.urljoin(eia_cfg.get("base_url", "https://api.eia.gov/v2/"), eia_cfg.get("route", "electricity/rto/region-data/data/"))
+
+# COMMAND ----------
 # DBTITLE 1,High-Water Mark: Auto-Detect Full Load vs Incremental
 now_utc = datetime.datetime.now(datetime.timezone.utc)
 end_date_str = now_utc.strftime("%Y-%m-%d")
@@ -63,40 +98,65 @@ start_param = f"{start_date_str}T00"
 end_param = f"{end_date_str}T23"
 
 # COMMAND ----------
-# DBTITLE 1,Paginated EIA API Client
-eia_base_url = "https://api.eia.gov/v2/electricity/rto/region-data/data/"
-
-def fetch_eia_records(api_key: str, start: str, end: str, page_size: int = 5000):
-    records = []
+# DBTITLE 1,Paginated EIA API Client with Full Envelope Preservation
+def fetch_eia_dataset(api_key: str, start: str, end: str, series_types: list, respondent: str = "ERCO", page_size: int = 5000):
+    """
+    Fetches EIA records with pagination and retry backoff.
+    Returns:
+      - all_records: extracted list of row dictionaries for Bronze ingestion
+      - raw_responses: list of raw response JSON envelopes for raw landing archive
+    """
+    all_records = []
+    raw_responses = []
     offset = 0
     
     while True:
-        params = {
-            "api_key": api_key,
-            "frequency": "hourly",
-            "data[0]": "value",
-            "facets[respondent][]": "ERCO",
-            "start": start,
-            "end": end,
-            "sort[0][column]": "period",
-            "sort[0][direction]": "asc",
-            "offset": offset,
-            "length": page_size
-        }
+        # Build query params including explicit series facets (e.g. facets[type][]=D & facets[type][]=DF)
+        query_params = [
+            ("api_key", api_key),
+            ("frequency", "hourly"),
+            ("data[0]", "value"),
+            ("facets[respondent][]", respondent),
+            ("start", start),
+            ("end", end),
+            ("sort[0][column]", "period"),
+            ("sort[0][direction]", "asc"),
+            ("offset", str(offset)),
+            ("length", str(page_size))
+        ]
         
-        query = urllib.parse.urlencode(params)
-        req = urllib.request.Request(f"{eia_base_url}?{query}", headers={"User-Agent": "ERCOT-Platform/1.0"})
+        # Explicitly filter only targeted series types (D: Demand, DF: Day-ahead Forecast)
+        for stype in series_types:
+            query_params.append(("facets[type][]", stype))
+            
+        encoded_query = urllib.parse.urlencode(query_params)
+        request_url = f"{EIA_BASE_URL}?{encoded_query}"
+        req = urllib.request.Request(request_url, headers={"User-Agent": "ERCOT-Platform/1.0"})
         
+        payload = None
         for attempt in range(1, 4):
             try:
                 with urllib.request.urlopen(req, timeout=30) as resp:
-                    payload = json.loads(resp.read().decode("utf-8"))
+                    raw_text = resp.read().decode("utf-8")
+                    payload = json.loads(raw_text)
                     break
             except Exception as e:
                 if attempt == 3:
                     raise RuntimeError(f"EIA API request failed at offset {offset}: {e}")
                 time.sleep(2 * attempt)
                 
+        # Preserve sanitized query params (excluding api_key) for complete audit trail & replayability
+        sanitized_params = {k: v for k, v in query_params if k != "api_key"}
+        
+        raw_responses.append({
+            "offset": offset,
+            "page_size": page_size,
+            "request_url_endpoint": EIA_BASE_URL,
+            "request_params_sanitized": sanitized_params,
+            "fetched_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "response_envelope": payload
+        })
+        
         resp_obj = payload.get("response", {})
         batch = resp_obj.get("data", [])
         total = int(resp_obj.get("total", 0))
@@ -104,23 +164,31 @@ def fetch_eia_records(api_key: str, start: str, end: str, page_size: int = 5000)
         if not batch:
             break
             
-        records.extend(batch)
+        all_records.extend(batch)
         offset += len(batch)
-        print(f"  Retrieved {offset} / {total} records...")
+        print(f"  Retrieved {offset} / {total} records (Series: {series_types})...")
         
         if offset >= total:
             break
         time.sleep(0.3)
         
-    return records
+    return all_records, raw_responses
 
 # COMMAND ----------
-# DBTITLE 1,Land Raw to Volume & Append to Bronze Delta Table
-eia_data = fetch_eia_records(EIA_API_KEY, start_param, end_param)
-print(f"Total EIA records fetched: {len(eia_data)}")
+# DBTITLE 1,Execute Fetch, Land Raw Envelope to Volume & Upsert Bronze
+records, raw_payloads = fetch_eia_dataset(
+    api_key=EIA_API_KEY,
+    start=start_param,
+    end=end_param,
+    series_types=EIA_SERIES_TYPES,
+    respondent=EIA_RESPONDENT,
+    page_size=EIA_PAGE_SIZE
+)
 
-if eia_data:
-    # 1. Production Landing: Save raw JSON payload to Volume for replayability & audit
+print(f"Total EIA records retrieved: {len(records)} across {len(raw_payloads)} API pages.")
+
+if records:
+    # 1. Raw Archival: Store COMPLETE response payloads (envelope + sanitized request params + pagination)
     raw_landing_dir = f"/Volumes/{CATALOG}/bronze/raw_landing/eia"
     os.makedirs(raw_landing_dir, exist_ok=True)
     timestamp_epoch = int(time.time())
@@ -128,11 +196,11 @@ if eia_data:
     raw_file_path = f"{raw_landing_dir}/{raw_file_name}"
     
     with open(raw_file_path, "w", encoding="utf-8") as f:
-        json.dump(eia_data, f)
-    print(f"Archived raw source payload to Volume: {raw_file_path}")
+        json.dump(raw_payloads, f)
+    print(f"Archived authentic raw API responses to Volume: {raw_file_path}")
 
-    # 2. Convert to Spark DataFrame & sanitize hyphenated column names (e.g., type-name -> type_name)
-    df_raw = spark.createDataFrame(eia_data)
+    # 2. Convert to Spark DataFrame & sanitize column names
+    df_raw = spark.createDataFrame(records)
     for c in df_raw.columns:
         if "-" in c:
             df_raw = df_raw.withColumnRenamed(c, c.replace("-", "_"))
@@ -142,9 +210,27 @@ if eia_data:
         .withColumn("_source", F.lit("EIA_v2_region_data")) \
         .withColumn("_raw_payload_path", F.lit(raw_file_path))
     
-    # 3. Idempotent Upsert into Bronze Delta table
+    # 3. Data Integrity & Completeness Assertions
     source_deduped = df_bronze.dropDuplicates(["respondent", "period", "type"])
     
+    null_key_count = source_deduped.filter(
+        F.col("respondent").isNull() | F.col("period").isNull() | F.col("type").isNull()
+    ).count()
+    assert null_key_count == 0, f"Integrity Failure: Found {null_key_count} records with null primary keys."
+    
+    distinct_types = set(row["type"] for row in source_deduped.select("type").distinct().collect())
+    
+    # Assert that no unexpected types entered Bronze
+    for t in distinct_types:
+        assert t in EIA_SERIES_TYPES, f"Schema Leak: Found unexpected series type '{t}' not in {EIA_SERIES_TYPES}."
+        
+    # Assert that ALL expected types are present in the batch
+    for expected_type in EIA_SERIES_TYPES:
+        assert expected_type in distinct_types, f"Completeness Failure: Expected series type '{expected_type}' was not returned by EIA API."
+        
+    print(f"Quality Assertions Passed: 0 null keys. All expected series types confirmed present: {distinct_types}")
+
+    # 4. Idempotent Upsert into Bronze Delta table using Null-Safe Equality (<=>)
     if not spark.catalog.tableExists(TABLE_NAME):
         source_deduped.write \
             .format("delta") \
@@ -158,14 +244,15 @@ if eia_data:
             "AND target.period = source.period "
             "AND target.type = source.type"
         )
+        # Null-safe inequality: updates only when value actually changed (handles null -> val, val -> null, val -> new_val)
         delta_table.alias("target").merge(
             source_deduped.alias("source"),
             merge_condition
         ).whenMatchedUpdateAll(
-            condition="target.value != source.value OR (target.value IS NULL AND source.value IS NOT NULL)"
+            condition="NOT (target.value <=> source.value)"
         ).whenNotMatchedInsertAll(
         ).execute()
-        print(f"Idempotent MERGE completed on {TABLE_NAME}.")
+        print(f"Idempotent MERGE completed on {TABLE_NAME} (null-safe equality enabled).")
 else:
     print("Warning: No records found for the specified window.")
 
