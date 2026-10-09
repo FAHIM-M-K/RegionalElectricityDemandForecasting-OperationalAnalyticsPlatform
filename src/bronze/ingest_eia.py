@@ -10,13 +10,7 @@
 # MAGIC **Region:** ERCOT (`ERCO`)
 
 # COMMAND ----------
-# DBTITLE 1,Widgets & Parameters
-dbutils.widgets.text("catalog", "main", "Catalog Name")
-dbutils.widgets.dropdown("ingest_mode", "full_backfill", ["full_backfill", "incremental"], "Ingest Mode")
-dbutils.widgets.text("backfill_start_date", "2021-01-01", "Backfill Start Date (YYYY-MM-DD)")
-dbutils.widgets.text("incremental_days", "14", "Incremental Lookback (Days)")
-
-# COMMAND ----------
+# DBTITLE 1,Imports & Configuration
 import os
 import json
 import time
@@ -26,12 +20,12 @@ import urllib.parse
 from pyspark.sql import functions as F
 from delta.tables import DeltaTable
 
-CATALOG = dbutils.widgets.get("catalog").strip()
-INGEST_MODE = dbutils.widgets.get("ingest_mode").strip()
-BACKFILL_START = dbutils.widgets.get("backfill_start_date").strip()
-INCREMENTAL_DAYS = int(dbutils.widgets.get("incremental_days").strip())
+CATALOG = "main"
+TABLE_NAME = f"{CATALOG}.bronze.eia_hourly_raw"
+FULL_HISTORY_START = "2021-01-01"  # Earliest date for initial full load
+RESTATEMENT_BUFFER_DAYS = 5       # Overlap to catch EIA corrections on recent hours
 
-# Retrieve API Key securely: Secret Scope -> Cluster Env Var -> Optional Widget
+# Retrieve API Key securely: Secret Scope -> Cluster Env Var
 EIA_API_KEY = None
 try:
     EIA_API_KEY = dbutils.secrets.get(scope="grid_platform", key="eia_api_key")
@@ -41,37 +35,32 @@ except Exception:
 if not EIA_API_KEY:
     EIA_API_KEY = os.getenv("EIA_API_KEY", "")
 
-if not EIA_API_KEY:
-    try:
-        EIA_API_KEY = dbutils.widgets.get("eia_api_key").strip()
-    except Exception:
-        pass
-
 assert EIA_API_KEY, (
-    "EIA_API_KEY is required. Configure it via Databricks Secret Scope "
-    "(scope='grid_platform', key='eia_api_key'), cluster environment variable 'EIA_API_KEY', "
-    "or provide it in the widget."
+    "EIA_API_KEY is required. Please ensure it is stored in Databricks Secret Scope "
+    "(scope='grid_platform', key='eia_api_key') or as cluster environment variable 'EIA_API_KEY'."
 )
 
 spark.sql(f"USE CATALOG {CATALOG}")
 spark.sql("USE SCHEMA bronze")
 
 # COMMAND ----------
-# DBTITLE 1,Compute Date Window
+# DBTITLE 1,High-Water Mark: Auto-Detect Full Load vs Incremental
 now_utc = datetime.datetime.now(datetime.timezone.utc)
 end_date_str = now_utc.strftime("%Y-%m-%d")
 
-if INGEST_MODE == "full_backfill":
-    start_date_str = BACKFILL_START
+if spark.catalog.tableExists(TABLE_NAME) and spark.table(TABLE_NAME).count() > 0:
+    # Table exists with data: incremental from high-water mark minus restatement buffer
+    max_period = spark.sql(f"SELECT max(period) FROM {TABLE_NAME}").first()[0]
+    hwm_dt = datetime.datetime.strptime(max_period[:10], "%Y-%m-%d") - datetime.timedelta(days=RESTATEMENT_BUFFER_DAYS)
+    start_date_str = hwm_dt.strftime("%Y-%m-%d")
+    print(f"[INCREMENTAL] High-water mark: {max_period}. Fetching from {start_date_str} (with {RESTATEMENT_BUFFER_DAYS}-day restatement buffer).")
 else:
-    # 14 days lookback captures restated / corrected EIA hours
-    start_dt = now_utc - datetime.timedelta(days=INCREMENTAL_DAYS)
-    start_date_str = start_dt.strftime("%Y-%m-%d")
+    # First run or empty table: full historical load
+    start_date_str = FULL_HISTORY_START
+    print(f"[FULL LOAD] No existing data found. Loading full history from {start_date_str}.")
 
 start_param = f"{start_date_str}T00"
 end_param = f"{end_date_str}T23"
-
-print(f"Fetching EIA ERCOT data from {start_param} to {end_param} (Mode: {INGEST_MODE})")
 
 # COMMAND ----------
 # DBTITLE 1,Paginated EIA API Client
@@ -154,17 +143,16 @@ if eia_data:
         .withColumn("_raw_payload_path", F.lit(raw_file_path))
     
     # 3. Idempotent Upsert into Bronze Delta table
-    table_name = f"{CATALOG}.bronze.eia_hourly_raw"
     source_deduped = df_bronze.dropDuplicates(["respondent", "period", "type"])
     
-    if not spark.catalog.tableExists(table_name):
+    if not spark.catalog.tableExists(TABLE_NAME):
         source_deduped.write \
             .format("delta") \
             .mode("overwrite") \
-            .saveAsTable(table_name)
-        print(f"Initialized table {table_name} with {source_deduped.count()} records.")
+            .saveAsTable(TABLE_NAME)
+        print(f"Initialized table {TABLE_NAME} with {source_deduped.count()} records.")
     else:
-        delta_table = DeltaTable.forName(spark, table_name)
+        delta_table = DeltaTable.forName(spark, TABLE_NAME)
         merge_condition = (
             "target.respondent = source.respondent "
             "AND target.period = source.period "
@@ -177,7 +165,7 @@ if eia_data:
             condition="target.value != source.value OR (target.value IS NULL AND source.value IS NOT NULL)"
         ).whenNotMatchedInsertAll(
         ).execute()
-        print(f"Idempotent MERGE completed on {table_name}.")
+        print(f"Idempotent MERGE completed on {TABLE_NAME}.")
 else:
     print("Warning: No records found for the specified window.")
 

@@ -8,13 +8,7 @@
 # MAGIC **Key Features:** Dry-bulb temp, apparent temp, dew point, humidity, wind, solar irradiance.
 
 # COMMAND ----------
-# DBTITLE 1,Widgets & Parameters
-dbutils.widgets.text("catalog", "main", "Catalog Name")
-dbutils.widgets.dropdown("ingest_mode", "full_backfill", ["full_backfill", "incremental"], "Ingest Mode")
-dbutils.widgets.text("backfill_start_date", "2021-01-01", "Backfill Start Date (YYYY-MM-DD)")
-dbutils.widgets.text("incremental_days", "14", "Incremental Lookback (Days)")
-
-# COMMAND ----------
+# DBTITLE 1,Imports & Configuration
 import os
 import json
 import time
@@ -24,26 +18,29 @@ import urllib.parse
 from pyspark.sql import functions as F
 from delta.tables import DeltaTable
 
-CATALOG = dbutils.widgets.get("catalog").strip()
-INGEST_MODE = dbutils.widgets.get("ingest_mode").strip()
-BACKFILL_START = dbutils.widgets.get("backfill_start_date").strip()
-INCREMENTAL_DAYS = int(dbutils.widgets.get("incremental_days").strip())
+CATALOG = "main"
+TABLE_NAME = f"{CATALOG}.bronze.weather_hourly_raw"
+FULL_HISTORY_START = "2021-01-01"  # Earliest date for initial full load
+RESTATEMENT_BUFFER_DAYS = 3       # Overlap to catch weather observation corrections
 
 spark.sql(f"USE CATALOG {CATALOG}")
 spark.sql("USE SCHEMA bronze")
 
 # COMMAND ----------
-# DBTITLE 1,Compute Date Window
+# DBTITLE 1,High-Water Mark: Auto-Detect Full Load vs Incremental
 now_utc = datetime.datetime.now(datetime.timezone.utc)
 end_date_str = now_utc.strftime("%Y-%m-%d")
 
-if INGEST_MODE == "full_backfill":
-    start_date_str = BACKFILL_START
+if spark.catalog.tableExists(TABLE_NAME) and spark.table(TABLE_NAME).count() > 0:
+    # Table exists with data: incremental from high-water mark minus buffer
+    max_time = spark.sql(f"SELECT max(time_utc) FROM {TABLE_NAME}").first()[0]
+    hwm_dt = datetime.datetime.strptime(max_time[:10], "%Y-%m-%d") - datetime.timedelta(days=RESTATEMENT_BUFFER_DAYS)
+    start_date_str = hwm_dt.strftime("%Y-%m-%d")
+    print(f"[INCREMENTAL] High-water mark: {max_time}. Fetching from {start_date_str} (with {RESTATEMENT_BUFFER_DAYS}-day buffer).")
 else:
-    start_dt = now_utc - datetime.timedelta(days=INCREMENTAL_DAYS)
-    start_date_str = start_dt.strftime("%Y-%m-%d")
-
-print(f"Ingesting weather panel from {start_date_str} to {end_date_str}")
+    # First run or empty table: full historical load
+    start_date_str = FULL_HISTORY_START
+    print(f"[FULL LOAD] No existing data found. Loading full history from {start_date_str}.")
 
 # COMMAND ----------
 # DBTITLE 1,Weather Stations Panel Definition
@@ -125,17 +122,16 @@ if all_weather_rows:
         .withColumn("_raw_payload_path", F.lit(raw_weather_path))
         
     # 3. Idempotent Upsert into Bronze Delta table
-    table_name = f"{CATALOG}.bronze.weather_hourly_raw"
     source_deduped = df_bronze_weather.dropDuplicates(["station_id", "time_utc"])
     
-    if not spark.catalog.tableExists(table_name):
+    if not spark.catalog.tableExists(TABLE_NAME):
         source_deduped.write \
             .format("delta") \
             .mode("overwrite") \
-            .saveAsTable(table_name)
-        print(f"Initialized table {table_name} with {source_deduped.count()} records.")
+            .saveAsTable(TABLE_NAME)
+        print(f"Initialized table {TABLE_NAME} with {source_deduped.count()} records.")
     else:
-        delta_table = DeltaTable.forName(spark, table_name)
+        delta_table = DeltaTable.forName(spark, TABLE_NAME)
         merge_condition = (
             "target.station_id = source.station_id "
             "AND target.time_utc = source.time_utc"
@@ -146,7 +142,7 @@ if all_weather_rows:
         ).whenMatchedUpdateAll(
         ).whenNotMatchedInsertAll(
         ).execute()
-        print(f"Idempotent MERGE completed on {table_name}.")
+        print(f"Idempotent MERGE completed on {TABLE_NAME}.")
 
 # COMMAND ----------
 # MAGIC %sql
