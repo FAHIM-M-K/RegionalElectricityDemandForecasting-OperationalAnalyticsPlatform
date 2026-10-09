@@ -12,8 +12,7 @@
 # COMMAND ----------
 # DBTITLE 1,Widgets & Parameters
 dbutils.widgets.text("catalog", "main", "Catalog Name")
-dbutils.widgets.text("eia_api_key", "", "EIA API Key")
-dbutils.widgets.dropdown("ingest_mode", "incremental", ["incremental", "full_backfill"], "Ingest Mode")
+dbutils.widgets.dropdown("ingest_mode", "full_backfill", ["full_backfill", "incremental"], "Ingest Mode")
 dbutils.widgets.text("backfill_start_date", "2021-01-01", "Backfill Start Date (YYYY-MM-DD)")
 dbutils.widgets.text("incremental_days", "14", "Incremental Lookback (Days)")
 
