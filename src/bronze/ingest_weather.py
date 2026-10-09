@@ -22,6 +22,7 @@ import datetime
 import urllib.request
 import urllib.parse
 from pyspark.sql import functions as F
+from delta.tables import DeltaTable
 
 CATALOG = dbutils.widgets.get("catalog").strip()
 INGEST_MODE = dbutils.widgets.get("ingest_mode").strip()
@@ -123,14 +124,29 @@ if all_weather_rows:
         .withColumn("_source", F.lit("Open-Meteo-Archive")) \
         .withColumn("_raw_payload_path", F.lit(raw_weather_path))
         
-    # 3. Append to Bronze Delta table
-    df_bronze_weather.write \
-        .format("delta") \
-        .mode("append") \
-        .option("mergeSchema", "true") \
-        .saveAsTable(f"{CATALOG}.bronze.weather_hourly_raw")
-        
-    print(f"Appended {len(all_weather_rows)} rows to {CATALOG}.bronze.weather_hourly_raw")
+    # 3. Idempotent Upsert into Bronze Delta table
+    table_name = f"{CATALOG}.bronze.weather_hourly_raw"
+    source_deduped = df_bronze_weather.dropDuplicates(["station_id", "time_utc"])
+    
+    if not spark.catalog.tableExists(table_name):
+        source_deduped.write \
+            .format("delta") \
+            .mode("overwrite") \
+            .saveAsTable(table_name)
+        print(f"Initialized table {table_name} with {source_deduped.count()} records.")
+    else:
+        delta_table = DeltaTable.forName(spark, table_name)
+        merge_condition = (
+            "target.station_id = source.station_id "
+            "AND target.time_utc = source.time_utc"
+        )
+        delta_table.alias("target").merge(
+            source_deduped.alias("source"),
+            merge_condition
+        ).whenMatchedUpdateAll(
+        ).whenNotMatchedInsertAll(
+        ).execute()
+        print(f"Idempotent MERGE completed on {table_name}.")
 
 # COMMAND ----------
 # MAGIC %sql

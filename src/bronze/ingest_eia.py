@@ -25,6 +25,7 @@ import datetime
 import urllib.request
 import urllib.parse
 from pyspark.sql import functions as F
+from delta.tables import DeltaTable
 
 CATALOG = dbutils.widgets.get("catalog").strip()
 INGEST_MODE = dbutils.widgets.get("ingest_mode").strip()
@@ -153,14 +154,31 @@ if eia_data:
         .withColumn("_source", F.lit("EIA_v2_region_data")) \
         .withColumn("_raw_payload_path", F.lit(raw_file_path))
     
-    # 3. Append to Bronze Delta table
-    df_bronze.write \
-        .format("delta") \
-        .mode("append") \
-        .option("mergeSchema", "true") \
-        .saveAsTable(f"{CATALOG}.bronze.eia_hourly_raw")
-        
-    print(f"Appended {len(eia_data)} rows to {CATALOG}.bronze.eia_hourly_raw")
+    # 3. Idempotent Upsert into Bronze Delta table
+    table_name = f"{CATALOG}.bronze.eia_hourly_raw"
+    source_deduped = df_bronze.dropDuplicates(["respondent", "period", "type"])
+    
+    if not spark.catalog.tableExists(table_name):
+        source_deduped.write \
+            .format("delta") \
+            .mode("overwrite") \
+            .saveAsTable(table_name)
+        print(f"Initialized table {table_name} with {source_deduped.count()} records.")
+    else:
+        delta_table = DeltaTable.forName(spark, table_name)
+        merge_condition = (
+            "target.respondent = source.respondent "
+            "AND target.period = source.period "
+            "AND target.type = source.type"
+        )
+        delta_table.alias("target").merge(
+            source_deduped.alias("source"),
+            merge_condition
+        ).whenMatchedUpdateAll(
+            condition="target.value != source.value OR (target.value IS NULL AND source.value IS NOT NULL)"
+        ).whenNotMatchedInsertAll(
+        ).execute()
+        print(f"Idempotent MERGE completed on {table_name}.")
 else:
     print("Warning: No records found for the specified window.")
 

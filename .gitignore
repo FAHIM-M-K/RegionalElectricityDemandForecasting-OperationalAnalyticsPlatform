@@ -41,11 +41,11 @@ $RECYCLE.BIN/
 .DS_Store
 
 # .md files
-PROJECT_PLAN.md
+plan.md
 README.md
 preference.md
 prompt.md
-
+progress.md
 
 # tests
 notebooks
