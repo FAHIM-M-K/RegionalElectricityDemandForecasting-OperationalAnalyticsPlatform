@@ -43,33 +43,34 @@ df_weather = spark.table(WEATHER_TABLE)
 df_calendar = spark.table(CALENDAR_TABLE)
 
 # COMMAND ----------
-# DBTITLE 1,Join Demand and Weather on timestamp_utc
-# Demand has respondent, timestamp_utc, timestamp_local, actual_demand_mw, day_ahead_forecast_mw, is_valid_demand, anomaly_flag
-# Weather has timestamp_utc, weighted metrics, station temps, degree hours
+# DBTITLE 1,Join Demand and Weather on timestamp_utc (Full Outer: Supports Historical Truth & Forecast Horizon)
+# Informed by profiling: Weather has 50,640 hours while EIA has 50,626 hours (EIA publication lag ~14h).
+# Using a full outer join preserves all historical truth while keeping upcoming weather hours available
+# for downstream day-ahead forecasting in Gold.
 df_grid_weather = df_demand.alias("d").join(
     df_weather.alias("w"),
     on="timestamp_utc",
-    how="inner"
+    how="full"
 ).select(
-    # Natural keys & Timestamps
-    F.col("d.respondent"),
+    # Natural keys & Timestamps (coalesce so weather-only recent hours retain valid respondent and timestamps)
+    F.coalesce(F.col("d.respondent"), F.lit("ERCO")).alias("respondent"),
     F.col("timestamp_utc"),
-    F.col("d.timestamp_local"),
-    F.to_date(F.col("d.timestamp_local")).alias("date_local"),
+    F.coalesce(F.col("d.timestamp_local"), F.col("w.timestamp_local")).alias("timestamp_local"),
+    F.to_date(F.coalesce(F.col("d.timestamp_local"), F.col("w.timestamp_local"))).alias("date_local"),
     
     # Temporal Components (Based on Texas Local Central Time)
-    F.hour(F.col("d.timestamp_local")).alias("hour_local"),
-    F.dayofweek(F.col("d.timestamp_local")).alias("day_of_week_local"), # 1=Sunday, 7=Saturday
-    F.dayofmonth(F.col("d.timestamp_local")).alias("day_of_month_local"),
-    F.month(F.col("d.timestamp_local")).alias("month_local"),
-    F.year(F.col("d.timestamp_local")).alias("year_local"),
-    F.dayofyear(F.col("d.timestamp_local")).alias("day_of_year_local"),
+    F.hour(F.coalesce(F.col("d.timestamp_local"), F.col("w.timestamp_local"))).alias("hour_local"),
+    F.dayofweek(F.coalesce(F.col("d.timestamp_local"), F.col("w.timestamp_local"))).alias("day_of_week_local"), # 1=Sunday, 7=Saturday
+    F.dayofmonth(F.coalesce(F.col("d.timestamp_local"), F.col("w.timestamp_local"))).alias("day_of_month_local"),
+    F.month(F.coalesce(F.col("d.timestamp_local"), F.col("w.timestamp_local"))).alias("month_local"),
+    F.year(F.coalesce(F.col("d.timestamp_local"), F.col("w.timestamp_local"))).alias("year_local"),
+    F.dayofyear(F.coalesce(F.col("d.timestamp_local"), F.col("w.timestamp_local"))).alias("day_of_year_local"),
     
-    # Electricity Metrics & Quality Flags
+    # Electricity Metrics & Quality Flags (NULL for upcoming hours where EIA hasn't published yet)
     F.col("d.actual_demand_mw"),
     F.col("d.day_ahead_forecast_mw"),
     F.col("d.day_ahead_error_mw"),
-    F.col("d.is_valid_demand"),
+    F.coalesce(F.col("d.is_valid_demand"), F.lit(False)).alias("is_valid_demand"),
     F.col("d.anomaly_flag"),
     
     # Regional Weighted Weather Indices
