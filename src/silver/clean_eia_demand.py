@@ -10,6 +10,10 @@
 # MAGIC 2. **Pivoting Series:** Restructure long format (`D` = Demand, `DF` = Day-ahead Forecast) into single hourly row: `actual_demand_mw` and `day_ahead_forecast_mw`.
 # MAGIC 3. **Physical Domain Screening:** Flag negative demand and physical operating boundary violations without silently dropping rows (`is_valid_demand`, `anomaly_flag`).
 # MAGIC 4. **Incremental Idempotency:** Null-safe Delta `MERGE` on `(respondent, timestamp_utc)` updating only when values change or restatements arrive.
+# MAGIC
+# MAGIC ### Design Decision:
+# MAGIC `day_ahead_error_mw` (actual - forecast) is NOT computed here. It is an analytical derivation, not data cleaning.
+# MAGIC Silver provides the two clean source values; Gold computes the delta. (Medallion: Silver = clean/conform, Gold = business logic).
 
 # COMMAND ----------
 # DBTITLE 1,Imports & Configuration
@@ -67,7 +71,7 @@ assert spark.catalog.tableExists(SOURCE_TABLE), f"Source table {SOURCE_TABLE} do
 df_bronze = spark.table(SOURCE_TABLE).filter(F.col("respondent") == REGION_CODE)
 
 # COMMAND ----------
-# DBTITLE 1,Parse Timestamps (UTC & America/Chicago)
+# DBTITLE 1,Parse Timestamps & Assert Source Uniqueness
 # EIA period is string formatted as "yyyy-MM-ddTHH" (representing UTC hour)
 # Example: "2021-01-01T00" -> 2021-01-01 00:00:00 UTC
 df_parsed = df_bronze \
@@ -80,6 +84,10 @@ df_parsed = df_bronze \
         F.from_utc_timestamp(F.col("timestamp_utc"), REGION_TIMEZONE)
     ) \
     .withColumn("value_num", F.col("value").cast(DoubleType()))
+
+# Assert source natural key uniqueness prior to pivoting (prevents silent multi-row collisions)
+pre_pivot_dupes = df_parsed.count() - df_parsed.dropDuplicates(["respondent", "period", "type"]).count()
+assert pre_pivot_dupes == 0, f"Source Integrity Failure: Found {pre_pivot_dupes} duplicate (respondent, period, type) records in Bronze."
 
 # COMMAND ----------
 # DBTITLE 1,Pivot Series: Align Actuals (D) and Day-Ahead Forecast (DF)
@@ -113,13 +121,6 @@ df_screened = df_pivoted \
             (F.col("actual_demand_mw") <= MAX_PLAUSIBLE_DEMAND_MW),
             F.lit(True)
         ).otherwise(F.lit(False))
-    ) \
-    .withColumn(
-        "day_ahead_error_mw",
-        F.when(
-            F.col("actual_demand_mw").isNotNull() & F.col("day_ahead_forecast_mw").isNotNull(),
-            F.col("actual_demand_mw") - F.col("day_ahead_forecast_mw")
-        ).otherwise(F.lit(None).cast(DoubleType()))
     ) \
     .withColumn("_transformed_at_utc", F.current_timestamp())
 

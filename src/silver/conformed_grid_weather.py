@@ -10,11 +10,15 @@
 # MAGIC **Output Table:** `main.silver.grid_hourly_conformed`  
 # MAGIC
 # MAGIC ### Core Transformations:
-# MAGIC 1. **1:1 Chronological Conformance:** Inner join on exact `timestamp_utc` grain.
+# MAGIC 1. **1:1 Chronological Conformance:** Full outer join on exact `timestamp_utc` grain (preserves weather-only future hours for Gold scoring).
 # MAGIC 2. **Calendar & Operational Dimension Join:** Join on date string to attach holiday name, holiday flag, day-of-week, and weekend indicators.
 # MAGIC 3. **Time Feature Extraction:** Extract hour of day (local), month, day of year, quarter for temporal seasonality analysis.
-# MAGIC 4. **Baseline Benchmark Pre-computation:** Compute EIA day-ahead forecast absolute error and percentage error for operational baseline comparison.
-# MAGIC 5. **Idempotent Delta MERGE:** Null-safe upsert on `(respondent, timestamp_utc)`.
+# MAGIC 4. **Idempotent Delta MERGE:** Null-safe upsert on `(respondent, timestamp_utc)`.
+# MAGIC
+# MAGIC ### Design Decisions:
+# MAGIC - **No business metrics here.** `day_ahead_error_mw` and `eia_day_ahead_ape_pct` belong in Gold (analytical derivations, not conformance).
+# MAGIC - **BA code from config.** Weather-only rows get their respondent from `ercot_config.json`, not a hardcoded string.
+# MAGIC - **`is_valid_demand` stays NULL for absent rows.** NULL = 'no data', False = 'data exists but is invalid'. Silver doesn't interpret absence.
 
 # COMMAND ----------
 # DBTITLE 1,Imports & Configuration
@@ -32,6 +36,35 @@ TARGET_TABLE = f"{CATALOG}.silver.grid_hourly_conformed"
 
 spark.sql(f"USE CATALOG {CATALOG}")
 spark.sql("USE SCHEMA silver")
+
+# COMMAND ----------
+# DBTITLE 1,Dynamic Configuration Locator
+def load_platform_config(filename="ercot_config.json"):
+    curr = os.getcwd()
+    for _ in range(5):
+        test_path = os.path.join(curr, "configs", filename)
+        if os.path.exists(test_path):
+            with open(test_path, "r", encoding="utf-8") as f:
+                print(f"Loaded platform config from {test_path}")
+                return json.load(f)
+        parent = os.path.dirname(curr)
+        if parent == curr:
+            break
+        curr = parent
+        
+    repo_candidate = f"/Workspace/Repos/configs/{filename}"
+    if os.path.exists(repo_candidate):
+        with open(repo_candidate, "r", encoding="utf-8") as f:
+            print(f"Loaded platform config from {repo_candidate}")
+            return json.load(f)
+            
+    raise FileNotFoundError(
+        f"Critical Configuration Error: Could not locate 'configs/{filename}'. "
+        "Ensure the repository is synced properly in Databricks Repos."
+    )
+
+config = load_platform_config("ercot_config.json")
+BA_CODE = config.get("region", {}).get("code", "ERCO")
 
 # COMMAND ----------
 # DBTITLE 1,Verify Source Tables Exist
@@ -52,8 +85,10 @@ df_grid_weather = df_demand.alias("d").join(
     on="timestamp_utc",
     how="full"
 ).select(
-    # Natural keys & Timestamps (coalesce so weather-only recent hours retain valid respondent and timestamps)
-    F.coalesce(F.col("d.respondent"), F.lit("ERCO")).alias("respondent"),
+    # Natural keys & Timestamps
+    # Weather-only rows (future hours without EIA data) get their BA code from config,
+    # not a hardcoded literal. This is the single source of truth for region identity.
+    F.coalesce(F.col("d.respondent"), F.lit(BA_CODE)).alias("respondent"),
     F.col("timestamp_utc"),
     F.coalesce(F.col("d.timestamp_local"), F.col("w.timestamp_local")).alias("timestamp_local"),
     F.to_date(F.coalesce(F.col("d.timestamp_local"), F.col("w.timestamp_local"))).alias("date_local"),
@@ -66,11 +101,21 @@ df_grid_weather = df_demand.alias("d").join(
     F.year(F.coalesce(F.col("d.timestamp_local"), F.col("w.timestamp_local"))).alias("year_local"),
     F.dayofyear(F.coalesce(F.col("d.timestamp_local"), F.col("w.timestamp_local"))).alias("day_of_year_local"),
     
-    # Electricity Metrics & Quality Flags (NULL for upcoming hours where EIA hasn't published yet)
+    # Demand Availability State Distinction (Distinguishes actuals available vs publication lag vs historical missing)
+    F.when(F.col("d.actual_demand_mw").isNotNull(), F.lit("AVAILABLE"))
+     .when(F.col("timestamp_utc") >= (F.current_timestamp() - F.expr("INTERVAL 48 HOURS")), F.lit("NOT_YET_PUBLISHED"))
+     .otherwise(F.lit("MISSING_HISTORICAL")).alias("demand_availability_status"),
+
+    # Weather Availability State Distinction
+    F.when(F.col("w.weighted_temperature_c").isNotNull(), F.lit("AVAILABLE"))
+     .otherwise(F.lit("UNAVAILABLE")).alias("weather_availability_status"),
+    
+    # Electricity Metrics & Quality Flags
+    # is_valid_demand stays NULL for weather-only rows: NULL = 'no data to validate',
+    # False = 'data exists but failed physical bounds'. Silver doesn't interpret absence.
     F.col("d.actual_demand_mw"),
     F.col("d.day_ahead_forecast_mw"),
-    F.col("d.day_ahead_error_mw"),
-    F.coalesce(F.col("d.is_valid_demand"), F.lit(False)).alias("is_valid_demand"),
+    F.col("d.is_valid_demand"),
     F.col("d.anomaly_flag"),
     
     # Regional Weighted Weather Indices
@@ -106,30 +151,39 @@ df_conformed = df_grid_weather.alias("gw").join(
     F.coalesce(F.col("c.is_holiday"), F.lit(False)).alias("is_holiday"),
     F.col("c.holiday_name")
 ) \
-.withColumn(
-    # Benchmark Metric: EIA Day-ahead absolute percentage error (APE)
-    "eia_day_ahead_ape_pct",
-    F.when(
-        (F.col("actual_demand_mw") > 0.0) & (F.col("day_ahead_error_mw").isNotNull()),
-        F.round(F.abs(F.col("day_ahead_error_mw")) / F.col("actual_demand_mw") * 100.0, 3)
-    ).otherwise(F.lit(None).cast(DoubleType()))
-) \
 .withColumn("_conformed_at_utc", F.current_timestamp())
 
 # COMMAND ----------
-# DBTITLE 1,Pre-Merge Structural Assertions
+# DBTITLE 1,Pre-Merge Structural & Cardinality Assertions
+# 1. Zero null primary keys
 null_keys_count = df_conformed.filter(
     F.col("respondent").isNull() | F.col("timestamp_utc").isNull()
 ).count()
 assert null_keys_count == 0, f"Integrity Failure: Found {null_keys_count} records with null primary keys."
 
+# 2. Strict deduplication check on target natural key
 dupe_count = df_conformed.count() - df_conformed.dropDuplicates(["respondent", "timestamp_utc"]).count()
 assert dupe_count == 0, f"Integrity Failure: Found {dupe_count} duplicate timestamp records."
 
+# 3. Join Cardinality Check: Ensure exact 1:1 match with zero cartesian explosion
+# Total conformed rows must exactly equal the number of distinct timestamps across weather and demand
 total_conformed_records = df_conformed.count()
-assert total_conformed_records > 0, "Completeness Failure: Conformed dataset is empty! Check join condition."
+demand_utc_count = df_demand.select("timestamp_utc").distinct().count()
+weather_utc_count = df_weather.select("timestamp_utc").distinct().count()
+expected_max_rows = max(demand_utc_count, weather_utc_count)
+assert total_conformed_records == expected_max_rows, (
+    f"Cardinality Explosion: Conformed rows ({total_conformed_records}) does not equal expected max ({expected_max_rows}). Check for duplicate timestamps!"
+)
 
-print(f"Silver Conformed Integration Passed: {total_conformed_records} hourly records fully aligned.")
+# 4. DST Transition Safety Check: Ensure no duplicate UTC timestamps during DST transitions
+# Fall back: Local 01:00 or 02:00 repeats, but UTC must remain strictly distinct
+dst_check = df_conformed.groupBy("timestamp_utc").count().filter("count > 1").count()
+assert dst_check == 0, f"DST Safety Failure: Found {dst_check} duplicate UTC hours."
+
+print(f"Silver Conformed Integration Passed:")
+print(f"  - Total conformed hours: {total_conformed_records:,}")
+print(f"  - Strict 1:1 join cardinality verified (no many-to-many explosion)")
+print(f"  - UTC chronological uniqueness verified (DST transitions safe)")
 
 # COMMAND ----------
 # DBTITLE 1,Idempotent Delta Upsert with Null-Safe Comparison
@@ -170,7 +224,8 @@ else:
 # MAGIC     min(timestamp_local) as min_time,
 # MAGIC     max(timestamp_local) as max_time,
 # MAGIC     round(avg(actual_demand_mw), 2) as avg_demand_mw,
-# MAGIC     round(avg(eia_day_ahead_ape_pct), 2) as eia_forecast_mape_pct,
 # MAGIC     round(avg(weighted_temperature_f), 2) as avg_regional_temp_f,
-# MAGIC     sum(case when is_holiday then 1 else 0 end) as holiday_hours
+# MAGIC     sum(case when is_holiday then 1 else 0 end) as holiday_hours,
+# MAGIC     sum(case when demand_availability_status = 'AVAILABLE' then 1 else 0 end) as demand_available_hours,
+# MAGIC     sum(case when demand_availability_status = 'NOT_YET_PUBLISHED' then 1 else 0 end) as pending_hours
 # MAGIC FROM silver.grid_hourly_conformed;
