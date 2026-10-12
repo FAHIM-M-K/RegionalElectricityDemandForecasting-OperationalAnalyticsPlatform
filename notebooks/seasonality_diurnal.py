@@ -24,13 +24,10 @@
 # COMMAND ----------
 # DBTITLE 1,Imports & Setup
 import numpy as np
+import matplotlib.pyplot as plt
 from pyspark.sql import functions as F
 
 SILVER_TABLE = "main.silver.grid_hourly_conformed"
-
-def section(title: str, width: int = 70) -> None:
-    bar = "=" * width
-    print(f"\n{bar}\n  {title}\n{bar}")
 
 # COMMAND ----------
 # DBTITLE 1,Load Analysis Cohort & Calendar Dimensions
@@ -96,7 +93,9 @@ display(df_diurnal)
 # DBTITLE 1,Diurnal Shape Diagnostics: Peak Hours & Intraday Swing Amplitudes
 pdf_diurnal = df_diurnal.toPandas()
 
-section("DIURNAL LOAD SHAPE DIAGNOSTICS BY METEOROLOGICAL SEASON")
+print("=" * 70)
+print("  DIURNAL LOAD SHAPE DIAGNOSTICS BY METEOROLOGICAL SEASON")
+print("=" * 70)
 for season in ["Summer", "Winter", "Spring", "Fall"]:
     sub = pdf_diurnal[pdf_diurnal["season"] == season].copy()
 
@@ -122,6 +121,22 @@ for season in ["Summer", "Winter", "Spring", "Fall"]:
         print(f"  AM Peak       : {int(am_peak['hour_local']):02d}:00 → {am_peak['median_demand_mw']:,.0f} MW")
         print(f"  PM Peak       : {int(pm_peak['hour_local']):02d}:00 → {pm_peak['median_demand_mw']:,.0f} MW")
     print("-" * 70)
+
+# Visualize Seasonal Diurnal Profiles
+plt.figure(figsize=(10, 5))
+season_colors = {"Summer": "#d62728", "Winter": "#1f77b4", "Spring": "#2ca02c", "Fall": "#ff7f0e"}
+for season in ["Summer", "Winter", "Spring", "Fall"]:
+    sub = pdf_diurnal[pdf_diurnal["season"] == season]
+    plt.plot(sub["hour_local"], sub["median_demand_mw"], marker="o", markersize=4, label=season, color=season_colors[season], lw=1.8)
+
+plt.title("ERCOT Diurnal Load Profile by Meteorological Season", fontsize=13, fontweight="bold")
+plt.xlabel("Hour of Day (Local Central Time)", fontsize=11)
+plt.ylabel("Median Demand (MW)", fontsize=11)
+plt.xticks(range(0, 24))
+plt.grid(True, linestyle=":", alpha=0.6)
+plt.legend(frameon=True)
+plt.tight_layout()
+plt.show()
 
 # COMMAND ----------
 # MAGIC %md
@@ -166,16 +181,17 @@ weekend_mean = pdf_dow[weekend_mask]["mean_demand_mw"].mean()
 gap_mw = weekday_mean - weekend_mean
 gap_pct = (gap_mw / weekend_mean) * 100.0
 
-section("WEEKDAY vs. WEEKEND DEMAND GAP")
+print("\n" + "=" * 70)
+print("  WEEKDAY vs. WEEKEND DEMAND GAP")
+print("=" * 70)
 print(f"Weekday Average Demand (Mon–Fri) : {weekday_mean:,.1f} MW")
 print(f"Weekend Average Demand (Sat–Sun) : {weekend_mean:,.1f} MW")
 print(f"Absolute Gap                     : {gap_mw:,.1f} MW")
 print(f"Relative Gap                     : {gap_pct:.1f}% higher load on weekdays vs. weekends")
 print()
-print("Per-day mean demand:")
+print("Per-day demand summary:")
 for _, row in pdf_dow.iterrows():
-    bar = "█" * int(row["mean_demand_mw"] / 2000)
-    print(f"  {row['day_name']:<10}: {row['mean_demand_mw']:,.0f} MW  {bar}")
+    print(f"  {row['day_name']:<10}: Mean {row['mean_demand_mw']:>10,.1f} MW  |  Median {row['median_demand_mw']:>10,.1f} MW  |  StdDev {row['stddev_demand_mw']:>8,.1f} MW")
 
 # COMMAND ----------
 # MAGIC %md
@@ -219,7 +235,9 @@ pdf_monthly["month_name"] = pdf_monthly["month_local"].map(MONTH_NAMES)
 peak_month = pdf_monthly.loc[pdf_monthly["median_demand_mw"].idxmax()]
 trough_month = pdf_monthly.loc[pdf_monthly["median_demand_mw"].idxmin()]
 
-section("ANNUAL SEASONAL DEMAND CYCLE")
+print("\n" + "=" * 70)
+print("  ANNUAL SEASONAL DEMAND CYCLE")
+print("=" * 70)
 print(f"Peak Demand Month  : {peak_month['month_name']}  "
       f"(Median: {peak_month['median_demand_mw']:,.0f} MW, Avg Temp: {peak_month['avg_temp_f']:.1f}°F)")
 print(f"Trough Demand Month: {trough_month['month_name']}  "
@@ -227,7 +245,6 @@ print(f"Trough Demand Month: {trough_month['month_name']}  "
 print(f"Annual Peak-to-Trough Swing: "
       f"{peak_month['median_demand_mw'] - trough_month['median_demand_mw']:,.0f} MW")
 print()
-print("Monthly median demand profile:")
+print("Monthly demand profile:")
 for _, row in pdf_monthly.iterrows():
-    bar = "█" * int(row["median_demand_mw"] / 2000)
-    print(f"  {row['month_name']}: {row['median_demand_mw']:,.0f} MW  {bar}")
+    print(f"  {row['month_name']:<5}: Median {row['median_demand_mw']:>10,.1f} MW  |  Mean {row['mean_demand_mw']:>10,.1f} MW  |  Max {row['max_demand_mw']:>10,.1f} MW")

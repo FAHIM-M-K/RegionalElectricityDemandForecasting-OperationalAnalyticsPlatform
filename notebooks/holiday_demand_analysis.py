@@ -31,14 +31,11 @@
 # DBTITLE 1,Imports & Setup
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 from scipy import stats
 from pyspark.sql import functions as F
 
 SILVER_TABLE = "main.silver.grid_hourly_conformed"
-
-def section(title: str, width: int = 70) -> None:
-    bar = "=" * width
-    print(f"\n{bar}\n  {title}\n{bar}")
 
 # COMMAND ----------
 # DBTITLE 1,Load Analysis Cohort — Weekday Scope Only
@@ -122,6 +119,22 @@ df_per_holiday = (
 
 display(df_per_holiday)
 
+# Visualize Per-Holiday Demand Impact vs Baseline
+pdf_per_holiday = df_per_holiday.toPandas()
+if not pdf_per_holiday.empty:
+    plt.figure(figsize=(9, 5))
+    y_pos = range(len(pdf_per_holiday))
+    colors = ["#d62728" if x < 0 else "#2ca02c" for x in pdf_per_holiday["demand_delta_vs_baseline_mw"]]
+    plt.barh(y_pos, pdf_per_holiday["demand_delta_vs_baseline_mw"], color=colors)
+    plt.yticks(y_pos, pdf_per_holiday["holiday_name"])
+    plt.axvline(0, color="black", linestyle="--", lw=1)
+    plt.xlabel("Demand Delta vs. Non-Holiday Weekday Baseline (MW)", fontsize=11)
+    plt.title("Impact of Federal Holidays on Electricity Demand", fontsize=13, fontweight="bold")
+    plt.gca().invert_yaxis()
+    plt.grid(True, axis="x", linestyle=":", alpha=0.6)
+    plt.tight_layout()
+    plt.show()
+
 # COMMAND ----------
 # MAGIC %md
 # MAGIC ## 3. Formal Hypothesis Testing — Temperature-Controlled
@@ -190,7 +203,9 @@ else:
 
 ALPHA = 0.01
 
-section("FEDERAL HOLIDAY DEMAND SUPPRESSION — HYPOTHESIS TEST RESULTS")
+print("\n" + "=" * 70)
+print("  FEDERAL HOLIDAY DEMAND SUPPRESSION — HYPOTHESIS TEST RESULTS")
+print("=" * 70)
 print(f"Qualified temperature bins (n ≥ 5 holiday, ≥ 20 non-holiday) : {qualified_bins}")
 print(f"Temperature-Controlled Avg Demand Drop                       : {avg_controlled_drop_mw:,.0f} MW")
 print(f"Temperature-Controlled Median Demand Drop                    : {median_controlled_drop_mw:,.0f} MW")
@@ -267,7 +282,9 @@ df_adj_stats = (
 
 display(df_adj_stats)
 
-section("HOLIDAY-ADJACENT DEMAND SIGNAL")
+print("\n" + "=" * 70)
+print("  HOLIDAY-ADJACENT DEMAND SIGNAL")
+print("=" * 70)
 pdf_adj = df_adj_stats.toPandas()
 baseline_row = pdf_adj[pdf_adj["adjacency_type"] == "regular_weekday"]
 if not baseline_row.empty:

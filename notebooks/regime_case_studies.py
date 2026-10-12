@@ -29,13 +29,10 @@
 # COMMAND ----------
 # DBTITLE 1,Imports & Setup
 import numpy as np
+import matplotlib.pyplot as plt
 from pyspark.sql import functions as F
 
 SILVER_TABLE = "main.silver.grid_hourly_conformed"
-
-def section(title: str, width: int = 70) -> None:
-    bar = "=" * width
-    print(f"\n{bar}\n  {title}\n{bar}")
 
 # COMMAND ----------
 # DBTITLE 1,Load Full Conformed Table (Unrestricted for Regime Analysis)
@@ -95,6 +92,24 @@ df_uri = (
 
 display(df_uri)
 
+# Visualize Uri Demand and Temperature Collapse
+pdf_uri = df_uri.toPandas()
+if not pdf_uri.empty:
+    fig, ax1 = plt.subplots(figsize=(10, 5))
+    ax1.set_xlabel("Local Timestamp", fontsize=11)
+    ax1.set_ylabel("Actual Served Demand (MW)", color="#1f77b4", fontsize=11)
+    ax1.plot(pdf_uri["timestamp_local"], pdf_uri["actual_demand_mw"], color="#1f77b4", lw=1.8, label="Actual Served Demand")
+    ax1.tick_params(axis="y", labelcolor="#1f77b4")
+
+    ax2 = ax1.twinx()
+    ax2.set_ylabel("Regional Temperature (°F)", color="#d62728", fontsize=11)
+    ax2.plot(pdf_uri["timestamp_local"], pdf_uri["weighted_temperature_f"], color="#d62728", lw=1.5, linestyle="--", label="Temperature (°F)")
+    ax2.tick_params(axis="y", labelcolor="#d62728")
+
+    plt.title("Winter Storm Uri (Feb 2021): Grid Stress & Involuntary Load Curtailment", fontsize=13, fontweight="bold")
+    fig.tight_layout()
+    plt.show()
+
 # COMMAND ----------
 # DBTITLE 1,Uri Regime Summary Statistics
 uri_stats = df_uri.select(
@@ -108,7 +123,9 @@ uri_stats = df_uri.select(
     F.round(F.max("day_ahead_forecast_mw"), 1).alias("max_da_forecast_mw"),
 ).first()
 
-section("WINTER STORM URI (FEB 2021) REGIME AUDIT")
+print("\n" + "=" * 70)
+print("  WINTER STORM URI (FEB 2021) REGIME AUDIT")
+print("=" * 70)
 if uri_stats and uri_stats["total_uri_hours"] and uri_stats["total_uri_hours"] > 0:
     print(f"Total Hours Examined          : {uri_stats['total_uri_hours']}")
     print(f"Min Regional Temperature      : {uri_stats['min_regional_temp_f']:.1f}°F")
@@ -183,7 +200,9 @@ s23_stats = df_s23.select(
     F.round(F.avg(F.when(F.col("actual_demand_mw") >= 80000, F.col("weighted_temperature_f"))), 1).alias("avg_temp_during_80gw_hours"),
 ).first()
 
-section("SUMMER 2023 HEATWAVE REGIME AUDIT")
+print("\n" + "=" * 70)
+print("  SUMMER 2023 HEATWAVE REGIME AUDIT")
+print("=" * 70)
 if s23_stats and s23_stats["total_hours"] and s23_stats["total_hours"] > 0:
     print(f"Period Examined               : {S23_START} → {S23_END}")
     print(f"Total Hours in Window         : {s23_stats['total_hours']:,}")
@@ -221,7 +240,9 @@ display(df_extreme_heat)
 from scipy import stats
 pdf_extreme = df_extreme_heat.toPandas()
 
-section("HIGH-TEMPERATURE DEMAND LINEARITY (AC SATURATION TEST)")
+print("\n" + "=" * 70)
+print("  HIGH-TEMPERATURE DEMAND LINEARITY (AC SATURATION TEST)")
+print("=" * 70)
 if len(pdf_extreme) >= 2:
     slope, intercept, r, p, se = stats.linregress(
         pdf_extreme["temp_bin_f"], pdf_extreme["median_demand_mw"]

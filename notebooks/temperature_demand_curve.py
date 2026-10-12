@@ -21,15 +21,12 @@
 # COMMAND ----------
 # DBTITLE 1,Imports & Setup
 import numpy as np
+import matplotlib.pyplot as plt
 from scipy import stats
 from pyspark.sql import functions as F
 
 SILVER_TABLE = "main.silver.grid_hourly_conformed"
 MIN_BIN_HOURS = 15
-
-def section(title: str, width: int = 70) -> None:
-    bar = "=" * width
-    print(f"\n{bar}\n  {title}\n{bar}")
 
 # COMMAND ----------
 # DBTITLE 1,Load Analysis Cohort
@@ -74,17 +71,17 @@ display(df_bins)
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## 2. Empirical Balance Point Optimization
+# MAGIC ## 2. Empirical Balance Point Optimization & Visualization
 # MAGIC
 # MAGIC We fit a cubic polynomial to the median demand curve to locate:
 # MAGIC
 # MAGIC $$\hat{T}_{\text{balance}} = \arg\min_T \;\mathbb{E}\left[\text{Demand} \mid T\right]$$
 # MAGIC
-# MAGIC A cubic (degree-3) polynomial is used because it captures the known U-shaped convexity
-# MAGIC while having enough flexibility for mild asymmetry, without overfitting to bin noise.
+# MAGIC A cubic (degree-3) polynomial captures the U-shaped convexity
+# MAGIC while having enough flexibility for mild asymmetry without overfitting.
 
 # COMMAND ----------
-# DBTITLE 1,Derive Empirical Balance Point via Polynomial Minimisation
+# DBTITLE 1,Derive Empirical Balance Point & Plot Curve
 pdf_curve = df_bins.toPandas()
 
 # Fit degree-3 polynomial to median demand curve
@@ -98,13 +95,29 @@ empirical_balance_f = float(temp_dense[np.argmin(demand_dense)])
 empirical_balance_c = (empirical_balance_f - 32.0) * 5.0 / 9.0
 min_basal_demand_mw = float(np.min(demand_dense))
 
-section("EMPIRICAL BALANCE POINT ANALYSIS")
+print("=" * 70)
+print("  EMPIRICAL BALANCE POINT ANALYSIS")
+print("=" * 70)
 print(f"Conventional Standard Balance Point  : 65.0°F (18.3°C)")
 print(f"Empirical Grid Balance Point (argmin): {empirical_balance_f:.1f}°F ({empirical_balance_c:.1f}°C)")
 print(f"Minimum Basal Median Demand          : {min_basal_demand_mw:,.0f} MW")
 delta_f = empirical_balance_f - 65.0
 direction = "above" if delta_f > 0 else "below"
 print(f"Deviation from 65°F standard         : {abs(delta_f):.1f}°F {direction} convention")
+
+# Plot empirical temperature-demand curve
+plt.figure(figsize=(10, 6))
+plt.scatter(pdf_curve["temp_bin_f"], pdf_curve["median_demand_mw"], color="#1f77b4", label="Observed Median Demand (2°F bins)", s=25, zorder=3)
+plt.plot(temp_dense, demand_dense, color="#d62728", lw=2, label="Cubic Polynomial Fit", zorder=2)
+plt.axvline(65.0, color="#7f7f7f", linestyle="--", lw=1.5, label="65°F Convention")
+plt.axvline(empirical_balance_f, color="#2ca02c", linestyle="--", lw=1.5, label=f"Empirical Balance ({empirical_balance_f:.1f}°F)")
+plt.title("ERCOT Empirical Temperature–Demand Curve", fontsize=13, fontweight="bold")
+plt.xlabel("Weighted Ambient Temperature (°F)", fontsize=11)
+plt.ylabel("Electricity Demand (MW)", fontsize=11)
+plt.grid(True, linestyle=":", alpha=0.6)
+plt.legend(frameon=True)
+plt.tight_layout()
+plt.show()
 
 # COMMAND ----------
 # MAGIC %md
@@ -135,7 +148,9 @@ heating_slope, heating_intercept, r_heat, p_heat, se_heat = stats.linregress(
 # We report the magnitude of the gradient for interpretability
 heating_gradient_magnitude = abs(heating_slope)
 
-section("ASYMMETRIC THERMAL RESPONSE GRADIENT")
+print("\n" + "=" * 70)
+print("  ASYMMETRIC THERMAL RESPONSE GRADIENT")
+print("=" * 70)
 print(f"Cooling Arm ({empirical_balance_f:.1f}°F → {pdf_curve['temp_bin_f'].max():.0f}°F):")
 print(f"  Slope  : +{cooling_slope:,.1f} MW per °F increase in temperature")
 print(f"  R²     : {r_cool**2:.3f}    p-value: {p_cool:.2e}")
@@ -167,7 +182,9 @@ print(f"  - Asymmetry ratio of {ratio:.2f}x supports a two-slope piecewise term 
 
 # COMMAND ----------
 # DBTITLE 1,Within-Bin Demand Variance (Unexplained Demand Drivers)
-section("WITHIN-BIN RESIDUAL VARIANCE — UNEXPLAINED DEMAND STRUCTURE")
+print("\n" + "=" * 70)
+print("  WITHIN-BIN RESIDUAL VARIANCE — UNEXPLAINED DEMAND STRUCTURE")
+print("=" * 70)
 high_variance_bins = pdf_curve.nlargest(10, "stddev_demand_mw")[
     ["temp_bin_f", "hour_count", "median_demand_mw", "stddev_demand_mw"]
 ].reset_index(drop=True)

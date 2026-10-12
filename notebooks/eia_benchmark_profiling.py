@@ -28,14 +28,11 @@
 # COMMAND ----------
 # DBTITLE 1,Imports & Setup
 import numpy as np
+import matplotlib.pyplot as plt
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
 SILVER_TABLE = "main.silver.grid_hourly_conformed"
-
-def section(title: str, width: int = 70) -> None:
-    bar = "=" * width
-    print(f"\n{bar}\n  {title}\n{bar}")
 
 # COMMAND ----------
 # DBTITLE 1,Load Analysis Cohort & Derive Season
@@ -91,7 +88,9 @@ bench_global = df_bench.select(
 
 bias_direction = "Overforecast" if bench_global["mean_bias_mw"] > 0 else "Underforecast"
 
-section("EIA DAY-AHEAD FORECAST — GLOBAL BENCHMARK SCORECARD")
+print("=" * 70)
+print("  EIA DAY-AHEAD FORECAST — GLOBAL BENCHMARK SCORECARD")
+print("=" * 70)
 print(f"  Evaluated Observations   : {bench_global['evaluated_hours']:,} hours")
 print()
 print(f"  MAE                      : {bench_global['mae_mw']:>10,.1f} MW   ← primary target for ML champion")
@@ -134,7 +133,9 @@ df_bench_season = (
 display(df_bench_season)
 
 pdf_season = df_bench_season.toPandas()
-section("SEASONAL BENCHMARK DECOMPOSITION")
+print("\n" + "=" * 70)
+print("  SEASONAL BENCHMARK DECOMPOSITION")
+print("=" * 70)
 print(f"{'Season':<10} {'MAE (MW)':>10} {'RMSE (MW)':>11} {'MAPE %':>8} {'Bias (MW)':>10}")
 print("-" * 55)
 for _, row in pdf_season.iterrows():
@@ -169,11 +170,26 @@ pdf_hour = df_bench_hour.toPandas()
 peak_error_hour = pdf_hour.loc[pdf_hour["mae_mw"].idxmax()]
 best_error_hour = pdf_hour.loc[pdf_hour["mae_mw"].idxmin()]
 
-section("INTRADAY ERROR PROFILE — HIGHEST/LOWEST FORECAST DIFFICULTY")
+print("\n" + "=" * 70)
+print("  INTRADAY ERROR PROFILE — HIGHEST/LOWEST FORECAST DIFFICULTY")
+print("=" * 70)
 print(f"Worst Forecast Accuracy Hour : {int(peak_error_hour['hour_local']):02d}:00 local  "
       f"(MAE: {peak_error_hour['mae_mw']:,.0f} MW)")
 print(f"Best Forecast Accuracy Hour  : {int(best_error_hour['hour_local']):02d}:00 local  "
       f"(MAE: {best_error_hour['mae_mw']:,.0f} MW)")
+
+# Visualize Intraday Forecast Error Profile
+plt.figure(figsize=(10, 4.5))
+plt.plot(pdf_hour["hour_local"], pdf_hour["mae_mw"], marker="o", color="#d62728", lw=2, label="MAE (MW)")
+plt.plot(pdf_hour["hour_local"], pdf_hour["rmse_mw"], marker="s", color="#1f77b4", lw=1.5, linestyle="--", label="RMSE (MW)")
+plt.title("EIA Day-Ahead Forecast Error by Hour of Day", fontsize=13, fontweight="bold")
+plt.xlabel("Hour of Day (Local Central Time)", fontsize=11)
+plt.ylabel("Forecast Error (MW)", fontsize=11)
+plt.xticks(range(0, 24))
+plt.grid(True, linestyle=":", alpha=0.6)
+plt.legend(frameon=True)
+plt.tight_layout()
+plt.show()
 
 # COMMAND ----------
 # MAGIC %md
@@ -207,7 +223,9 @@ display(df_bench_decile)
 
 pdf_decile = df_bench_decile.toPandas()
 
-section("TEMPERATURE DECILE ERROR PROFILE")
+print("\n" + "=" * 70)
+print("  TEMPERATURE DECILE ERROR PROFILE")
+print("=" * 70)
 print(f"{'Decile':>7} {'Temp Range (°F)':>18} {'MAE (MW)':>10} {'MAPE %':>8} {'Bias (MW)':>10}")
 print("-" * 60)
 for _, row in pdf_decile.iterrows():
@@ -238,7 +256,9 @@ if not pdf_decile.empty:
 
 # COMMAND ----------
 # DBTITLE 1,Final Benchmark Summary & ML Target Definition
-section("BENCHMARK SUMMARY — EIA DAY-AHEAD FORECAST vs. ML CHAMPION TARGET")
+print("\n" + "=" * 70)
+print("  BENCHMARK SUMMARY — EIA DAY-AHEAD FORECAST vs. ML CHAMPION TARGET")
+print("=" * 70)
 print(f"Benchmark (EIA Day-Ahead Forecast):")
 print(f"  Overall MAE   : {bench_global['mae_mw']:,.0f} MW")
 print(f"  Overall RMSE  : {bench_global['rmse_mw']:,.0f} MW")
