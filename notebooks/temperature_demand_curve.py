@@ -33,7 +33,7 @@ MIN_BIN_HOURS = 15
 df = (
     spark.table(SILVER_TABLE)
     .filter(
-        (F.col("demand_availability_status") == "AVAILABLE") &
+        F.col("actual_demand_mw").isNotNull() &
         (F.col("is_valid_demand") == True) &
         (F.col("weighted_temperature_f").isNotNull())
     )

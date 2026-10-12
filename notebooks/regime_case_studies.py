@@ -40,7 +40,7 @@ SILVER_TABLE = "main.silver.grid_hourly_conformed"
 # (they passed physical bounds), but they are regime-distorted for modelling purposes.
 # The regime analysis notebook explicitly characterises this distinction.
 df_full = spark.table(SILVER_TABLE).filter(
-    F.col("demand_availability_status") == "AVAILABLE"
+    F.col("actual_demand_mw").isNotNull()
 )
 
 print(f"Full historical cohort (all available hours): {df_full.count():,} records")
