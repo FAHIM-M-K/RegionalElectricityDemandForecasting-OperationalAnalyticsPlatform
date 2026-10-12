@@ -36,6 +36,10 @@ from pyspark.sql import functions as F
 
 SILVER_TABLE = "main.silver.grid_hourly_conformed"
 
+def section(title: str, width: int = 70) -> None:
+    bar = "=" * width
+    print(f"\n{bar}\n  {title}\n{bar}")
+
 # COMMAND ----------
 # DBTITLE 1,Load Analysis Cohort — Weekday Scope Only
 df = (
@@ -94,11 +98,12 @@ display(df_raw_compare)
 # COMMAND ----------
 # DBTITLE 1,Per-Holiday Demand Profile vs. Non-Holiday Weekday Baseline
 # Compute the non-holiday weekday baseline for comparison
-non_holiday_mean = (
+non_holiday_row = (
     df_weekdays.filter(F.col("is_holiday") == False)
     .agg(F.avg("actual_demand_mw"))
-    .first()[0]
+    .first()
 )
+non_holiday_mean = float(non_holiday_row[0]) if (non_holiday_row and non_holiday_row[0] is not None) else 0.0
 
 df_per_holiday = (
     df_weekdays.filter(F.col("is_holiday") == True)
@@ -159,18 +164,29 @@ for temp_bin, grp in pdf_weekdays.groupby("temp_bin_3f"):
         bin_deltas.append(nh.mean() - h.mean())
         qualified_bins += 1
 
-avg_controlled_drop_mw = np.mean(bin_deltas)
-median_controlled_drop_mw = np.median(bin_deltas)
+if qualified_bins >= 2:
+    avg_controlled_drop_mw = float(np.mean(bin_deltas))
+    median_controlled_drop_mw = float(np.median(bin_deltas))
+    t_stat_controlled, p_val_controlled = stats.ttest_1samp(bin_deltas, popmean=0.0)
+elif qualified_bins == 1:
+    avg_controlled_drop_mw = float(bin_deltas[0])
+    median_controlled_drop_mw = float(bin_deltas[0])
+    t_stat_controlled, p_val_controlled = 0.0, 1.0
+else:
+    avg_controlled_drop_mw = 0.0
+    median_controlled_drop_mw = 0.0
+    t_stat_controlled, p_val_controlled = 0.0, 1.0
 
 # -- Statistical tests --
-t_stat_controlled, p_val_controlled = stats.ttest_1samp(bin_deltas, popmean=0.0)
-mwu_stat, p_val_mwu = stats.mannwhitneyu(holiday_series, non_holiday_series, alternative="two-sided")
-
-# -- Effect size: Cohen's d on raw uncontrolled samples --
-pooled_std = np.sqrt(
-    (holiday_series.std() ** 2 + non_holiday_series.std() ** 2) / 2.0
-)
-cohens_d = (non_holiday_series.mean() - holiday_series.mean()) / pooled_std
+if len(holiday_series) > 0 and len(non_holiday_series) > 0:
+    mwu_stat, p_val_mwu = stats.mannwhitneyu(holiday_series, non_holiday_series, alternative="two-sided")
+    pooled_std = np.sqrt(
+        (holiday_series.std() ** 2 + non_holiday_series.std() ** 2) / 2.0
+    )
+    cohens_d = (non_holiday_series.mean() - holiday_series.mean()) / pooled_std if pooled_std > 0 else 0.0
+else:
+    mwu_stat, p_val_mwu = 0.0, 1.0
+    cohens_d = 0.0
 
 ALPHA = 0.01
 

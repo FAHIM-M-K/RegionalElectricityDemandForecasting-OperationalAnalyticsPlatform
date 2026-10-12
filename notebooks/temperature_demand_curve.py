@@ -27,6 +27,10 @@ from pyspark.sql import functions as F
 SILVER_TABLE = "main.silver.grid_hourly_conformed"
 MIN_BIN_HOURS = 15
 
+def section(title: str, width: int = 70) -> None:
+    bar = "=" * width
+    print(f"\n{bar}\n  {title}\n{bar}")
+
 # COMMAND ----------
 # DBTITLE 1,Load Analysis Cohort
 # Filter to valid historical records with both demand and weather observations
@@ -81,7 +85,7 @@ display(df_bins)
 
 # COMMAND ----------
 # DBTITLE 1,Derive Empirical Balance Point via Polynomial Minimisation
-pdf_curve = df_bins.select("temp_bin_f", "median_demand_mw", "mean_demand_mw", "hour_count").toPandas()
+pdf_curve = df_bins.toPandas()
 
 # Fit degree-3 polynomial to median demand curve
 poly_coeffs = np.polyfit(pdf_curve["temp_bin_f"], pdf_curve["median_demand_mw"], deg=3)

@@ -28,6 +28,10 @@ from pyspark.sql import functions as F
 
 SILVER_TABLE = "main.silver.grid_hourly_conformed"
 
+def section(title: str, width: int = 70) -> None:
+    bar = "=" * width
+    print(f"\n{bar}\n  {title}\n{bar}")
+
 # COMMAND ----------
 # DBTITLE 1,Load Analysis Cohort & Calendar Dimensions
 df = (

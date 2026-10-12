@@ -33,6 +33,10 @@ from pyspark.sql.window import Window
 
 SILVER_TABLE = "main.silver.grid_hourly_conformed"
 
+def section(title: str, width: int = 70) -> None:
+    bar = "=" * width
+    print(f"\n{bar}\n  {title}\n{bar}")
+
 # COMMAND ----------
 # DBTITLE 1,Load Analysis Cohort & Derive Season
 df = (
@@ -211,16 +215,19 @@ for _, row in pdf_decile.iterrows():
           f"{row['mae_mw']:>10,.1f} {row['mape_pct']:>8.3f} {row['bias_mw']:>+10,.1f}")
 
 # Identify coldest and hottest decile performance
-coldest = pdf_decile[pdf_decile["temp_decile"] == pdf_decile["temp_decile"].min()].iloc[0]
-hottest = pdf_decile[pdf_decile["temp_decile"] == pdf_decile["temp_decile"].max()].iloc[0]
-median_decile = pdf_decile[pdf_decile["temp_decile"] == 5].iloc[0]
+if not pdf_decile.empty:
+    coldest = pdf_decile[pdf_decile["temp_decile"] == pdf_decile["temp_decile"].min()].iloc[0]
+    hottest = pdf_decile[pdf_decile["temp_decile"] == pdf_decile["temp_decile"].max()].iloc[0]
+    decile_5 = pdf_decile[pdf_decile["temp_decile"] == 5]
+    median_decile = decile_5.iloc[0] if not decile_5.empty else pdf_decile.iloc[len(pdf_decile) // 2]
 
-print()
-print("Key Finding:")
-print(f"  Coldest Decile (≤ {coldest['max_temp_f']:.0f}°F)  MAE: {coldest['mae_mw']:,.0f} MW "
-      f"  ({coldest['mae_mw'] / median_decile['mae_mw']:.1f}x median-decile error)")
-print(f"  Hottest Decile (≥ {hottest['min_temp_f']:.0f}°F)  MAE: {hottest['mae_mw']:,.0f} MW "
-      f"  ({hottest['mae_mw'] / median_decile['mae_mw']:.1f}x median-decile error)")
+    median_mae = median_decile['mae_mw'] if median_decile['mae_mw'] > 0 else 1.0
+    print()
+    print("Key Finding:")
+    print(f"  Coldest Decile (≤ {coldest['max_temp_f']:.0f}°F)  MAE: {coldest['mae_mw']:,.0f} MW "
+          f"  ({coldest['mae_mw'] / median_mae:.1f}x median-decile error)")
+    print(f"  Hottest Decile (≥ {hottest['min_temp_f']:.0f}°F)  MAE: {hottest['mae_mw']:,.0f} MW "
+          f"  ({hottest['mae_mw'] / median_mae:.1f}x median-decile error)")
 
 # COMMAND ----------
 # MAGIC %md
