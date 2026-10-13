@@ -73,12 +73,13 @@ display(df_bins)
 # MAGIC %md
 # MAGIC ## 2. Empirical Balance Point Optimization & Visualization
 # MAGIC
-# MAGIC We fit a cubic polynomial to the median demand curve to locate:
+# MAGIC We fit a cubic polynomial to the binned median demand curve to locate:
 # MAGIC
-# MAGIC $$\hat{T}_{\text{balance}} = \arg\min_T \;\mathbb{E}\left[\text{Demand} \mid T\right]$$
+# MAGIC $$T^* = \arg\min_{T \in [T_{\min}, T_{\max}]} \operatorname{Median}\left(\text{Demand} \mid T\right)$$
 # MAGIC
-# MAGIC A cubic (degree-3) polynomial captures the U-shaped convexity
-# MAGIC while having enough flexibility for mild asymmetry without overfitting.
+# MAGIC Because we fit a cubic (degree-3) polynomial to the empirical 2°F binned medians over the observed
+# MAGIC range $[T_{\min}, T_{\max}]$, $T^*$ represents the estimated minimizer of the fitted binned-median curve.
+# MAGIC A cubic polynomial captures U-shaped convexity while remaining resilient to boundary variance.
 
 # COMMAND ----------
 # DBTITLE 1,Derive Empirical Balance Point & Plot Curve
@@ -166,9 +167,13 @@ ratio = cooling_slope / heating_gradient_magnitude
 print(f"  {ratio:.2f}x — {'cooling-dominant' if ratio > 1 else 'heating-dominant'}")
 print()
 print("Gold Feature Engineering Implication:")
-print(f"  - If |empirical_balance_f - 65| > 2°F, recommend adding custom CDH/HDH at {empirical_balance_f:.0f}°F")
-print(f"    alongside the existing cdh_65 / hdh_65 Silver features.")
-print(f"  - Asymmetry ratio of {ratio:.2f}x supports a two-slope piecewise term in addition to quadratic T².")
+print(f"  - Asymmetry ratio of {ratio:.2f}x supports testing two-slope piecewise degree-hours in Phase 4.")
+print(f"  - Custom degree-hours (cdh_{empirical_balance_f:.0f}/hdh_{empirical_balance_f:.0f}) should be evaluated against conventional 65°F terms via walk-forward ablation.")
+print()
+print("Statistical Qualification:")
+print("  - Slopes and R² are descriptive metrics across the 25 cooling and 19 heating bins.")
+print("  - Bin OLS p-values/SEs assume independent bin errors; hourly autocorrelation requires")
+print("    temporal block-bootstrap sensitivity analysis for formal inferential testing.")
 
 # COMMAND ----------
 # MAGIC %md

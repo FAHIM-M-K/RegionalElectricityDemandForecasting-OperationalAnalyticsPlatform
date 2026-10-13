@@ -152,27 +152,48 @@ if not spark.catalog.tableExists(TARGET_TABLE):
     print(f"Initialized Silver table {TARGET_TABLE} with {total_records} records.")
 else:
     delta_target = DeltaTable.forName(spark, TARGET_TABLE)
-    merge_condition = (
-        "target.respondent = source.respondent "
-        "AND target.timestamp_utc = source.timestamp_utc"
-    )
+    target_cols = [c.name for c in delta_target.toDF().schema]
     
-    # Update only if measurements or anomaly flags actually changed
-    update_condition = (
-        "NOT (target.actual_demand_mw <=> source.actual_demand_mw) OR "
-        "NOT (target.day_ahead_forecast_mw <=> source.day_ahead_forecast_mw) OR "
-        "NOT (target.anomaly_flag <=> source.anomaly_flag) OR "
-        "NOT (target.is_valid_demand <=> source.is_valid_demand)"
-    )
-    
-    delta_target.alias("target").merge(
-        df_screened.alias("source"),
-        merge_condition
-    ).whenMatchedUpdateAll(
-        condition=update_condition
-    ).whenNotMatchedInsertAll(
-    ).execute()
-    print(f"Idempotent MERGE successfully executed on {TARGET_TABLE}.")
+    # Schema Migration Check:
+    # If the target table was initialized in an earlier run and still contains 'day_ahead_error_mw',
+    # overwrite the schema once to align with the Medallion rule (error metrics moved to Gold).
+    if "day_ahead_error_mw" in target_cols:
+        print(f"Migrating Silver schema: dropping legacy 'day_ahead_error_mw' from {TARGET_TABLE}...")
+        df_screened.write \
+            .format("delta") \
+            .mode("overwrite") \
+            .option("overwriteSchema", "true") \
+            .saveAsTable(TARGET_TABLE)
+        print(f"Successfully migrated and overwritten {TARGET_TABLE} to clean Silver schema.")
+    else:
+        merge_condition = (
+            "target.respondent = source.respondent "
+            "AND target.timestamp_utc = source.timestamp_utc"
+        )
+        
+        # Update only if measurements or anomaly flags actually changed
+        update_condition = (
+            "NOT (target.actual_demand_mw <=> source.actual_demand_mw) OR "
+            "NOT (target.day_ahead_forecast_mw <=> source.day_ahead_forecast_mw) OR "
+            "NOT (target.anomaly_flag <=> source.anomaly_flag) OR "
+            "NOT (target.is_valid_demand <=> source.is_valid_demand)"
+        )
+        
+        # Explicit column mapping guarantees resilience against schema differences
+        update_cols = [c for c in df_screened.columns if c not in ["respondent", "timestamp_utc"]]
+        update_set = {col: f"source.{col}" for col in update_cols}
+        insert_set = {col: f"source.{col}" for col in df_screened.columns}
+        
+        delta_target.alias("target").merge(
+            df_screened.alias("source"),
+            merge_condition
+        ).whenMatchedUpdate(
+            condition=update_condition,
+            set=update_set
+        ).whenNotMatchedInsert(
+            values=insert_set
+        ).execute()
+        print(f"Idempotent MERGE successfully executed on {TARGET_TABLE}.")
 
 # COMMAND ----------
 # MAGIC %sql

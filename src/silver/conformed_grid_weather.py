@@ -248,27 +248,48 @@ def upsert_conformed_table(df_conformed, target_table, spark_session):
         print(f"Initialized Silver conformed table {target_table} with {total_records:,} records.")
     else:
         delta_target = DeltaTable.forName(spark_session, target_table)
-        merge_condition = (
-            "target.respondent = source.respondent "
-            "AND target.timestamp_utc = source.timestamp_utc"
-        )
+        target_cols = [c.name for c in delta_target.toDF().schema]
         
-        update_condition = (
-            "NOT (target.actual_demand_mw <=> source.actual_demand_mw) OR "
-            "NOT (target.day_ahead_forecast_mw <=> source.day_ahead_forecast_mw) OR "
-            "NOT (target.weighted_temperature_c <=> source.weighted_temperature_c) OR "
-            "NOT (target.is_valid_demand <=> source.is_valid_demand) OR "
-            "NOT (target.anomaly_flag <=> source.anomaly_flag)"
-        )
-        
-        delta_target.alias("target").merge(
-            df_conformed.alias("source"),
-            merge_condition
-        ).whenMatchedUpdateAll(
-            condition=update_condition
-        ).whenNotMatchedInsertAll(
-        ).execute()
-        print(f"Idempotent MERGE successfully executed on {target_table}.")
+        # Schema Migration Check:
+        # If legacy business metrics (e.g. eia_day_ahead_ape_pct, day_ahead_error_mw) exist in target,
+        # overwrite schema to align with Medallion rules (business metrics moved to Gold).
+        legacy_cols = [c for c in ["eia_day_ahead_ape_pct", "day_ahead_error_mw"] if c in target_cols]
+        if legacy_cols:
+            print(f"Migrating Silver conformed schema: removing {legacy_cols} from {target_table}...")
+            df_conformed.write \
+                .format("delta") \
+                .mode("overwrite") \
+                .option("overwriteSchema", "true") \
+                .saveAsTable(target_table)
+            print(f"Successfully migrated and overwritten {target_table} to clean Silver schema.")
+        else:
+            merge_condition = (
+                "target.respondent = source.respondent "
+                "AND target.timestamp_utc = source.timestamp_utc"
+            )
+            
+            update_condition = (
+                "NOT (target.actual_demand_mw <=> source.actual_demand_mw) OR "
+                "NOT (target.day_ahead_forecast_mw <=> source.day_ahead_forecast_mw) OR "
+                "NOT (target.weighted_temperature_c <=> source.weighted_temperature_c) OR "
+                "NOT (target.is_valid_demand <=> source.is_valid_demand) OR "
+                "NOT (target.anomaly_flag <=> source.anomaly_flag)"
+            )
+            
+            update_cols = [c for c in df_conformed.columns if c not in ["respondent", "timestamp_utc"]]
+            update_set = {col: f"source.{col}" for col in update_cols}
+            insert_set = {col: f"source.{col}" for col in df_conformed.columns}
+            
+            delta_target.alias("target").merge(
+                df_conformed.alias("source"),
+                merge_condition
+            ).whenMatchedUpdate(
+                condition=update_condition,
+                set=update_set
+            ).whenNotMatchedInsert(
+                values=insert_set
+            ).execute()
+            print(f"Idempotent MERGE successfully executed on {target_table}.")
 
 
 def audit_persisted_table(target_table, spark_session):
