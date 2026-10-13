@@ -186,10 +186,12 @@ def build_gold_features_dataset(df_silver, empirical_balance_f=EMPIRICAL_BALANCE
         # Rolling Statistics: Horizon 24 Window (t-47 to t-24)
         .withColumn("demand_rolling_avg_24h_lag24", F.round(F.avg("actual_demand_mw").over(window_rolling_lag24), 1))
         .withColumn("demand_rolling_std_24h_lag24", F.round(F.stddev("actual_demand_mw").over(window_rolling_lag24), 1))
+        .withColumn("demand_rolling_count_24h_lag24", F.count("actual_demand_mw").over(window_rolling_lag24))
         
         # Rolling Statistics: Horizon 48 Window (t-71 to t-48, strictly leakage-safe for H=48)
         .withColumn("demand_rolling_avg_24h_lag48", F.round(F.avg("actual_demand_mw").over(window_rolling_lag48), 1))
         .withColumn("demand_rolling_std_24h_lag48", F.round(F.stddev("actual_demand_mw").over(window_rolling_lag48), 1))
+        .withColumn("demand_rolling_count_24h_lag48", F.count("actual_demand_mw").over(window_rolling_lag48))
         
         # Holiday-Adjacent Indicator (True if previous 24h or next 24h is a holiday)
         .withColumn(
@@ -201,9 +203,13 @@ def build_gold_features_dataset(df_silver, empirical_balance_f=EMPIRICAL_BALANCE
             ).otherwise(F.lit(0.0))
         )
         
-        # Training Sample Eligibility Indicator (Guarantees uncorrupted targets AND lookbacks)
+        # Base training sample validity conditions:
+        # 1. Target actual demand is valid and within physical bounds
+        # 2. Target hour is not a curtailed grid emergency
+        # 3. 168h lookback history does not intersect Winter Storm Uri
+        # 4. Canonical 168h seasonal lag exists
         .withColumn(
-            "is_valid_training_sample",
+            "is_base_training_eligible",
             F.when(
                 F.col("actual_demand_mw").isNotNull() &
                 (F.col("is_valid_demand") == True) &
@@ -213,6 +219,30 @@ def build_gold_features_dataset(df_silver, empirical_balance_f=EMPIRICAL_BALANCE
                 F.lit(True)
             ).otherwise(F.lit(False))
         )
+        # Horizon H=24 Sample Validity: requires base validity, lag_24h, lag_48h, and complete 24h rolling window
+        .withColumn(
+            "is_valid_training_sample_h24",
+            F.when(
+                (F.col("is_base_training_eligible") == True) &
+                F.col("demand_lag_24h").isNotNull() &
+                F.col("demand_lag_48h").isNotNull() &
+                (F.col("demand_rolling_count_24h_lag24") == 24),
+                F.lit(True)
+            ).otherwise(F.lit(False))
+        )
+        # Horizon H=48 Sample Validity: requires base validity, lag_48h, lag_72h, and complete 48h rolling window
+        .withColumn(
+            "is_valid_training_sample_h48",
+            F.when(
+                (F.col("is_base_training_eligible") == True) &
+                F.col("demand_lag_48h").isNotNull() &
+                F.col("demand_lag_72h").isNotNull() &
+                (F.col("demand_rolling_count_24h_lag48") == 24),
+                F.lit(True)
+            ).otherwise(F.lit(False))
+        )
+        # Canonical backwards-compatible training sample flag
+        .withColumn("is_valid_training_sample", F.col("is_valid_training_sample_h24"))
         .withColumn("_gold_feature_extracted_at_utc", F.current_timestamp())
     )
     
@@ -238,6 +268,23 @@ def validate_gold_features_candidate(df_features):
         f"Integrity Failure: Found {total_rows - distinct_keys} duplicate timestamp records!"
     )
     
+    # 2b. Chronological Grid Continuity Check: Ensure zero missing hours across the span
+    span_stats = df_features.select(
+        F.min("timestamp_utc").alias("min_utc"),
+        F.max("timestamp_utc").alias("max_utc"),
+        F.countDistinct("timestamp_utc").alias("distinct_hours")
+    ).first()
+    min_ts = span_stats["min_utc"]
+    max_ts = span_stats["max_utc"]
+    distinct_hours = span_stats["distinct_hours"]
+    if min_ts is not None and max_ts is not None and distinct_hours > 0:
+        expected_span_hours = int((max_ts - min_ts).total_seconds() / 3600.0) + 1
+        assert distinct_hours == expected_span_hours, (
+            f"Grid Continuity Failure: Expected {expected_span_hours:,} continuous hours "
+            f"between {min_ts} and {max_ts}, but found {distinct_hours:,} (missing {expected_span_hours - distinct_hours:,} hours). "
+            "Continuous hourly grid is strictly required for row-offset autoregressive lag safety."
+        )
+    
     # Cyclical feature boundary check
     bounds_violation = df_features.filter(
         (F.col("hour_sin") < -1.0001) | (F.col("hour_sin") > 1.0001) |
@@ -245,25 +292,39 @@ def validate_gold_features_candidate(df_features):
     ).count()
     assert bounds_violation == 0, f"Math Failure: {bounds_violation} cyclical features outside [-1, 1] range!"
     
-    # Emergency exclusion assertion: zero direct target leaks and zero lookback contamination leaks
-    uri_target_leaks = df_features.filter(
-        (F.col("is_grid_emergency") == True) & (F.col("is_valid_training_sample") == True)
+    # Horizon H=24 and H=48 training eligibility integrity assertions
+    h24_invalid = df_features.filter(
+        (F.col("is_valid_training_sample_h24") == True) &
+        (
+            F.col("demand_lag_24h").isNull() |
+            F.col("demand_lag_48h").isNull() |
+            (F.col("demand_rolling_count_24h_lag24") != 24) |
+            (F.col("is_grid_emergency") == True) |
+            (F.col("is_lookback_emergency_contaminated") == True)
+        )
     ).count()
-    assert uri_target_leaks == 0, f"Leakage Failure: Found {uri_target_leaks} Uri emergency target records in training sample!"
+    assert h24_invalid == 0, f"Integrity Failure: Found {h24_invalid} invalid rows flagged as valid H=24 training samples!"
     
-    uri_lookback_leaks = df_features.filter(
-        (F.col("is_lookback_emergency_contaminated") == True) & (F.col("is_valid_training_sample") == True)
+    h48_invalid = df_features.filter(
+        (F.col("is_valid_training_sample_h48") == True) &
+        (
+            F.col("demand_lag_48h").isNull() |
+            F.col("demand_lag_72h").isNull() |
+            (F.col("demand_rolling_count_24h_lag48") != 24) |
+            (F.col("is_grid_emergency") == True) |
+            (F.col("is_lookback_emergency_contaminated") == True)
+        )
     ).count()
-    assert uri_lookback_leaks == 0, f"Leakage Failure: Found {uri_lookback_leaks} lookback-contaminated records in training sample!"
+    assert h48_invalid == 0, f"Integrity Failure: Found {h48_invalid} invalid rows flagged as valid H=48 training samples!"
     
     # Degree hour non-negativity check
     invalid_dh = df_features.filter((F.col("cdh_55") < 0.0) | (F.col("hdh_55") < 0.0)).count()
     assert invalid_dh == 0, f"Thermodynamic Failure: Found {invalid_dh} negative degree-hour records!"
     
     print(f"Feature Table Quality Gate Passed:")
-    print(f"  - Total records: {total_rows:,}")
+    print(f"  - Total records: {total_rows:,} (Continuous hourly grid verified)")
     print(f"  - Cyclical feature bounds verified (sin/cos in [-1.0, 1.0])")
-    print(f"  - Multi-horizon lag structure verified (H=24 vs H=48 tiers)")
+    print(f"  - Strict Horizon sample validity verified: H=24 and H=48 training flags verified")
     print(f"  - Winter Storm Uri target AND lookback contamination verified (0 sample leaks)")
 
 # COMMAND ----------

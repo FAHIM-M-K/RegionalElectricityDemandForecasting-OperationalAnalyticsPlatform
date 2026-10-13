@@ -174,19 +174,20 @@ if all_weather_rows:
     for exp_st in expected_stations:
         assert exp_st in ingested_stations, f"Completeness Failure: Expected station {exp_st} not found in ingested batch."
         
-    # Assert timestamp matrix coverage: every station must have the exact same count of timestamps
-    station_counts = (
-        source_deduped.groupBy("station_id")
+    # Assert exact timestamp matrix equality: every single timestamp must have ALL stations reporting
+    missing_station_timestamps = (
+        source_deduped.groupBy("time_utc")
+        .agg(F.countDistinct("station_id").alias("stations_reporting"))
+        .filter(F.col("stations_reporting") != len(expected_stations))
         .count()
-        .collect()
     )
-    counts_map = {row["station_id"]: row["count"] for row in station_counts}
-    unique_counts = set(counts_map.values())
-    assert len(unique_counts) == 1, (
-        f"Alignment Failure: Stations have unequal hourly timestamps! Counts: {counts_map}"
+    assert missing_station_timestamps == 0, (
+        f"Matrix Alignment Failure: Found {missing_station_timestamps} timestamps where not all "
+        f"{len(expected_stations)} stations reported simultaneously."
     )
-        
-    print(f"Quality Assertions Passed: 0 null keys. All {len(expected_stations)} stations present with identical count ({list(unique_counts)[0]} hrs).")
+    
+    total_distinct_hours = source_deduped.select("time_utc").distinct().count()
+    print(f"Quality Assertions Passed: 0 null keys. All {len(expected_stations)} stations aligned across exactly {total_distinct_hours:,} synchronized hours.")
     
     # 4. Idempotent Upsert into Bronze Delta table with Null-Safe Equality (<=>)
     if not spark.catalog.tableExists(TABLE_NAME):

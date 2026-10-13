@@ -195,6 +195,23 @@ def validate_conformed_candidate(df_conformed, df_demand, df_weather, df_calenda
     utc_dupes = df_conformed.groupBy("timestamp_utc").count().filter("count > 1").count()
     assert utc_dupes == 0, f"DST Safety Failure: Found {utc_dupes} duplicate UTC hours."
 
+    # 4b. Chronological Grid Continuity Check: Ensure zero missing hourly slots across the span
+    span_stats = df_conformed.select(
+        F.min("timestamp_utc").alias("min_utc"),
+        F.max("timestamp_utc").alias("max_utc"),
+        F.countDistinct("timestamp_utc").alias("distinct_hours")
+    ).first()
+    min_ts = span_stats["min_utc"]
+    max_ts = span_stats["max_utc"]
+    distinct_hours = span_stats["distinct_hours"]
+    if min_ts is not None and max_ts is not None and distinct_hours > 0:
+        expected_span_hours = int((max_ts - min_ts).total_seconds() / 3600.0) + 1
+        assert distinct_hours == expected_span_hours, (
+            f"Grid Continuity Failure: Expected {expected_span_hours:,} continuous hourly intervals "
+            f"between {min_ts} and {max_ts}, but found {distinct_hours:,} (missing {expected_span_hours - distinct_hours:,} hours). "
+            "Continuous hourly grid is strictly required for row-offset autoregressive lag safety."
+        )
+
     # 5. Missing Data Semantics
     null_status = df_conformed.filter(F.col("demand_availability_status").isNull()).count()
     assert null_status == 0, f"Integrity Failure: Found {null_status} rows with null demand_availability_status."
