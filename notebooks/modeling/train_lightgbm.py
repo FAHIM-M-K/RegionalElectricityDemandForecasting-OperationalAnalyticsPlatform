@@ -92,6 +92,8 @@ FEATURE_COLS = [
     "demand_lag_24h",
     "demand_lag_48h",
     "demand_lag_168h",
+    "demand_diff_24_48",
+    "demand_diff_24_168",
     "demand_rolling_avg_24h_lag24",
     "demand_rolling_std_24h_lag24"
 ]
@@ -120,6 +122,10 @@ pdf_all = df_spark.toPandas()
 pdf_all[TIME_COL] = pd.to_datetime(pdf_all[TIME_COL])
 pdf_all = pdf_all.sort_values(TIME_COL).reset_index(drop=True)
 
+# Compute Day-Ahead momentum / delta features
+pdf_all["demand_diff_24_48"] = pdf_all["demand_lag_24h"] - pdf_all["demand_lag_48h"]
+pdf_all["demand_diff_24_168"] = pdf_all["demand_lag_24h"] - pdf_all["demand_lag_168h"]
+
 # Chronological split masks
 SPLIT_TRAIN_END = pd.to_datetime("2024-01-01 00:00:00")
 SPLIT_VAL_END   = pd.to_datetime("2024-07-01 00:00:00")
@@ -137,6 +143,11 @@ y_val = pdf_all.loc[val_mask, TARGET_COL].copy()
 X_test = pdf_all.loc[test_mask, FEATURE_COLS].copy()
 y_test = pdf_all.loc[test_mask, TARGET_COL].copy()
 test_meta = pdf_all.loc[test_mask, [TIME_COL, TARGET_COL, BENCHMARK_COL, "hour_local", "demand_lag_24h", "demand_lag_168h"]].copy()
+
+# Delta Target Formulation: y_delta = actual_demand_mw - demand_lag_24h
+# Eliminates secular grid growth extrapolation bias: yesterday's demand sets modern base level
+y_train_delta = y_train - X_train["demand_lag_24h"]
+y_val_delta   = y_val - X_val["demand_lag_24h"]
 
 # Cast boolean flags to float
 for c in ["is_weekend", "is_holiday"]:
@@ -179,8 +190,8 @@ callbacks = [
 
 model.fit(
     X_train,
-    y_train,
-    eval_set=[(X_val, y_val)],
+    y_train_delta,
+    eval_set=[(X_val, y_val_delta)],
     callbacks=callbacks
 )
 
@@ -189,7 +200,9 @@ print(f"Training completed! Optimal trees: {best_iteration}")
 
 # COMMAND ----------
 # DBTITLE 1,Generate Predictions on Holdout Test Cohort
-y_pred_test = model.predict(X_test)
+# Reconstruct full demand: Forecast = Yesterday's Demand (t-24) + Predicted Delta
+y_pred_delta = model.predict(X_test)
+y_pred_test = test_meta["demand_lag_24h"].values + y_pred_delta
 test_meta["pred_lightgbm"] = y_pred_test
 
 # COMMAND ----------
@@ -311,9 +324,9 @@ display(importance_df.head(15))
 # DBTITLE 1,Log Run & Validated Signature to MLflow
 mlflow.set_experiment("/Shared/regional_demand_forecasting")
 
-# Infer signature cleanly from input sample
+# Infer signature cleanly from input sample and delta target
 input_example = X_train.head(5)
-signature = infer_signature(input_example, y_train.head(5))
+signature = infer_signature(input_example, y_train_delta.head(5))
 
 with mlflow.start_run(run_name="LightGBM_Champion_H24"):
     # Log parameters
