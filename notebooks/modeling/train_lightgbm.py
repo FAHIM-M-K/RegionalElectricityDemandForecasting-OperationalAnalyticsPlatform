@@ -108,7 +108,9 @@ for i, col in enumerate(FEATURE_COLS, 1):
 
 # COMMAND ----------
 # DBTITLE 1,Extract Datasets & Apply Strict Chronological Splits
-cols_to_pull = [TIME_COL, TARGET_COL, BENCHMARK_COL, "hour_local"] + FEATURE_COLS
+# Separate base columns stored in Delta table from derived momentum columns computed in-memory
+BASE_FEATURE_COLS = [c for c in FEATURE_COLS if c not in ["demand_diff_24_48", "demand_diff_24_168"]]
+cols_to_pull = [TIME_COL, TARGET_COL, BENCHMARK_COL, "hour_local"] + BASE_FEATURE_COLS
 
 df_spark = (
     spark.table(FEATURES_TABLE)
