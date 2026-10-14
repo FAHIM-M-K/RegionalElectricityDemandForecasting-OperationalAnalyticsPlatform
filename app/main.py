@@ -2,10 +2,9 @@ import os
 import sys
 import streamlit as st
 
-# Configure wide layout and page metadata
+# Configure wide layout and page metadata without emojis
 st.set_page_config(
     page_title="ERCOT Operational Grid Forecast Platform",
-    page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -26,8 +25,8 @@ if os.path.exists(css_path):
 
 # ---------------- Sidebar Configuration ----------------
 with st.sidebar:
-    st.markdown("### ⚡ Grid Dispatch Control")
-    st.markdown("Operational electricity demand forecasting & capacity risk analytics.")
+    st.markdown("#### Grid Dispatch Control")
+    st.caption("Operational demand forecasting and capacity analytics.")
     st.divider()
 
     selected_region = st.selectbox(
@@ -57,29 +56,29 @@ with st.sidebar:
     with st.spinner("Connecting to Gold Forecast Mart..."):
         df_forecast, data_source = load_operational_forecast_data()
 
-    st.markdown("### 📡 Data Pipeline Status")
+    st.markdown("##### Pipeline Connection Status")
     if "Databricks" in data_source:
-        st.markdown(f'<span class="badge-success">LIVE: {data_source}</span>', unsafe_allow_html=True)
+        st.markdown(f'<span class="status-pill-success">{data_source}</span>', unsafe_allow_html=True)
     else:
-        st.markdown(f'<span class="badge-warning">OFFLINE: {data_source}</span>', unsafe_allow_html=True)
-        st.caption("Using high-fidelity local ERCOT simulation. Set Databricks credentials in .env to stream live Unity Catalog tables.")
+        st.markdown(f'<span class="status-pill-neutral">{data_source}</span>', unsafe_allow_html=True)
+        st.caption("Using local ERCOT sample. Set Databricks credentials in .env to stream live tables.")
 
     st.divider()
     st.markdown("""
-    **Model Champion:** `LightGBM Hybrid`  
-    **Target:** Day-Ahead Load ($H=24..48$)  
-    **EIA Lift:** **+3.58% Global**, **+7.37% Peak**
+    **Champion Architecture:** LightGBM Hybrid  
+    **Evaluation Target:** Day-Ahead Load (H=24..48)  
+    **Benchmark Superiority:** +3.58% Global Lift, +7.37% Peak Lift
     """)
 
 # ---------------- Main Dashboard Layout ----------------
 st.title("ERCOT Regional Demand Forecasting Platform")
-st.caption("Day-Ahead Operational Analytics & Institutional Benchmark Comparison Engine")
+st.caption("Operational Dispatch Analytics and Institutional EIA Benchmark Scorecard")
 
-# Top Navigation Tabs
+# Top Navigation Tabs without emojis
 tab_exec, tab_analytics, tab_monitoring = st.tabs([
-    "🚀 Executive Dispatch",
-    "📊 Operational Analytics",
-    "🛡️ Model Governance & Monitoring"
+    "Executive Dispatch",
+    "Operational Analytics",
+    "Model Governance and Monitoring"
 ])
 
 with tab_exec:

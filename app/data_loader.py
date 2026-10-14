@@ -38,6 +38,9 @@ def get_databricks_connection():
         print(f"Warning: Databricks SQL connection failed: {e}")
         return None
 
+import streamlit as st
+
+@st.cache_data(ttl=300)
 def load_operational_forecast_data():
     """
     Loads hourly forecast and demand data.
@@ -48,31 +51,36 @@ def load_operational_forecast_data():
         try:
             query = """
             SELECT 
-                respondent,
-                timestamp_utc,
-                timestamp_local,
-                date_local,
-                hour_local,
-                day_of_week_local,
-                actual_demand_mw,
-                day_ahead_forecast_mw,
-                predicted_demand_mw,
-                prediction_lower_95_mw,
-                prediction_upper_95_mw,
-                is_predicted_peak_risk,
-                model_error_mw,
-                model_abs_error_mw,
-                eia_error_mw,
-                eia_abs_error_mw,
-                is_model_better_than_eia,
-                model_version
-            FROM main.gold.forecast_hourly
-            WHERE respondent = 'ERCO'
-            ORDER BY timestamp_utc ASC
+                f.respondent,
+                f.timestamp_utc,
+                f.timestamp_local,
+                f.date_local,
+                f.hour_local,
+                f.day_of_week_local,
+                f.actual_demand_mw,
+                f.day_ahead_forecast_mw,
+                f.predicted_demand_mw,
+                f.prediction_lower_95_mw,
+                f.prediction_upper_95_mw,
+                f.is_predicted_peak_risk,
+                f.model_error_mw,
+                f.model_abs_error_mw,
+                f.eia_error_mw,
+                f.eia_abs_error_mw,
+                f.is_model_better_than_eia,
+                f.model_version,
+                feat.weighted_temperature_f
+            FROM main.gold.forecast_hourly f
+            LEFT JOIN main.gold.features_hourly feat
+              ON f.respondent = feat.respondent AND f.timestamp_utc = feat.timestamp_utc
+            WHERE f.respondent = 'ERCO'
+            ORDER BY f.timestamp_utc DESC
+            LIMIT 8760
             """
             df = pd.read_sql(query, conn)
             conn.close()
             if len(df) > 0:
+                df = df.sort_values("timestamp_utc").reset_index(drop=True)
                 df["timestamp_local"] = pd.to_datetime(df["timestamp_local"])
                 df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"])
                 return df, "Databricks Unity Catalog (Live)"
