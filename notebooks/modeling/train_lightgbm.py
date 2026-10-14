@@ -55,21 +55,22 @@ BA_CODE = config.get("region", {}).get("code", "ERCO")
 
 # COMMAND ----------
 # DBTITLE 1,Define Feature Architecture & Leakage Contract
-# Explicit feature set: strictly observable at day-ahead origin (t0 = T-24)
+# Scale-invariant stationary features: strictly observable at day-ahead origin (t0 = T-24)
+# Excludes raw non-stationary MW levels (demand_lag_24h, year_local) to eliminate multi-year grid growth bias
 FEATURE_COLS = [
-    # 1. Empirical Thermodynamic Features (55.2°F balance point)
+    # 1. Target-Hour Weather (Stationary across years: 95°F in 2021 = 95°F in 2026)
+    "weighted_temperature_f",
     "cdh_55",
     "hdh_55",
     "temp_deviation_55_sq",
     "temp_delta_dfw_houston_c",
     
-    # 2. Raw Temperature & Weather Context
-    "weighted_temperature_f",
+    # 2. Weather Differences vs Yesterday (t-24) — The Primary Physical Driver of Load Shift
+    "temp_diff_24h",
+    "cdh_diff_24h",
+    "hdh_diff_24h",
     
-    # 3. Multi-Year Secular Growth Anchor
-    "year_local",
-    
-    # 4. Cyclical Temporal Encodings (smooth circular time)
+    # 3. Cyclical Temporal Encodings (smooth circular time)
     "hour_sin",
     "hour_cos",
     "day_of_week_sin",
@@ -79,54 +80,75 @@ FEATURE_COLS = [
     "day_of_year_sin",
     "day_of_year_cos",
     
-    # 5. Calendar & Holiday Encodings
+    # 4. Calendar & Day-over-Day Transitions (Scale-Invariant)
     "is_weekend",
     "is_holiday",
     "is_major_shutdown_holiday",
     "is_holiday_adjacent",
+    "weekend_diff_24h",
+    "holiday_diff_24h",
     "season_summer",
     "season_winter",
     "season_shoulder",
     
-    # 6. Day-Ahead Horizon (H=24) Autoregressive Lags & Rolling Context
-    "demand_lag_24h",
-    "demand_lag_48h",
-    "demand_lag_168h",
-    "demand_diff_24_48",
-    "demand_diff_24_168",
-    "demand_rolling_avg_24h_lag24",
-    "demand_rolling_std_24h_lag24"
+    # 5. Scale-Invariant Load Ratios & Volatility (No raw non-stationary MW)
+    "demand_ratio_24_48",
+    "demand_ratio_24_168",
+    "demand_rolling_cv_24h"
 ]
 
 TARGET_COL = "actual_demand_mw"
 BENCHMARK_COL = "day_ahead_forecast_mw"
 TIME_COL = "timestamp_utc"
 
-print(f"Selected {len(FEATURE_COLS)} leakage-safe features for LightGBM Champion:")
+print(f"Selected {len(FEATURE_COLS)} stationary scale-invariant features for LightGBM Champion:")
 for i, col in enumerate(FEATURE_COLS, 1):
     print(f"  {i:02d}. {col}")
 
 # COMMAND ----------
 # DBTITLE 1,Extract Datasets & Apply Strict Chronological Splits
-# Separate base columns stored in Delta table from derived momentum columns computed in-memory
-BASE_FEATURE_COLS = [c for c in FEATURE_COLS if c not in ["demand_diff_24_48", "demand_diff_24_168"]]
-cols_to_pull = [TIME_COL, TARGET_COL, BENCHMARK_COL, "hour_local"] + BASE_FEATURE_COLS
+# Base columns stored in Delta table
+BASE_COLS = [
+    TIME_COL, TARGET_COL, BENCHMARK_COL, "hour_local",
+    "cdh_55", "hdh_55", "temp_deviation_55_sq", "temp_delta_dfw_houston_c",
+    "weighted_temperature_f", "hour_sin", "hour_cos", "day_of_week_sin",
+    "day_of_week_cos", "month_sin", "month_cos", "day_of_year_sin",
+    "day_of_year_cos", "is_weekend", "is_holiday", "is_major_shutdown_holiday",
+    "is_holiday_adjacent", "season_summer", "season_winter", "season_shoulder",
+    "demand_lag_24h", "demand_lag_48h", "demand_lag_168h",
+    "demand_rolling_avg_24h_lag24", "demand_rolling_std_24h_lag24"
+]
 
 df_spark = (
     spark.table(FEATURES_TABLE)
     .filter(F.col("respondent") == BA_CODE)
     .filter(F.col("is_valid_training_sample_h24") == True)
     .filter(F.col(BENCHMARK_COL).isNotNull())
-    .select(*cols_to_pull)
+    .select(*BASE_COLS)
 )
 
 pdf_all = df_spark.toPandas()
 pdf_all[TIME_COL] = pd.to_datetime(pdf_all[TIME_COL])
 pdf_all = pdf_all.sort_values(TIME_COL).reset_index(drop=True)
 
-# Compute Day-Ahead momentum / delta features
-pdf_all["demand_diff_24_48"] = pdf_all["demand_lag_24h"] - pdf_all["demand_lag_48h"]
-pdf_all["demand_diff_24_168"] = pdf_all["demand_lag_24h"] - pdf_all["demand_lag_168h"]
+# 1. Weather shifts from yesterday at the exact same hour
+pdf_all["temp_diff_24h"] = (pdf_all["weighted_temperature_f"] - pdf_all["weighted_temperature_f"].shift(24)).fillna(0.0)
+pdf_all["cdh_diff_24h"] = (pdf_all["cdh_55"] - pdf_all["cdh_55"].shift(24)).fillna(0.0)
+pdf_all["hdh_diff_24h"] = (pdf_all["hdh_55"] - pdf_all["hdh_55"].shift(24)).fillna(0.0)
+
+# 2. Calendar transitions from yesterday (e.g. Friday -> Saturday = -1.0)
+pdf_all["weekend_diff_24h"] = (pdf_all["is_weekend"].astype(float) - pdf_all["is_weekend"].astype(float).shift(24)).fillna(0.0)
+pdf_all["holiday_diff_24h"] = (pdf_all["is_holiday"].astype(float) - pdf_all["is_holiday"].astype(float).shift(24)).fillna(0.0)
+
+# 3. Scale-invariant load momentum ratios (normalized by base load to eliminate grid growth bias)
+pdf_all["demand_ratio_24_48"] = ((pdf_all["demand_lag_24h"] - pdf_all["demand_lag_48h"]) / pdf_all["demand_lag_48h"].clip(lower=1000.0)).fillna(0.0)
+pdf_all["demand_ratio_24_168"] = ((pdf_all["demand_lag_24h"] - pdf_all["demand_lag_168h"]) / pdf_all["demand_lag_168h"].clip(lower=1000.0)).fillna(0.0)
+pdf_all["demand_rolling_cv_24h"] = (pdf_all["demand_rolling_std_24h_lag24"] / pdf_all["demand_rolling_avg_24h_lag24"].clip(lower=1000.0)).fillna(0.0)
+
+# Cast boolean flags to float
+for c in ["is_weekend", "is_holiday"]:
+    if c in pdf_all.columns:
+        pdf_all[c] = pdf_all[c].astype(float)
 
 # Chronological split masks
 SPLIT_TRAIN_END = pd.to_datetime("2024-01-01 00:00:00")
@@ -148,15 +170,8 @@ test_meta = pdf_all.loc[test_mask, [TIME_COL, TARGET_COL, BENCHMARK_COL, "hour_l
 
 # Delta Target Formulation: y_delta = actual_demand_mw - demand_lag_24h
 # Eliminates secular grid growth extrapolation bias: yesterday's demand sets modern base level
-y_train_delta = y_train - X_train["demand_lag_24h"]
-y_val_delta   = y_val - X_val["demand_lag_24h"]
-
-# Cast boolean flags to float
-for c in ["is_weekend", "is_holiday"]:
-    if c in X_train.columns:
-        X_train[c] = X_train[c].astype(float)
-        X_val[c] = X_val[c].astype(float)
-        X_test[c] = X_test[c].astype(float)
+y_train_delta = y_train - pdf_all.loc[train_mask, "demand_lag_24h"]
+y_val_delta   = y_val - pdf_all.loc[val_mask, "demand_lag_24h"]
 
 print(f"Dataset Split Sizes:")
 print(f"  - Train Cohort (2021-03 through 2023): {len(X_train):,} samples")
