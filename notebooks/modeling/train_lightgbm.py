@@ -15,6 +15,9 @@
 # MAGIC - **Target 2 (Peak Hour MAE):** Beat EIA Peak MAE (1,464.6 MW) by >= 15% (Target: **< 1,244.9 MW**)
 
 # COMMAND ----------
+# MAGIC %pip install lightgbm --quiet
+
+# COMMAND ----------
 # DBTITLE 1,Imports & Setup
 import os
 import sys
