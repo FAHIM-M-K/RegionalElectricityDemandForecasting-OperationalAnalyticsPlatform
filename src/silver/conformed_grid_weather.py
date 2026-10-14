@@ -105,7 +105,7 @@ def build_conformed_dataset(df_demand, df_weather, df_calendar, ba_code=BA_CODE)
         # Electricity Metrics & Quality Flags
         F.col("d.actual_demand_mw"),
         F.col("d.day_ahead_forecast_mw"),
-        F.col("d.is_valid_demand"),
+        F.when(F.col("d.actual_demand_mw").isNotNull(), F.col("d.is_valid_demand")).alias("is_valid_demand"),
         F.col("d.anomaly_flag"),
         
         # Regional Weighted Weather Indices

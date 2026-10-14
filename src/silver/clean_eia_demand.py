@@ -104,8 +104,8 @@ df_screened = df_pivoted \
     ) \
     .withColumn(
         "is_valid_demand",
-        F.when(
-            (F.col("actual_demand_mw").isNotNull()) &
+        F.when(F.col("actual_demand_mw").isNull(), F.lit(None).cast(BooleanType()))
+         .when(
             (F.col("actual_demand_mw") >= MIN_PLAUSIBLE_DEMAND_MW) &
             (F.col("actual_demand_mw") <= MAX_PLAUSIBLE_DEMAND_MW),
             F.lit(True)
