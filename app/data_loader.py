@@ -81,8 +81,8 @@ def load_operational_forecast_data():
             conn.close()
             if len(df) > 0:
                 df = df.sort_values("timestamp_utc").reset_index(drop=True)
-                df["timestamp_local"] = pd.to_datetime(df["timestamp_local"])
-                df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"])
+                df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
+                df["timestamp_local"] = df["timestamp_utc"].dt.tz_convert("America/Chicago")
                 return df, "Databricks Unity Catalog (Live)"
         except Exception as e:
             err_msg = str(e)
