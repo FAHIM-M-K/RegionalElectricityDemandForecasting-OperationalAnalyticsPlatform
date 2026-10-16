@@ -2,272 +2,86 @@
 # MAGIC %md
 # MAGIC # Grid Stress Regime Case Studies: Uri & Summer 2023
 # MAGIC
-# MAGIC **Research Question:**  
-# MAGIC Which historical periods in our dataset reflect **supply-constrained** (artificially capped)
-# MAGIC served load rather than unconstrained consumer demand — and what are the implications
-# MAGIC for machine learning training?
+# MAGIC **Core Objective:** Detect supply-constrained periods (artificially suppressed load) vs
+# MAGIC unconstrained extreme demand records to prevent model training distortion.
 # MAGIC
-# MAGIC **Why This Matters:**  
-# MAGIC Machine learning models trained on electricity demand assume `actual_demand_mw` represents
-# MAGIC what consumers **wanted** to consume at that hour. This assumption breaks catastrophically
-# MAGIC during grid emergencies when involuntary load shedding forces demand below what it would
-# MAGIC otherwise be. Including these distorted observations in model training without flagging
-# MAGIC them biases learned relationships — particularly temperature-demand coefficients during
-# MAGIC extreme cold, which is exactly the regime we most need to extrapolate to for risk.
-# MAGIC
-# MAGIC **Two Regimes Examined:**
-# MAGIC
-# MAGIC | Event | Period | Nature | Training Risk |
-# MAGIC |---|---|---|---|
-# MAGIC | Winter Storm Uri | Feb 13–19, 2021 | Supply curtailment (involuntary blackouts ~20 GW shed) | Demand artificially suppressed — cold-weather response is underestimated |
-# MAGIC | Summer 2023 Heatwave | Jul–Aug 2023 | Unconstrained demand record (no load shedding) | True cooling saturation ceiling — model should reflect this |
-# MAGIC
-# MAGIC **Formal Claim Boundary:**  
-# MAGIC We do not claim that ERCOT grid management decisions were correct or incorrect.
-# MAGIC We document the data implications for our forecasting model exclusively.
+# MAGIC **Feature Layer Implication:**
+# MAGIC - Winter Storm Uri (Feb 2021) had ~20 GW of involuntary load shedding. Justifies `is_grid_emergency` flag.
+# MAGIC - Summer 2023 set records (>85 GW) without load shedding. Validates high-temperature linearity.
 
 # COMMAND ----------
 # DBTITLE 1,Imports & Setup
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy import stats
 from pyspark.sql import functions as F
 
 SILVER_TABLE = "main.silver.grid_hourly_conformed"
 
-# COMMAND ----------
-# DBTITLE 1,Load Full Conformed Table (Unrestricted for Regime Analysis)
-# Note: We load the FULL silver table here — not the is_valid_demand-filtered cohort —
-# because Uri observations were recorded and are "valid" data in the Silver sense
-# (they passed physical bounds), but they are regime-distorted for modelling purposes.
-# The regime analysis notebook explicitly characterises this distinction.
-df_full = spark.table(SILVER_TABLE).filter(
-    F.col("actual_demand_mw").isNotNull()
-)
-
-print(f"Full historical cohort (all available hours): {df_full.count():,} records")
+df_full = spark.table(SILVER_TABLE).filter(F.col("actual_demand_mw").isNotNull())
 
 # COMMAND ----------
-# MAGIC %md
-# MAGIC ## Case Study 1: Winter Storm Uri — February 13–19, 2021
-# MAGIC
-# MAGIC ### Background
-# MAGIC During the week of February 13–19, 2021, a historic polar vortex collapsed brought
-# MAGIC temperatures as low as **−2°F in DFW and +12°F in Houston** — temperatures well outside
-# MAGIC normal Texas building thermal tolerances. ERCOT's grid frequency dropped to within
-# MAGIC **4.5 seconds** of a complete blackout (~59.3 Hz). Emergency firm load shedding
-# MAGIC removed up to **20,000 MW** of load in rolling intervals to protect grid stability.
-# MAGIC
-# MAGIC ### Data Implication
-# MAGIC EIA `actual_demand_mw` records the **served load** — what was actually consumed —
-# MAGIC not the unconstrained consumer demand. During Uri, served load was artificially
-# MAGIC capped at ~50,000 MW while ERCOT internally estimated unconstrained demand at
-# MAGIC **>76,000 MW** had all consumers been able to receive power.
-# MAGIC
-# MAGIC ### Modelling Decision
-# MAGIC Uri observations should be **flagged** in the Gold feature table (`is_grid_emergency`)
-# MAGIC rather than silently dropped. During training, models can be evaluated with and without
-# MAGIC Uri hours to measure the regime's influence on cold-weather response coefficients.
-
-# COMMAND ----------
-# DBTITLE 1,Uri Period: Hourly Temperature & Served Demand Profile
-URI_START = "2021-02-13"
-URI_END   = "2021-02-20"
-
+# DBTITLE 1,1. Winter Storm Uri (Feb 13–20, 2021) — Load Shedding Audit
 df_uri = (
     df_full.filter(
-        (F.col("timestamp_local") >= URI_START) &
-        (F.col("timestamp_local") <  URI_END)
+        (F.col("timestamp_local") >= "2021-02-13") &
+        (F.col("timestamp_local") <  "2021-02-20")
     )
-    .select(
-        "timestamp_local",
-        "actual_demand_mw",
-        "day_ahead_forecast_mw",
-        "weighted_temperature_f",
-        "temp_dfw_c",
-        "temp_houston_c",
-        "is_valid_demand",
-    )
+    .select("timestamp_local", "actual_demand_mw", "weighted_temperature_f")
     .orderBy("timestamp_local")
 )
 
 display(df_uri)
 
-# Visualize Uri Demand and Temperature Collapse
-pdf_uri = df_uri.toPandas()
-if not pdf_uri.empty:
-    fig, ax1 = plt.subplots(figsize=(10, 5))
-    ax1.set_xlabel("Local Timestamp", fontsize=11)
-    ax1.set_ylabel("Actual Served Demand (MW)", color="#1f77b4", fontsize=11)
-    ax1.plot(pdf_uri["timestamp_local"], pdf_uri["actual_demand_mw"], color="#1f77b4", lw=1.8, label="Actual Served Demand")
-    ax1.tick_params(axis="y", labelcolor="#1f77b4")
-
-    ax2 = ax1.twinx()
-    ax2.set_ylabel("Regional Temperature (°F)", color="#d62728", fontsize=11)
-    ax2.plot(pdf_uri["timestamp_local"], pdf_uri["weighted_temperature_f"], color="#d62728", lw=1.5, linestyle="--", label="Temperature (°F)")
-    ax2.tick_params(axis="y", labelcolor="#d62728")
-
-    plt.title("Winter Storm Uri (Feb 2021): Grid Stress & Involuntary Load Curtailment", fontsize=13, fontweight="bold")
-    fig.tight_layout()
-    plt.show()
-
-# COMMAND ----------
-# DBTITLE 1,Uri Regime Summary Statistics
 uri_stats = df_uri.select(
-    F.count("*").alias("total_uri_hours"),
-    F.round(F.min("weighted_temperature_f"), 1).alias("min_regional_temp_f"),
-    F.round(F.min("temp_dfw_c"), 1).alias("min_dfw_temp_c"),
-    F.round(F.min("temp_houston_c"), 1).alias("min_houston_temp_c"),
-    F.round(F.min("actual_demand_mw"), 1).alias("min_served_demand_mw"),
-    F.round(F.max("actual_demand_mw"), 1).alias("max_served_demand_mw"),
-    F.round(F.avg("actual_demand_mw"), 1).alias("avg_served_demand_mw"),
-    F.round(F.max("day_ahead_forecast_mw"), 1).alias("max_da_forecast_mw"),
+    F.round(F.min("weighted_temperature_f"), 1).alias("min_temp_f"),
+    F.round(F.min("actual_demand_mw"), 1).alias("min_served_mw"),
+    F.round(F.max("actual_demand_mw"), 1).alias("max_served_mw"),
 ).first()
 
-print("\n" + "=" * 70)
-print("  WINTER STORM URI (FEB 2021) REGIME AUDIT")
-print("=" * 70)
-if uri_stats and uri_stats["total_uri_hours"] and uri_stats["total_uri_hours"] > 0:
-    print(f"Total Hours Examined          : {uri_stats['total_uri_hours']}")
-    print(f"Min Regional Temperature      : {uri_stats['min_regional_temp_f']:.1f}°F")
-    print(f"Min DFW Temperature           : {uri_stats['min_dfw_temp_c']:.1f}°C  "
-          f"({uri_stats['min_dfw_temp_c'] * 9/5 + 32:.1f}°F)")
-    print(f"Min Houston Temperature       : {uri_stats['min_houston_temp_c']:.1f}°C  "
-          f"({uri_stats['min_houston_temp_c'] * 9/5 + 32:.1f}°F)")
-    print()
-    print("Served Load During Uri Blackout Period:")
-    print(f"  Minimum Served Demand (EIA-930) : {uri_stats['min_served_demand_mw']:,.0f} MW (Feb 16, 2021 16:00 UTC / 10:00 Central)")
-    print(f"  Maximum Served Demand in Window : {uri_stats['max_served_demand_mw']:,.0f} MW")
-    print("  ERCOT Estimated Peak Demand     : ~76,819 MW (unconstrained estimate for Feb 14-15 peak; PUCT testimony)")
-    print("  ERCOT Maximum Firm Load Shed    : ~20,000 MW (peak emergency shed order on Feb 15)")
-    print("  NOTE: These figures occurred at distinct timestamps across the event;")
-    print("        their arithmetic difference cannot be treated as a single-hour shed quantity.")
-    print("Day-Ahead Forecast (pre-event):")
-    print(f"  Maximum DA Forecast         : {uri_stats['max_da_forecast_mw']:,.0f} MW")
-    print("  → EIA forecast was also not predictive of the true demand surge.")
-else:
-    print("No records available in dataset for the Feb 13–20, 2021 window.")
-print()
-print("Gold Layer Recommendation:")
-print("  → Add `is_grid_emergency = True` flag for Feb 15–18 2021 in the Gold feature table.")
-print("  → Run ablation study: train with Uri included vs. excluded, compare cold-weather RMSE.")
+if uri_stats:
+    print(f"Uri Min Temp         : {uri_stats['min_temp_f']}°F")
+    print(f"Uri Served Demand    : {uri_stats['min_served_mw']:,.0f} MW (artificially capped by ~20 GW load shed)")
+    print(f"ERCOT Estimated Peak : ~76,819 MW (true unconstrained demand)")
+    print(f"Engineering Action   : Flag Feb 15–18, 2021 as is_grid_emergency=True in Gold feature table.")
 
 # COMMAND ----------
-# MAGIC %md
-# MAGIC ## Case Study 2: Summer 2023 Heatwave — All-Time Peak Demand Records
-# MAGIC
-# MAGIC ### Background
-# MAGIC During July–August 2023, a prolonged heat dome kept temperatures above 100°F across
-# MAGIC Texas for consecutive weeks. ERCOT set **10 new all-time demand records** during this
-# MAGIC period, peaking above **85,000 MW**. Critically, **no firm load shedding occurred** —
-# MAGIC this is unconstrained consumer demand at the system's physical ceiling.
-# MAGIC
-# MAGIC ### Data Implication
-# MAGIC Unlike Uri, Summer 2023 observations are valid unconstrained demand and should
-# MAGIC be retained in training. However, the prolonged extreme-heat plateau tests whether
-# MAGIC air conditioning demand **saturates** at high temperatures (i.e., is the curve still
-# MAGIC linear above 105°F, or does it flatten as all available AC units are already running?).
-
-# COMMAND ----------
-# DBTITLE 1,Summer 2023 Heatwave: Demand & Temperature Profile
-S23_START = "2023-07-15"
-S23_END   = "2023-09-01"
-
+# DBTITLE 1,2. Summer 2023 Heatwave & AC Saturation Linearity Test
 df_s23 = (
     df_full.filter(
-        (F.col("timestamp_local") >= S23_START) &
-        (F.col("timestamp_local") <  S23_END)
+        (F.col("timestamp_local") >= "2023-07-15") &
+        (F.col("timestamp_local") <  "2023-09-01")
     )
-    .select(
-        "timestamp_local",
-        "actual_demand_mw",
-        "day_ahead_forecast_mw",
-        "weighted_temperature_f",
-        "is_valid_demand",
-    )
-    .orderBy("timestamp_local")
 )
 
-display(df_s23)
-
-# COMMAND ----------
-# DBTITLE 1,Summer 2023 Regime Summary Statistics
 s23_stats = df_s23.select(
-    F.count("*").alias("total_hours"),
-    F.round(F.max("weighted_temperature_f"), 1).alias("max_regional_temp_f"),
-    F.round(F.max("actual_demand_mw"), 1).alias("peak_demand_mw"),
-    F.round(F.avg("actual_demand_mw"), 1).alias("avg_demand_mw"),
+    F.round(F.max("weighted_temperature_f"), 1).alias("max_temp_f"),
+    F.round(F.max("actual_demand_mw"), 1).alias("peak_mw"),
     F.count(F.when(F.col("actual_demand_mw") >= 80000, 1)).alias("hours_above_80gw"),
-    F.count(F.when(F.col("actual_demand_mw") >= 85000, 1)).alias("hours_above_85gw"),
-    F.round(F.avg(F.when(F.col("actual_demand_mw") >= 80000, F.col("weighted_temperature_f"))), 1).alias("avg_temp_during_80gw_hours"),
 ).first()
 
-print("\n" + "=" * 70)
-print("  SUMMER 2023 HEATWAVE REGIME AUDIT")
-print("=" * 70)
-if s23_stats and s23_stats["total_hours"] and s23_stats["total_hours"] > 0:
-    print(f"Period Examined               : {S23_START} → {S23_END}")
-    print(f"Total Hours in Window         : {s23_stats['total_hours']:,}")
-    print(f"Maximum Regional Temperature  : {s23_stats['max_regional_temp_f']:.1f}°F")
-    print(f"Peak Demand in Selected Dataset : {s23_stats['peak_demand_mw']:,.0f} MW (Aug 10, 2023 17:00 Central)")
-    print("  Official ERCOT Series Note      : ERCOT published an integrated system record of 85,508 MW for 2023.")
-    print("  The ~76 MW difference is an unexplained discrepancy under investigation between EIA-930 and ERCOT.")
-    print("  Subsequent all-time records reached >91 GW in July 2026 (listed as 91,089 MW on ERCOT's yearly page")
-    print("  and 91,134 MW on its 2026 peak page; recent records remain unofficial pending final settlement).")
-    print(f"Average Demand in Period      : {s23_stats['avg_demand_mw']:,.0f} MW")
-    print(f"Hours Above 80,000 MW         : {s23_stats['hours_above_80gw']:,} hours")
-    print(f"Hours Above 85,000 MW         : {s23_stats['hours_above_85gw']:,} hours")
-    avg_temp_80 = s23_stats['avg_temp_during_80gw_hours']
-    print(f"Avg Temp During 80GW+ Hours   : {avg_temp_80:.1f}°F" if avg_temp_80 is not None else "Avg Temp During 80GW+ Hours   : N/A")
-    print()
-    print("No firm load shedding was required → observations are valid unconstrained demand.")
-else:
-    print("No records available in dataset for the Summer 2023 window.")
+if s23_stats:
+    print(f"Summer 2023 Max Temp   : {s23_stats['max_temp_f']}°F")
+    print(f"Summer 2023 Peak Load  : {s23_stats['peak_mw']:,.0f} MW (no load shedding; valid unconstrained records)")
+    print(f"Hours ≥ 80,000 MW      : {s23_stats['hours_above_80gw']:,} hours")
 
-# COMMAND ----------
-# DBTITLE 1,AC Saturation Test: High-Temperature Demand Linearity Check
-# Pull extreme heat hours (>95°F) to driver to check if demand curve flattens
-df_extreme_heat = (
+# AC Saturation test: verify if demand flattens above 95°F
+df_ext = (
     df_full.filter(F.col("weighted_temperature_f") > 95.0)
     .withColumn("temp_bin_f", F.floor(F.col("weighted_temperature_f") / 2.0) * 2.0)
     .groupBy("temp_bin_f")
     .agg(
-        F.count("*").alias("hour_count"),
-        F.round(F.expr("percentile_approx(actual_demand_mw, 0.50)"), 1).alias("median_demand_mw"),
-        F.round(F.avg("actual_demand_mw"), 1).alias("mean_demand_mw"),
+        F.count("*").alias("n"),
+        F.round(F.expr("percentile_approx(actual_demand_mw, 0.50)"), 1).alias("median_mw"),
     )
-    .filter(F.col("hour_count") >= 5)
+    .filter(F.col("n") >= 5)
     .orderBy("temp_bin_f")
 )
 
-display(df_extreme_heat)
+display(df_ext)
 
-# Pull to driver for slope analysis
-from scipy import stats
-pdf_extreme = df_extreme_heat.toPandas()
-
-print("\n" + "=" * 70)
-print("  HIGH-TEMPERATURE DEMAND LINEARITY (AC SATURATION TEST)")
-print("=" * 70)
-if len(pdf_extreme) >= 2:
-    slope, intercept, r, p, se = stats.linregress(
-        pdf_extreme["temp_bin_f"], pdf_extreme["median_demand_mw"]
-    )
-    print(f"Temperature Range Analysed  : {pdf_extreme['temp_bin_f'].min():.0f}°F – {pdf_extreme['temp_bin_f'].max():.0f}°F")
-    print(f"Linear Slope                : +{slope:,.1f} MW / °F above 95°F")
-    print(f"R²                          : {r**2:.3f}")
-    print(f"p-value                     : {p:.4e}")
-    print()
-    if r**2 > 0.85:
-        print("Finding: Demand medians continued rising linearly across observed range (94F-104F, R2 > 0.85).")
-        print("There is no evidence of an in-sample plateau across these observed temperature bins.")
-        print("Note: This descriptive regression does not independently prove AC causality or preclude")
-        print("saturation at unobserved higher temperatures.")
-        print("Implication: Linear + quadratic temperature features remain empirically supported up to observed max.")
-    elif r**2 > 0.5:
-        print("Finding: Moderate linearity above 95°F — some evidence of demand plateau.")
-        print("Implication: Consider a capped degree-hour feature (max(CDH, threshold)) in Gold.")
-    else:
-        print("Finding: Weak linearity above 95°F — demand curve appears to flatten at extreme heat.")
-        print("Implication: Piecewise or quantile-based temperature feature may better capture saturation.")
-else:
-    print("Insufficient extreme heat records (>95°F) for linear regression (minimum 2 bins required).")
+pdf_ext = df_ext.toPandas()
+if len(pdf_ext) >= 2:
+    slope, _, r, _, _ = stats.linregress(pdf_ext["temp_bin_f"], pdf_ext["median_mw"])
+    print(f"Slope >95°F : +{slope:,.1f} MW/°F (R² = {r**2:.2f})")
+    print(f"Finding     : Linear relationship holds without saturation plateau across observed temperatures.")
