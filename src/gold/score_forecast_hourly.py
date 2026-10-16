@@ -7,7 +7,7 @@
 # MAGIC **Model Source:** Databricks MLflow Registry / Experiment (`/Shared/regional_demand_forecasting`)  
 # MAGIC
 # MAGIC ### Core Production Pipeline Responsibilities:
-# MAGIC 1. **Model Retrieval:** Dynamically loads the champion model artifact (`LightGBM_EIA_Hybrid_Champion_H24`) from MLflow.
+# MAGIC 1. **Model Retrieval:** Dynamically loads the active production model artifact (`LightGBM_EIA_Hybrid_Production`) from MLflow.
 # MAGIC 2. **Inference Execution:** Generates point forecasts (`predicted_demand_mw`) across the chronological evaluation grid.
 # MAGIC 3. **Uncertainty & Risk Quantification:**
 # MAGIC    - 95% Confidence Intervals (`prediction_lower_95_mw`, `prediction_upper_95_mw`).
@@ -104,10 +104,13 @@ print("Successfully loaded Production LightGBM Booster!")
 
 # COMMAND ----------
 # DBTITLE 1,Execute Batch Scoring
-def generate_forecast_predictions(df_features_spark, booster, feature_cols=FEATURE_COLS, base_cols=BASE_COLS):
+def generate_forecast_predictions(df_features_spark, booster, feature_cols=FEATURE_COLS, base_cols=BASE_COLS, model_version=None):
     """
     Computes scale-invariant features and generates Day-Ahead model predictions.
     """
+    if model_version is None:
+        model_version = f"LightGBM_Hybrid_{prod_run_id[:8]}" if "prod_run_id" in globals() else "LightGBM_Hybrid_Production"
+
     # Pull candidate rows (requires valid 24h lag and day_ahead_forecast_mw)
     df_eligible = (
         df_features_spark
@@ -137,7 +140,7 @@ def generate_forecast_predictions(df_features_spark, booster, feature_cols=FEATU
     pdf["is_predicted_peak_risk"] = pdf["predicted_demand_mw"] >= PEAK_THRESHOLD_MW
     
     # Model tracking lineage
-    pdf["model_version"] = f"LightGBM_Hybrid_{champion_run_id[:8]}"
+    pdf["model_version"] = model_version
     
     # Convert back to Spark
     spark_df = spark.createDataFrame(pdf[[
