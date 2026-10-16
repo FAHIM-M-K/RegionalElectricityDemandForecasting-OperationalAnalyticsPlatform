@@ -51,118 +51,36 @@ for _ in range(5):
         break
     _repo_root = _parent
 from configs.loader import load_platform_config
+from src.shared.feature_transforms import (
+    FEATURE_COLS,
+    BASE_COLS,
+    TARGET_COL,
+    BENCHMARK_COL,
+    TIME_COL,
+    compute_derived_features,
+)
 
 config = load_platform_config("ercot_config.json")
 BA_CODE = config.get("region", {}).get("code", "ERCO")
 
 # COMMAND ----------
 # DBTITLE 1,Define Feature Architecture & Leakage Contract
-# Scale-invariant stationary features: strictly observable at day-ahead origin (t0 = T-24)
-FEATURE_COLS = [
-    # 1. Target-Hour Thermodynamics & Humidity (Stationary across years)
-    "weighted_temperature_f",
-    "weighted_apparent_temperature_f",
-    "weighted_solar_irradiance_wm2",
-    "cdh_55",
-    "hdh_55",
-    "temp_deviation_55_sq",
-    "temp_delta_dfw_houston_c",
-    "temp_rolling_24h",
-    
-    # 2. Weather Differences vs Yesterday (t-24) — The Primary Physical Shift Drivers
-    "temp_diff_24h",
-    "apparent_temp_diff_24h",
-    "cdh_diff_24h",
-    "hdh_diff_24h",
-    "peak_temp_interaction",
-    
-    # 3. Discrete Temporal Features (Enables Sharp Tree Partitions)
-    "hour_local",
-    "day_of_week_local",
-    "hour_sin",
-    "hour_cos",
-    "day_of_week_sin",
-    "day_of_week_cos",
-    "month_sin",
-    "month_cos",
-    "day_of_year_sin",
-    "day_of_year_cos",
-    
-    # 4. Calendar & Day-over-Day Step Transitions
-    "is_weekend",
-    "is_holiday",
-    "is_major_shutdown_holiday",
-    "is_holiday_adjacent",
-    "weekend_diff_24h",
-    "holiday_diff_24h",
-    "season_summer",
-    "season_winter",
-    "season_shoulder",
-    
-    # 5. Scale-Invariant Load Ratios & Volatility (No raw non-stationary MW)
-    "demand_ratio_24_48",
-    "demand_ratio_24_168",
-    "demand_rolling_cv_24h"
-]
-
-TARGET_COL = "actual_demand_mw"
-BENCHMARK_COL = "day_ahead_forecast_mw"
-TIME_COL = "timestamp_utc"
-
 print(f"Selected {len(FEATURE_COLS)} stationary scale-invariant features for Modeling:")
 for i, col in enumerate(FEATURE_COLS, 1):
     print(f"  {i:02d}. {col}")
 
 # COMMAND ----------
 # DBTITLE 1,Extract Datasets & Compute In-Memory Physical Features
-# Base columns stored in Delta table
-BASE_COLS = [
-    TIME_COL, TARGET_COL, BENCHMARK_COL, "hour_local", "day_of_week_local",
-    "cdh_55", "hdh_55", "temp_deviation_55_sq", "temp_delta_dfw_houston_c",
-    "weighted_temperature_f", "weighted_apparent_temperature_f", "weighted_solar_irradiance_wm2",
-    "hour_sin", "hour_cos", "day_of_week_sin", "day_of_week_cos",
-    "month_sin", "month_cos", "day_of_year_sin", "day_of_year_cos",
-    "is_weekend", "is_holiday", "is_major_shutdown_holiday", "is_holiday_adjacent",
-    "season_summer", "season_winter", "season_shoulder",
-    "demand_lag_24h", "demand_lag_48h", "demand_lag_168h",
-    "demand_rolling_avg_24h_lag24", "demand_rolling_std_24h_lag24"
-]
-
 df_spark = (
     spark.table(FEATURES_TABLE)
     .filter(F.col("respondent") == BA_CODE)
     .filter(F.col("is_valid_training_sample_h24") == True)
     .filter(F.col(BENCHMARK_COL).isNotNull())
-    .select(*BASE_COLS)
+    .select(*[c for c in BASE_COLS if c in spark.table(FEATURES_TABLE).columns])
 )
 
-pdf_all = df_spark.toPandas()
-pdf_all[TIME_COL] = pd.to_datetime(pdf_all[TIME_COL])
-pdf_all = pdf_all.sort_values(TIME_COL).reset_index(drop=True)
-
-# 1. Weather shifts from yesterday at the exact same hour
-pdf_all["temp_diff_24h"] = (pdf_all["weighted_temperature_f"] - pdf_all["weighted_temperature_f"].shift(24)).fillna(0.0)
-pdf_all["apparent_temp_diff_24h"] = (pdf_all["weighted_apparent_temperature_f"] - pdf_all["weighted_apparent_temperature_f"].shift(24)).fillna(0.0)
-pdf_all["cdh_diff_24h"] = (pdf_all["cdh_55"] - pdf_all["cdh_55"].shift(24)).fillna(0.0)
-pdf_all["hdh_diff_24h"] = (pdf_all["hdh_55"] - pdf_all["hdh_55"].shift(24)).fillna(0.0)
-
-# 2. Thermal rolling inertia (24h average) & peak-hour interaction
-pdf_all["temp_rolling_24h"] = pdf_all["weighted_temperature_f"].rolling(24, min_periods=1).mean().fillna(pdf_all["weighted_temperature_f"])
-pdf_all["peak_temp_interaction"] = pdf_all["hour_local"].between(14, 18).astype(float) * pdf_all["temp_diff_24h"]
-
-# 3. Calendar transitions from yesterday (e.g. Friday -> Saturday = -1.0)
-pdf_all["weekend_diff_24h"] = (pdf_all["is_weekend"].astype(float) - pdf_all["is_weekend"].astype(float).shift(24)).fillna(0.0)
-pdf_all["holiday_diff_24h"] = (pdf_all["is_holiday"].astype(float) - pdf_all["is_holiday"].astype(float).shift(24)).fillna(0.0)
-
-# 4. Scale-invariant load momentum ratios (normalized by base load to eliminate grid growth bias)
-pdf_all["demand_ratio_24_48"] = ((pdf_all["demand_lag_24h"] - pdf_all["demand_lag_48h"]) / pdf_all["demand_lag_48h"].clip(lower=1000.0)).fillna(0.0)
-pdf_all["demand_ratio_24_168"] = ((pdf_all["demand_lag_24h"] - pdf_all["demand_lag_168h"]) / pdf_all["demand_lag_168h"].clip(lower=1000.0)).fillna(0.0)
-pdf_all["demand_rolling_cv_24h"] = (pdf_all["demand_rolling_std_24h_lag24"] / pdf_all["demand_rolling_avg_24h_lag24"].clip(lower=1000.0)).fillna(0.0)
-
-# Cast boolean flags to float
-for c in ["is_weekend", "is_holiday"]:
-    if c in pdf_all.columns:
-        pdf_all[c] = pdf_all[c].astype(float)
+pdf_raw = df_spark.toPandas()
+pdf_all = compute_derived_features(pdf_raw)
 
 # Chronological split masks
 SPLIT_TRAIN_END = pd.to_datetime("2024-01-01 00:00:00")

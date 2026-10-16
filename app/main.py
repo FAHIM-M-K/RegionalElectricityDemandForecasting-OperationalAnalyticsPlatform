@@ -2,9 +2,9 @@ import os
 import sys
 import streamlit as st
 
-# Configure wide layout and page metadata without emojis
+# Configure wide layout and page metadata
 st.set_page_config(
-    page_title="ERCOT Operational Grid Forecast Platform",
+    page_title="ERCOT Operational Grid What-If Simulator",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -13,9 +13,7 @@ st.set_page_config(
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from app.data_loader import load_operational_forecast_data
-from app.views.executive import render_executive_view
-from app.views.analytics import render_analytics_view
-from app.views.monitoring import render_monitoring_view
+from app.views.scenario_simulator import render_scenario_simulator_view
 
 # Load Custom CSS Styling
 css_path = os.path.join(os.path.dirname(__file__), "style.css")
@@ -25,8 +23,8 @@ if os.path.exists(css_path):
 
 # ---------------- Sidebar Configuration ----------------
 with st.sidebar:
-    st.markdown("#### Grid Dispatch Control")
-    st.caption("Operational demand forecasting and capacity analytics.")
+    st.markdown("#### Grid Dispatch Controls")
+    st.caption("Operational What-If Stress Testing Simulator.")
     st.divider()
 
     selected_region = st.selectbox(
@@ -35,57 +33,42 @@ with st.sidebar:
         index=0
     )
 
-    peak_threshold_mw = st.slider(
-        "Peak Alert Threshold (MW)",
-        min_value=60000,
-        max_value=90000,
-        value=75000,
-        step=1000,
-        help="Triggers critical dispatch warnings when forecasted load exceeds this value."
-    )
-
-    forecast_horizon = st.selectbox(
-        "Forecast Horizon",
-        ["Day-Ahead (48-Hour Horizon)", "Intraday (6-Hour Horizon)", "Week-Ahead (168-Hour Horizon)"],
-        index=0
+    installed_cap_gw = st.number_input(
+        "Total Available Grid Capacity (GW)",
+        min_value=70.0,
+        max_value=110.0,
+        value=86.5,
+        step=0.5,
+        help="Effective thermal, nuclear, wind, and solar dispatch capacity."
     )
 
     st.divider()
 
-    # Load Data
+    # Load Baseline Data
     with st.spinner("Connecting to Gold Forecast Mart..."):
         df_forecast, data_source = load_operational_forecast_data()
 
-    st.markdown("##### Pipeline Connection Status")
+    st.markdown("##### Connection Status")
     if "Databricks" in data_source:
         st.markdown(f'<span class="status-pill-success">{data_source}</span>', unsafe_allow_html=True)
     else:
         st.markdown(f'<span class="status-pill-neutral">{data_source}</span>', unsafe_allow_html=True)
-        st.caption("Using local ERCOT sample. Set Databricks credentials in .env to stream live tables.")
 
     st.divider()
     st.markdown("""
-    **Champion Architecture:** LightGBM Hybrid  
-    **Evaluation Target:** Day-Ahead Load (H=24..48)  
-    **Benchmark Superiority:** +3.58% Global Lift, +7.37% Peak Lift
+    **Production Dashboards:** Power BI  
+    - Page 1: Executive Dispatch  
+    - Page 2: Grid Stress & Growth  
+    - Page 3: Thermodynamic Response  
+    - Page 4: ERCOT Zonal Map  
+
+    **Streamlit Role:** Real-Time Simulation Engine  
+    *(Zero triggers; runs dynamic in-memory what-if perturbations).*
     """)
 
-# ---------------- Main Dashboard Layout ----------------
-st.title("ERCOT Regional Demand Forecasting Platform")
-st.caption("Operational Dispatch Analytics and Institutional EIA Benchmark Scorecard")
+# ---------------- Main Layout ----------------
+st.title("ERCOT Operational Stress & What-If Simulation Engine")
+st.caption("Dynamic thermodynamic perturbator and reserve margin estimator (Zero-trigger interactive simulator).")
 
-# Top Navigation Tabs without emojis
-tab_exec, tab_analytics, tab_monitoring = st.tabs([
-    "Executive Dispatch",
-    "Operational Analytics",
-    "Model Governance and Monitoring"
-])
-
-with tab_exec:
-    render_executive_view(df_forecast, peak_threshold_mw)
-
-with tab_analytics:
-    render_analytics_view(df_forecast)
-
-with tab_monitoring:
-    render_monitoring_view(df_forecast)
+# Render Simulator
+render_scenario_simulator_view(df_forecast)

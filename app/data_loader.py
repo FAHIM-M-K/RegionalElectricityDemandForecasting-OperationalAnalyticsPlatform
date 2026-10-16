@@ -189,7 +189,47 @@ def generate_simulation_data():
 def load_feature_importance():
     """
     Returns empirical gain-based feature importances from LightGBM Champion.
+    Queries Databricks SQL main.gold.feature_importance if available,
+    checks local cached sync data/feature_importance.csv, or falls back to baseline.
     """
+    conn = get_databricks_connection()
+    if conn:
+        try:
+            query = """
+            SELECT 
+                feature_name AS Feature,
+                gain_importance AS Gain,
+                feature_description AS Description
+            FROM main.gold.feature_importance
+            ORDER BY gain_importance DESC
+            LIMIT 15
+            """
+            cursor = conn.cursor()
+            cursor.execute(query)
+            cols = [desc[0] for desc in cursor.description]
+            rows = cursor.fetchall()
+            cursor.close()
+            if rows:
+                return pd.DataFrame(rows, columns=cols)
+        except Exception as e:
+            print(f"Notice: Failed to load feature importance from Databricks SQL: {e}")
+
+    # Check local synced CSV
+    csv_path = os.path.join(os.path.dirname(__file__), "..", "data", "feature_importance.csv")
+    if os.path.exists(csv_path):
+        try:
+            df = pd.read_csv(csv_path)
+            if "feature_name" in df.columns and "gain_importance" in df.columns:
+                df = df.rename(columns={
+                    "feature_name": "Feature",
+                    "gain_importance": "Gain",
+                    "feature_description": "Description"
+                })
+                return df[["Feature", "Gain", "Description"]].head(15)
+        except Exception as e:
+            print(f"Notice: Failed to load local feature importance CSV: {e}")
+
+    # Default fallback
     features = [
         {"Feature": "weighted_apparent_temperature_f", "Gain": 45210.5, "Description": "Population-weighted Heat Index / Wind Chill"},
         {"Feature": "hour_local", "Gain": 38940.2, "Description": "Discrete diurnal cycle indicator"},
@@ -203,3 +243,108 @@ def load_feature_importance():
         {"Feature": "weekend_diff_24h", "Gain": 7250.0, "Description": "Friday-to-Saturday drop transition"}
     ]
     return pd.DataFrame(features)
+
+
+@st.cache_data(ttl=300)
+def load_zonal_demand_data():
+    """
+    Loads hourly ERCOT zonal demand data.
+    First checks Databricks SQL main.gold.ercot_zonal_demand,
+    falls back to local data/ercot_zonal_demand.csv.
+    """
+    conn = get_databricks_connection()
+    if conn:
+        try:
+            query = """
+            SELECT 
+                zone_code,
+                zone_name,
+                timestamp_utc,
+                timestamp_local,
+                date_local,
+                hour_local,
+                demand_actual_mw,
+                demand_predicted_mw,
+                system_total_mw,
+                pct_of_system_load,
+                centroid_lat,
+                centroid_lon,
+                major_cities,
+                is_peak_risk,
+                peak_threshold_mw
+            FROM main.gold.ercot_zonal_demand
+            ORDER BY timestamp_utc DESC
+            LIMIT 5760
+            """
+            df = pd.read_sql(query, conn)
+            conn.close()
+            if len(df) > 0:
+                df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
+                return df, "Databricks Unity Catalog (Live)"
+        except Exception as e:
+            print(f"Notice: Failed to load zonal demand from Databricks SQL: {e}")
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    # Fallback to local CSV
+    csv_path = os.path.join(os.path.dirname(__file__), "..", "data", "ercot_zonal_demand.csv")
+    if os.path.exists(csv_path):
+        try:
+            df = pd.read_csv(csv_path)
+            df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
+            return df, "Local Synchronized Mart (ERCOT Zonal)"
+        except Exception as e:
+            print(f"Notice: Failed to read local zonal CSV: {e}")
+
+    # Fallback synthesis if CSV missing
+    date_rng = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=72, freq="h")
+    zones = [
+        ("NCENT", "North Central", 0.345, 32.7767, -96.7970, "Dallas, Fort Worth", 26000.0),
+        ("COAST", "Coast", 0.275, 29.7604, -95.3698, "Houston, Galveston", 21000.0),
+        ("SCENT", "South Central", 0.165, 29.8833, -98.1167, "Austin, San Antonio", 13000.0),
+        ("FWEST", "Far West", 0.075, 31.9973, -102.0779, "Midland, Permian", 6500.0),
+        ("SOUTH", "South", 0.060, 27.2000, -98.2000, "Corpus Christi, Valley", 5000.0),
+        ("EAST", "East", 0.035, 32.3513, -95.3011, "Tyler, Longview", 3000.0),
+        ("WEST", "West", 0.025, 32.1000, -100.2000, "Abilene, San Angelo", 2500.0),
+        ("NORTH", "North", 0.020, 33.9137, -98.4934, "Wichita Falls", 2000.0),
+    ]
+    rows = []
+    for ts in date_rng:
+        tot = 52000 + 18000 * np.sin((ts.hour - 6) * np.pi / 12)
+        for code, name, share, lat, lon, cities, p_thresh in zones:
+            z_mw = round(tot * share, 1)
+            rows.append({
+                "zone_code": code,
+                "zone_name": name,
+                "timestamp_utc": ts,
+                "timestamp_local": str(ts - pd.Timedelta(hours=5)),
+                "date_local": str((ts - pd.Timedelta(hours=5)).date()),
+                "hour_local": (ts - pd.Timedelta(hours=5)).hour,
+                "demand_actual_mw": z_mw,
+                "demand_predicted_mw": round(z_mw * 1.01, 1),
+                "system_total_mw": round(tot, 1),
+                "pct_of_system_load": round(share * 100.0, 2),
+                "centroid_lat": lat,
+                "centroid_lon": lon,
+                "major_cities": cities,
+                "is_peak_risk": z_mw >= p_thresh,
+                "peak_threshold_mw": p_thresh
+            })
+    return pd.DataFrame(rows), "Local Standalone Generated (ERCOT Zonal)"
+
+
+@st.cache_data
+def load_zonal_geojson():
+    """
+    Loads GeoJSON polygons for ERCOT 8 weather zones.
+    """
+    geojson_path = os.path.join(os.path.dirname(__file__), "..", "configs", "texas_ercot_zones.geojson")
+    if os.path.exists(geojson_path):
+        import json
+        with open(geojson_path, "r") as f:
+            return json.load(f)
+    return None
+

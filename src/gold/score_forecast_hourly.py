@@ -52,6 +52,11 @@ for _ in range(5):
         break
     _repo_root = _parent
 from configs.loader import load_platform_config
+from src.shared.feature_transforms import (
+    FEATURE_COLS,
+    BASE_COLS,
+    compute_derived_features,
+)
 
 config = load_platform_config("ercot_config.json")
 BA_CODE = config.get("region", {}).get("code", "ERCO")
@@ -89,68 +94,6 @@ champion_booster = mlflow.lightgbm.load_model(model_uri)
 print("Successfully loaded Champion LightGBM Booster!")
 
 # COMMAND ----------
-# DBTITLE 1,Define Feature Extraction Architecture
-FEATURE_COLS = [
-    # 1. Target-Hour Thermodynamics & Humidity
-    "weighted_temperature_f",
-    "weighted_apparent_temperature_f",
-    "weighted_solar_irradiance_wm2",
-    "cdh_55",
-    "hdh_55",
-    "temp_deviation_55_sq",
-    "temp_delta_dfw_houston_c",
-    "temp_rolling_24h",
-    
-    # 2. Weather Differences vs Yesterday (t-24)
-    "temp_diff_24h",
-    "apparent_temp_diff_24h",
-    "cdh_diff_24h",
-    "hdh_diff_24h",
-    "peak_temp_interaction",
-    
-    # 3. Discrete Temporal Features
-    "hour_local",
-    "day_of_week_local",
-    "hour_sin",
-    "hour_cos",
-    "day_of_week_sin",
-    "day_of_week_cos",
-    "month_sin",
-    "month_cos",
-    "day_of_year_sin",
-    "day_of_year_cos",
-    
-    # 4. Calendar & Day-over-Day Step Transitions
-    "is_weekend",
-    "is_holiday",
-    "is_major_shutdown_holiday",
-    "is_holiday_adjacent",
-    "weekend_diff_24h",
-    "holiday_diff_24h",
-    "season_summer",
-    "season_winter",
-    "season_shoulder",
-    
-    # 5. Scale-Invariant Load Ratios & Volatility
-    "demand_ratio_24_48",
-    "demand_ratio_24_168",
-    "demand_rolling_cv_24h"
-]
-
-BASE_COLS = [
-    "respondent", "timestamp_utc", "timestamp_local", "date_local", "hour_local", "day_of_week_local",
-    "actual_demand_mw", "day_ahead_forecast_mw", "is_valid_demand",
-    "cdh_55", "hdh_55", "temp_deviation_55_sq", "temp_delta_dfw_houston_c",
-    "weighted_temperature_f", "weighted_apparent_temperature_f", "weighted_solar_irradiance_wm2",
-    "hour_sin", "hour_cos", "day_of_week_sin", "day_of_week_cos",
-    "month_sin", "month_cos", "day_of_year_sin", "day_of_year_cos",
-    "is_weekend", "is_holiday", "is_major_shutdown_holiday", "is_holiday_adjacent",
-    "season_summer", "season_winter", "season_shoulder",
-    "demand_lag_24h", "demand_lag_48h", "demand_lag_168h",
-    "demand_rolling_avg_24h_lag24", "demand_rolling_std_24h_lag24"
-]
-
-# COMMAND ----------
 # DBTITLE 1,Execute Batch Scoring
 def generate_forecast_predictions(df_features_spark, booster, feature_cols=FEATURE_COLS, base_cols=BASE_COLS):
     """
@@ -162,35 +105,11 @@ def generate_forecast_predictions(df_features_spark, booster, feature_cols=FEATU
         .filter(F.col("respondent") == BA_CODE)
         .filter(F.col("demand_lag_24h").isNotNull())
         .filter(F.col("day_ahead_forecast_mw").isNotNull())
-        .select(*base_cols)
+        .select(*[c for c in base_cols if c in df_features_spark.columns])
     )
     
-    pdf = df_eligible.toPandas()
-    pdf["timestamp_utc"] = pd.to_datetime(pdf["timestamp_utc"])
-    pdf = pdf.sort_values("timestamp_utc").reset_index(drop=True)
-    
-    # 1. Weather shifts from yesterday
-    pdf["temp_diff_24h"] = (pdf["weighted_temperature_f"] - pdf["weighted_temperature_f"].shift(24)).fillna(0.0)
-    pdf["apparent_temp_diff_24h"] = (pdf["weighted_apparent_temperature_f"] - pdf["weighted_apparent_temperature_f"].shift(24)).fillna(0.0)
-    pdf["cdh_diff_24h"] = (pdf["cdh_55"] - pdf["cdh_55"].shift(24)).fillna(0.0)
-    pdf["hdh_diff_24h"] = (pdf["hdh_55"] - pdf["hdh_55"].shift(24)).fillna(0.0)
-    
-    # 2. Thermal rolling average & peak interaction
-    pdf["temp_rolling_24h"] = pdf["weighted_temperature_f"].rolling(24, min_periods=1).mean().fillna(pdf["weighted_temperature_f"])
-    pdf["peak_temp_interaction"] = pdf["hour_local"].between(14, 18).astype(float) * pdf["temp_diff_24h"]
-    
-    # 3. Calendar shifts
-    pdf["weekend_diff_24h"] = (pdf["is_weekend"].astype(float) - pdf["is_weekend"].astype(float).shift(24)).fillna(0.0)
-    pdf["holiday_diff_24h"] = (pdf["is_holiday"].astype(float) - pdf["is_holiday"].astype(float).shift(24)).fillna(0.0)
-    
-    # 4. Momentum ratios
-    pdf["demand_ratio_24_48"] = ((pdf["demand_lag_24h"] - pdf["demand_lag_48h"]) / pdf["demand_lag_48h"].clip(lower=1000.0)).fillna(0.0)
-    pdf["demand_ratio_24_168"] = ((pdf["demand_lag_24h"] - pdf["demand_lag_168h"]) / pdf["demand_lag_168h"].clip(lower=1000.0)).fillna(0.0)
-    pdf["demand_rolling_cv_24h"] = (pdf["demand_rolling_std_24h_lag24"] / pdf["demand_rolling_avg_24h_lag24"].clip(lower=1000.0)).fillna(0.0)
-    
-    for c in ["is_weekend", "is_holiday"]:
-        if c in pdf.columns:
-            pdf[c] = pdf[c].astype(float)
+    pdf_raw = df_eligible.toPandas()
+    pdf = compute_derived_features(pdf_raw)
             
     X = pdf[feature_cols].copy()
     

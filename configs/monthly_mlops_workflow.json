@@ -1,0 +1,49 @@
+{
+  "name": "ERCOT_Monthly_MLOps_Retraining_and_Scoring",
+  "schedule": {
+    "quartz_cron_expression": "0 0 6 1 * ?",
+    "timezone_id": "UTC",
+    "pause_status": "UNPAUSED"
+  },
+  "max_concurrent_runs": 1,
+  "tasks": [
+    {
+      "task_key": "retrain_champion",
+      "description": "Retrains candidate EIA-Hybrid LightGBM model over dynamic 36-month rolling window.",
+      "notebook_task": {
+        "notebook_path": "src/mlops/retrain_champion",
+        "source": "GIT"
+      },
+      "timeout_seconds": 3600
+    },
+    {
+      "task_key": "validate_and_promote",
+      "description": "Evaluates candidate holdout MAE and peak reliability against active Champion. Promotes if >=0.5% lift.",
+      "depends_on": [
+        {
+          "task_key": "retrain_champion"
+        }
+      ],
+      "notebook_task": {
+        "notebook_path": "src/mlops/validate_and_promote",
+        "source": "GIT"
+      },
+      "timeout_seconds": 1800
+    },
+    {
+      "task_key": "score_forecast_hourly",
+      "description": "Generates 24h operational day-ahead forecasts using the certified active Champion booster.",
+      "depends_on": [
+        {
+          "task_key": "validate_and_promote"
+        }
+      ],
+      "notebook_task": {
+        "notebook_path": "src/gold/score_forecast_hourly",
+        "source": "GIT"
+      },
+      "timeout_seconds": 3600
+    }
+  ],
+  "format": "MULTI_TASK"
+}

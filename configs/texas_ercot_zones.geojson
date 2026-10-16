@@ -1,0 +1,206 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "id": "NCENT",
+      "properties": {
+        "zone_code": "NCENT",
+        "zone_name": "North Central",
+        "major_cities": "Dallas, Fort Worth, Arlington, Denton",
+        "base_load_pct": 34.5,
+        "centroid_lat": 32.7767,
+        "centroid_lon": -96.7970
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-98.2, 33.6],
+            [-96.2, 33.6],
+            [-96.0, 32.8],
+            [-96.2, 31.9],
+            [-98.0, 31.9],
+            [-98.4, 32.6],
+            [-98.2, 33.6]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "COAST",
+      "properties": {
+        "zone_code": "COAST",
+        "zone_name": "Coast",
+        "major_cities": "Houston, Galveston, Beaumont, Freeport",
+        "base_load_pct": 27.5,
+        "centroid_lat": 29.7604,
+        "centroid_lon": -95.3698
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-96.5, 30.6],
+            [-94.2, 30.5],
+            [-93.8, 29.8],
+            [-94.8, 29.2],
+            [-95.8, 28.6],
+            [-96.8, 28.8],
+            [-96.5, 30.6]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "SCENT",
+      "properties": {
+        "zone_code": "SCENT",
+        "zone_name": "South Central",
+        "major_cities": "Austin, San Antonio, San Marcos, New Braunfels",
+        "base_load_pct": 16.5,
+        "centroid_lat": 29.8833,
+        "centroid_lon": -98.1167
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-99.2, 31.1],
+            [-97.3, 31.1],
+            [-96.8, 29.8],
+            [-97.8, 28.8],
+            [-99.2, 28.8],
+            [-99.6, 30.0],
+            [-99.2, 31.1]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "FWEST",
+      "properties": {
+        "zone_code": "FWEST",
+        "zone_name": "Far West",
+        "major_cities": "Midland, Odessa, Pecos, Permian Basin",
+        "base_load_pct": 7.5,
+        "centroid_lat": 31.9973,
+        "centroid_lon": -102.0779
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-104.5, 32.5],
+            [-101.8, 32.5],
+            [-101.8, 30.0],
+            [-103.8, 29.8],
+            [-104.5, 31.0],
+            [-104.5, 32.5]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "SOUTH",
+      "properties": {
+        "zone_code": "SOUTH",
+        "zone_name": "South",
+        "major_cities": "Corpus Christi, McAllen, Brownsville, Laredo",
+        "base_load_pct": 6.0,
+        "centroid_lat": 27.2,
+        "centroid_lon": -98.2
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-99.5, 28.8],
+            [-97.2, 28.8],
+            [-97.0, 27.5],
+            [-97.2, 26.0],
+            [-98.5, 26.0],
+            [-99.8, 27.5],
+            [-99.5, 28.8]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "EAST",
+      "properties": {
+        "zone_code": "EAST",
+        "zone_name": "East",
+        "major_cities": "Tyler, Longview, Marshall, Lufkin",
+        "base_load_pct": 3.5,
+        "centroid_lat": 32.3513,
+        "centroid_lon": -95.3011
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-95.8, 33.6],
+            [-94.0, 33.6],
+            [-94.0, 31.2],
+            [-95.5, 31.2],
+            [-95.8, 33.6]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "WEST",
+      "properties": {
+        "zone_code": "WEST",
+        "zone_name": "West",
+        "major_cities": "Abilene, San Angelo, Sweetwater",
+        "base_load_pct": 2.5,
+        "centroid_lat": 32.1,
+        "centroid_lon": -100.2
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-101.8, 33.2],
+            [-99.2, 33.2],
+            [-99.2, 31.1],
+            [-101.8, 31.1],
+            [-101.8, 33.2]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "NORTH",
+      "properties": {
+        "zone_code": "NORTH",
+        "zone_name": "North",
+        "major_cities": "Wichita Falls, Vernon, Gainesville",
+        "base_load_pct": 2.0,
+        "centroid_lat": 33.9137,
+        "centroid_lon": -98.4934
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-99.5, 34.4],
+            [-97.1, 34.4],
+            [-97.1, 33.6],
+            [-99.5, 33.6],
+            [-99.5, 34.4]
+          ]
+        ]
+      }
+    }
+  ]
+}
