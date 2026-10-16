@@ -63,35 +63,44 @@ BA_CODE = config.get("region", {}).get("code", "ERCO")
 PEAK_THRESHOLD_MW = float(config.get("region", {}).get("default_peak_threshold_mw", 75000.0))
 
 # COMMAND ----------
-# DBTITLE 1,Retrieve Champion Model from MLflow
+# DBTITLE 1,Retrieve Active Production Model from MLflow
 EXPERIMENT_NAME = "/Shared/regional_demand_forecasting"
-CHAMPION_RUN_NAME = "LightGBM_EIA_Hybrid_Champion_H24"
+PRODUCTION_RUN_NAME = "LightGBM_EIA_Hybrid_Production"
+LEGACY_RUN_NAME = "LightGBM_EIA_Hybrid_Champion_H24"
 
 client = mlflow.tracking.MlflowClient()
 experiment = client.get_experiment_by_name(EXPERIMENT_NAME)
 assert experiment is not None, f"MLflow Experiment {EXPERIMENT_NAME} not found! Run modeling notebook first."
 
-# Find latest successful run for the champion model
+# Find latest successful run for the production model (or legacy name fallback)
 runs = client.search_runs(
     experiment_ids=[experiment.experiment_id],
-    filter_string=f"tags.mlflow.runName = '{CHAMPION_RUN_NAME}'",
+    filter_string=f"tags.mlflow.runName = '{PRODUCTION_RUN_NAME}'",
     order_by=["start_time DESC"],
     max_results=1
 )
 
-assert len(runs) > 0, f"No logged runs found with name '{CHAMPION_RUN_NAME}' in {EXPERIMENT_NAME}."
-champion_run = runs[0]
-champion_run_id = champion_run.info.run_id
-model_uri = f"runs:/{champion_run_id}/lightgbm_eia_hybrid"
+if not runs:
+    runs = client.search_runs(
+        experiment_ids=[experiment.experiment_id],
+        filter_string=f"tags.mlflow.runName = '{LEGACY_RUN_NAME}'",
+        order_by=["start_time DESC"],
+        max_results=1
+    )
 
-print(f"Loading Champion Model from MLflow:")
+assert len(runs) > 0, f"No logged runs found with name '{PRODUCTION_RUN_NAME}' or '{LEGACY_RUN_NAME}' in {EXPERIMENT_NAME}."
+prod_run = runs[0]
+prod_run_id = prod_run.info.run_id
+model_uri = f"runs:/{prod_run_id}/lightgbm_eia_hybrid"
+
+print(f"Loading Production Model from MLflow:")
 print(f"  - Experiment: {EXPERIMENT_NAME}")
-print(f"  - Run Name:   {CHAMPION_RUN_NAME}")
-print(f"  - Run ID:     {champion_run_id}")
+print(f"  - Run Name:   {prod_run.info.run_name}")
+print(f"  - Run ID:     {prod_run_id}")
 print(f"  - Model URI:  {model_uri}")
 
-champion_booster = mlflow.lightgbm.load_model(model_uri)
-print("Successfully loaded Champion LightGBM Booster!")
+model_booster = mlflow.lightgbm.load_model(model_uri)
+print("Successfully loaded Production LightGBM Booster!")
 
 # COMMAND ----------
 # DBTITLE 1,Execute Batch Scoring
@@ -274,7 +283,7 @@ def audit_persisted_forecast_table(target_table, spark_session):
 assert spark.catalog.tableExists(SOURCE_FEATURES_TABLE), f"Source {SOURCE_FEATURES_TABLE} does not exist!"
 df_features = spark.table(SOURCE_FEATURES_TABLE)
 
-df_scored = generate_forecast_predictions(df_features, champion_booster)
+df_scored = generate_forecast_predictions(df_features, model_booster)
 validate_forecast_predictions(df_scored)
 upsert_forecast_table(df_scored, TARGET_FORECAST_TABLE, spark)
 audit_persisted_forecast_table(TARGET_FORECAST_TABLE, spark)

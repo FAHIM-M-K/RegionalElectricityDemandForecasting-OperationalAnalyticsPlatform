@@ -4,8 +4,7 @@ Regional Electricity Demand Forecasting Platform (ERCOT)
 
 Single source of truth for model feature names, base Delta table columns,
 and in-memory physical/calendar feature derivation. Used by both training
-(train_lightgbm, retrain_champion, walk_forward_evaluation) and inference
-(score_forecast_hourly) to guarantee zero train/serve feature skew.
+(retrain_model) and inference (score_forecast_hourly) to guarantee zero train/serve feature skew.
 """
 
 import numpy as np
