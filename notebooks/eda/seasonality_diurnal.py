@@ -2,12 +2,14 @@
 # MAGIC %md
 # MAGIC # Temporal Seasonality & Diurnal Load Profile Analysis
 # MAGIC
-# MAGIC **Core Objective:** Characterize intraday load profiles, weekday/weekend demand deltas,
-# MAGIC and holiday industrial suppression to justify calendar and cyclical feature engineering.
+# MAGIC **Core Objective:** Describe intraday load profiles and weekday/weekend and holiday
+# MAGIC differences. These exploratory comparisons can motivate feature tests, but do not by
+# MAGIC themselves establish that a feature improves forecast accuracy or that a pattern is causal.
 # MAGIC
 # MAGIC **Feature Layer Implication:**
-# MAGIC - Validates `hour_local`, `day_of_week_local`, and cyclical harmonics (`sin`/`cos`).
-# MAGIC - Statistically justifies `is_weekend`, `is_holiday`, and `is_holiday_adjacent`.
+# MAGIC - Describes patterns associated with hour, weekday/weekend, and holidays.
+# MAGIC - Feature value must be confirmed with leakage-safe rolling validation or ablation; this
+# MAGIC   notebook alone does not establish a statistical or causal justification.
 
 # COMMAND ----------
 # DBTITLE 1,Imports & Setup
@@ -86,7 +88,7 @@ gap_pct = ((weekday_mean - weekend_mean) / weekend_mean) * 100.0
 
 print(f"Weekday Mean Load : {weekday_mean:,.0f} MW")
 print(f"Weekend Mean Load : {weekend_mean:,.0f} MW")
-print(f"Weekday Load Gap  : +{gap_pct:.1f}% higher than weekends (justifies is_weekend flag)")
+print(f"Weekday Load Gap  : {gap_pct:+.1f}% relative to weekends (descriptive; not a feature test)")
 
 # COMMAND ----------
 # DBTITLE 1,3. Monthly Macro Seasonality
@@ -143,4 +145,4 @@ adj_holiday_drop = -float(beta[1])
 print(f"Date-Level Daily Observations  : {len(holiday_daily)} holiday dates vs {len(non_holiday_daily)} non-holiday weekdays.")
 print(f"Unadjusted Mean Difference     : {raw_daily_drop:,.0f} MW (Welch's t-test p = {p_val:.3e})")
 print(f"Temperature-Adjusted Drop      : {adj_holiday_drop:,.0f} MW (controlling for daily temp and nonlinear CDH/HDH response)")
-print(f"Conclusion                     : Both unadjusted and temperature-controlled estimates show substantial demand suppression on holidays.")
+print(f"Interpretation                 : Descriptive association after this temperature adjustment; not a causal estimate or proof of forecast-feature value.")

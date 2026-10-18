@@ -1,13 +1,15 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Empirical Temperature–Demand Curve & Thermal Balance Point Discovery
+# MAGIC # Exploratory Temperature–Demand Relationship
 # MAGIC
-# MAGIC **Core Objective:** Discover the empirical grid thermal balance point ($T^* = \arg\min \text{Demand}(T)$)
-# MAGIC and quantify the cooling vs heating asymmetry to engineer optimal degree-hour features.
+# MAGIC **Core Objective:** Describe how observed demand varies across temperature bins and compare
+# MAGIC the fitted slopes on either side of the observed minimum. This is a retrospective association:
+# MAGIC hour-of-week, season, and other factors also affect demand, so this curve does not estimate a
+# MAGIC causal temperature effect or a stable engineering balance point.
 # MAGIC
-# MAGIC **Feature Layer Implication:**
-# MAGIC - Conventional degree-hours use 65°F. If the empirical balance is 55°F, custom `cdh_55` and `hdh_55` must be built.
-# MAGIC - Asymmetry determines whether cooling and heating response should be modeled with separate slopes.
+# MAGIC **Feature Layer Implication:** Treat the fitted minimum and slopes as hypotheses. Add or tune
+# MAGIC degree-hour features only if leakage-safe rolling validation shows improvement over the current
+# MAGIC model and calendar features.
 
 # COMMAND ----------
 # DBTITLE 1,Imports & Data Load
@@ -61,8 +63,8 @@ interior_mask = (temp_dense >= 48.0) & (temp_dense <= 68.0)
 empirical_balance_f = float(temp_dense[interior_mask][np.argmin(demand_dense[interior_mask])])
 min_demand_mw = float(np.min(demand_dense[interior_mask]))
 
-print(f"Empirical Grid Balance Point : {empirical_balance_f:.1f}°F (Empirical descriptive inflection point vs 65.0°F standard convention)")
-print(f"Minimum Basal Demand         : {min_demand_mw:,.0f} MW")
+print(f"Observed-bin fitted minimum : {empirical_balance_f:.1f}°F (exploratory cubic fit; sensitive to the sampled period and binning)")
+print(f"Fitted demand at minimum    : {min_demand_mw:,.0f} MW (descriptive fit, not a physical baseline)")
 
 # Plot
 plt.figure(figsize=(9, 5))
@@ -90,4 +92,4 @@ ratio = slope_cool / abs(slope_heat)
 print(f"Cooling Gradient : +{slope_cool:,.1f} MW/°F (R² = {r_cool**2:.2f})")
 print(f"Heating Gradient : -{abs(slope_heat):,.1f} MW/°F (R² = {r_heat**2:.2f})")
 print(f"Asymmetry Ratio  : {ratio:.2f}x cooling-dominant")
-print(f"Conclusion       : Empirically supports two-slope degree-hours (cdh_{empirical_balance_f:.0f} / hdh_{empirical_balance_f:.0f}).")
+print("Interpretation   : Descriptive slopes across temperature-bin medians; test degree-hour features with rolling validation before adoption.")

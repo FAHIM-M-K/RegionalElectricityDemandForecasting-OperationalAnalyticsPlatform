@@ -2,12 +2,16 @@
 # MAGIC %md
 # MAGIC # Grid Stress Regime Case Studies: Uri & Summer 2023
 # MAGIC
-# MAGIC **Core Objective:** Detect supply-constrained periods (artificially suppressed load) vs
-# MAGIC unconstrained extreme demand records to prevent model training distortion.
+# MAGIC **Core Objective:** Inspect selected extreme periods and the emergency-event flag used to
+# MAGIC keep known supply-constrained observations identifiable during analysis and training.
+# MAGIC Served demand alone cannot recover unserved load; any estimate of unconstrained demand must
+# MAGIC be attributed to its external source and treated separately from this dataset's observations.
 # MAGIC
 # MAGIC **Feature Layer Implication:**
-# MAGIC - Winter Storm Uri (Feb 2021) had ~20 GW of involuntary load shedding. Justifies `is_grid_emergency` flag.
-# MAGIC - Summer 2023 set records (>85 GW) without load shedding. Validates high-temperature linearity.
+# MAGIC - The Gold table flags Feb 15–18, 2021 as an emergency period. The flag identifies a known
+# MAGIC   regime; this demand-only view does not quantify involuntary load shedding.
+# MAGIC - Summer 2023 values and the >95°F binned relationship are descriptive. They do not, by
+# MAGIC   themselves, establish unconstrained demand or a general linear temperature response.
 
 # COMMAND ----------
 # DBTITLE 1,Imports & Setup
@@ -41,9 +45,8 @@ uri_stats = df_uri.select(
 
 if uri_stats:
     print(f"Uri Min Temp         : {uri_stats['min_temp_f']}°F")
-    print(f"Uri Served Demand    : {uri_stats['min_served_mw']:,.0f} MW (artificially capped by ~20 GW load shed)")
-    print(f"ERCOT Estimated Peak : ~76,819 MW (true unconstrained demand)")
-    print(f"Engineering Action   : Flag Feb 15–18, 2021 as is_grid_emergency=True in Gold feature table.")
+    print(f"Uri Minimum Observed Demand: {uri_stats['min_served_mw']:,.0f} MW (served demand; not unconstrained demand)")
+    print("Interpretation             : Gold marks the emergency window; quantify unserved load only from an attributed external source.")
 
 # COMMAND ----------
 # DBTITLE 1,2. Summer 2023 Heatwave & AC Saturation Linearity Test
@@ -62,7 +65,7 @@ s23_stats = df_s23.select(
 
 if s23_stats:
     print(f"Summer 2023 Max Temp   : {s23_stats['max_temp_f']}°F")
-    print(f"Summer 2023 Peak Load  : {s23_stats['peak_mw']:,.0f} MW (no load shedding; valid unconstrained records)")
+    print(f"Summer 2023 Peak Load  : {s23_stats['peak_mw']:,.0f} MW (observed demand; this table alone does not verify supply constraints)")
     print(f"Hours ≥ 80,000 MW      : {s23_stats['hours_above_80gw']:,} hours")
 
 # AC Saturation test: verify if demand flattens above 95°F
@@ -84,4 +87,4 @@ pdf_ext = df_ext.toPandas()
 if len(pdf_ext) >= 2:
     slope, _, r, _, _ = stats.linregress(pdf_ext["temp_bin_f"], pdf_ext["median_mw"])
     print(f"Slope >95°F : +{slope:,.1f} MW/°F (R² = {r**2:.2f})")
-    print(f"Finding     : Linear relationship holds without saturation plateau across observed temperatures.")
+    print(f"Interpretation: Linear fit to temperature-bin medians only; descriptive and not evidence of a general causal response.")

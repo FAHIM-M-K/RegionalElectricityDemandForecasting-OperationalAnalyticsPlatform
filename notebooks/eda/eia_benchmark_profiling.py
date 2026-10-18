@@ -3,10 +3,13 @@
 # MAGIC # EIA Day-Ahead Forecast Benchmark Profiling
 # MAGIC
 # MAGIC **Core Objective:** Profile ERCOT's published EIA Day-Ahead Forecast (`day_ahead_forecast_mw`)
-# MAGIC across seasons, hours, and temperature extremes to establish the quantitative promotion gate
-# MAGIC criteria for our machine learning model.
+# MAGIC across seasons, hours, and temperature extremes as a retrospective reference benchmark.
+# MAGIC The conformed historical table does not preserve the original issue-time vintage for every
+# MAGIC EIA forecast, so this profile is not an exact same-origin operational comparison.
 # MAGIC
-# MAGIC **Success Criteria:** Candidate model must reduce MAE by ≥15% relative to this benchmark.
+# MAGIC **Model promotion:** Candidate promotion is decided by the rolling, time-ordered naive
+# MAGIC baselines in the validation workflow. Matched EIA hours are reported separately when coverage
+# MAGIC is available; this descriptive notebook does not set a promotion threshold.
 
 # COMMAND ----------
 # DBTITLE 1,Imports & Synchronized Horizon Load
@@ -50,7 +53,7 @@ g = df_bench.select(
 ).first()
 
 if g:
-    print(f"EIA Day-Ahead MAE  : {g['mae']:,.1f} MW  (Target for ML: < {g['mae'] * 0.85:,.0f} MW)")
+    print(f"Retrospective EIA reference MAE : {g['mae']:,.1f} MW")
     print(f"EIA Day-Ahead RMSE : {g['rmse']:,.1f} MW")
     print(f"EIA Day-Ahead MAPE : {g['mape']:.2f}%")
     print(f"EIA Mean Bias      : {g['bias']:+,.1f} MW ({'Overforecast' if g['bias'] > 0 else 'Underforecast'})")
