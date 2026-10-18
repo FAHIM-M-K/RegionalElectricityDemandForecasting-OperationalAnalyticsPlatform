@@ -91,6 +91,14 @@ if spark.catalog.tableExists(TABLE_NAME) and spark.table(TABLE_NAME).count() > 0
     max_time = spark.sql(f"SELECT max(time_utc) FROM {TABLE_NAME}").first()[0]
     hwm_dt = datetime.datetime.strptime(max_time[:10], "%Y-%m-%d") - datetime.timedelta(days=RESTATEMENT_BUFFER_DAYS)
     start_date_str = hwm_dt.strftime("%Y-%m-%d")
+    if start_date_str > end_date_str:
+        # The lake can be ahead of the archive's publication edge. Re-read the
+        # latest available archive day so the daily job remains a safe no-op/upsert.
+        print(
+            f"[ARCHIVE CURRENT] High-water mark {max_time} is newer than the archive "
+            f"boundary {end_date_str}. Rechecking the latest available day only."
+        )
+        start_date_str = end_date_str
     print(f"[INCREMENTAL] High-water mark: {max_time}. Fetching from {start_date_str} (with {RESTATEMENT_BUFFER_DAYS}-day buffer).")
 else:
     # First run or empty table: full historical load

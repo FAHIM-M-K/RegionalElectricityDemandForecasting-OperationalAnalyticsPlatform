@@ -179,15 +179,35 @@ def fetch_eia_subregion_dataset(api_key: str, start: str, end: str, parent: str 
 
     return all_records, raw_responses
 
+
+def date_windows(start_date: str, end_date: str, months: int = 3):
+    """Bound pagination offsets during full backfills by querying quarterly windows."""
+    current = datetime.date.fromisoformat(start_date)
+    end = datetime.date.fromisoformat(end_date)
+    while current <= end:
+        month_index = current.month - 1 + months
+        year = current.year + month_index // 12
+        month = month_index % 12 + 1
+        next_window = datetime.date(year, month, 1)
+        window_end = min(next_window - datetime.timedelta(days=1), end)
+        yield current.isoformat(), window_end.isoformat()
+        current = window_end + datetime.timedelta(days=1)
+
 # COMMAND ----------
 # DBTITLE 1,Execute Ingestion, Archive Raw Payload & Write to Bronze Delta
-records, raw_payloads = fetch_eia_subregion_dataset(
-    api_key=EIA_API_KEY,
-    start=start_param,
-    end=end_param,
-    parent=EIA_PARENT,
-    page_size=EIA_PAGE_SIZE
-)
+records, raw_payloads = [], []
+date_ranges = list(date_windows(start_date_str, end_date_str))
+for window_index, (window_start, window_end) in enumerate(date_ranges, start=1):
+    print(f"[BACKFILL] Fetching date window {window_index}/{len(date_ranges)}: {window_start} to {window_end}.")
+    window_records, window_payloads = fetch_eia_subregion_dataset(
+        api_key=EIA_API_KEY,
+        start=f"{window_start}T00",
+        end=f"{window_end}T23",
+        parent=EIA_PARENT,
+        page_size=EIA_PAGE_SIZE
+    )
+    records.extend(window_records)
+    raw_payloads.extend(window_payloads)
 
 print(f"Total authentic subregion records extracted: {len(records)} across {len(raw_payloads)} API pages.")
 
