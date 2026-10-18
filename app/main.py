@@ -8,7 +8,7 @@ from data_loader import load_operational_forecast_data
 
 st.set_page_config(page_title="ERCOT Demand Forecast", layout="wide")
 st.title("ERCOT Demand Forecast")
-st.caption("H24 uses the promoted demand model. H168 uses its promoted model when available, otherwise the labeled weekly seasonal-naive benchmark.")
+st.caption("H24 is the day-ahead forecast. H168 is a separate model forecast for all 168 hours of the week-ahead horizon.")
 
 forecast, status, monitoring = load_operational_forecast_data()
 if status.startswith("Stale"):
@@ -22,6 +22,9 @@ if forecast.empty:
 horizon = st.radio("Forecast product", [24, 168], horizontal=True,
                    format_func=lambda h: "Day ahead (H24)" if h == 24 else "Week ahead (H168)")
 view = forecast[forecast.horizon_hours == horizon].copy()
+if view.empty:
+    st.error(f"No H{horizon} forecast rows are available.")
+    st.stop()
 peak = view.loc[view.predicted_demand_mw.idxmax()]
 first, second, third = st.columns(3)
 first.metric("Expected peak", f"{peak.predicted_demand_mw:,.0f} MW")
@@ -29,8 +32,10 @@ peak_time_central = pd.Timestamp(peak.target_timestamp_utc).tz_convert("America/
 second.metric("Peak time (Central)", peak_time_central.strftime("%b %d, %Y %I:%M %p %Z"))
 third.metric("Hours above high-demand threshold", int(view.is_predicted_high_demand.sum()))
 
-figure = px.line(view, x="timestamp_local", y="predicted_demand_mw", markers=True,
-                 labels={"timestamp_local": "Central time", "predicted_demand_mw": "Forecast demand (MW)"})
+figure = px.line(
+    view, x="timestamp_local", y="predicted_demand_mw", markers=True,
+    labels={"timestamp_local": "Central time", "predicted_demand_mw": "Forecast demand (MW)"},
+)
 figure.add_hline(y=float(view.high_demand_threshold_mw.iloc[0]), line_dash="dash", line_color="#b91c1c",
                  annotation_text="Configured demand advisory threshold")
 figure.update_layout(height=480, font={"size": 13}, margin={"l": 30, "r": 30, "t": 45, "b": 30})
@@ -39,7 +44,9 @@ st.caption("Above-threshold flags identify high forecast demand only; they do no
 forecast_source = str(view.forecast_source.iloc[0])
 if forecast_source == "weekly_seasonal_naive_baseline":
     st.warning("No H168 ML model has passed validation yet. This week-ahead view is the weekly seasonal-naive benchmark, not an ML forecast.")
-st.caption(f"Source: {forecast_source} | Model: {view.model_version.iloc[0]} | Run: {view.model_run_id.iloc[0]} | Forecast origin: {view.forecast_origin_utc.iloc[0]}")
+    st.caption(f"Source: {forecast_source} | Model: {view.model_version.iloc[0]} | Run: {view.model_run_id.iloc[0]} | Forecast origin: {view.forecast_origin_utc.iloc[0]}")
+else:
+    st.caption(f"Source: {forecast_source} | Model: {view.model_version.iloc[0]} | Run: {view.model_run_id.iloc[0]} | Forecast origin: {view.forecast_origin_utc.iloc[0]}")
 
 if not monitoring.empty:
     st.subheader("Observed forecast reliability")
@@ -48,6 +55,10 @@ if not monitoring.empty:
         (monitoring.horizon_hours == horizon)
         & (monitoring.model_run_id == selected_run_id)
     ].copy()
+    # Older monitor output can include timestamp matches without actual values.
+    # Drop incomplete KPI rows so pandas does not turn all-null sums into 0 MW.
+    recent = recent.dropna(subset=["mae_mw", "rmse_mw", "bias_mw", "evaluated_rows"])
+    recent = recent[recent["evaluated_rows"] > 0].copy()
     if not recent.empty:
         recent["target_date_utc"] = pd.to_datetime(recent["target_date_utc"])
         recent["absolute_error_sum"] = recent["mae_mw"] * recent["evaluated_rows"]
@@ -96,7 +107,9 @@ if not monitoring.empty:
                 lead_rows["lead_hours"], bins=[0, 24, 48, 168],
                 labels=["1–24 hours", "25–48 hours", "49–168 hours"],
             )
-        lead_rows = lead_rows.dropna(subset=["lead_bucket"])
+        lead_rows = lead_rows.dropna(
+            subset=["lead_bucket", "mae_mw", "rmse_mw", "bias_mw", "evaluated_rows"]
+        )
         lead_rows["absolute_error_sum"] = lead_rows["mae_mw"] * lead_rows["evaluated_rows"]
         lead_rows["squared_error_sum"] = lead_rows["rmse_mw"].pow(2) * lead_rows["evaluated_rows"]
         lead_rows["signed_error_sum"] = lead_rows["bias_mw"] * lead_rows["evaluated_rows"]
