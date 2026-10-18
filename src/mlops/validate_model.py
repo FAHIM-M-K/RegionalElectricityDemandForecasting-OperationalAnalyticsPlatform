@@ -105,7 +105,7 @@ def validate_and_promote_horizon(horizon: int, candidate_run_id: str | None = No
     if not decision["accepted"]:
         client.set_tag(candidate_run_id, "pipeline_role", "REJECTED_CANDIDATE")
         print(
-            f"H{horizon} rejected: {decision['reason']}. "
+            f"H{horizon} candidate {candidate_run_id} rejected: {decision['reason']}. "
             f"Rolling MAE {score:,.1f} vs {baseline:,.1f} MW; "
             f"peak MAE {decision['candidate_peak_mae']:,.1f} vs "
             f"{decision['baseline_peak_mae']:,.1f} MW; "
@@ -122,7 +122,7 @@ def validate_and_promote_horizon(horizon: int, candidate_run_id: str | None = No
     for incumbent in incumbents:
         client.set_tag(incumbent.info.run_id, "pipeline_role", "ARCHIVED")
     print(
-        f"H{horizon} promoted: rolling MAE {score:,.1f} vs {baseline:,.1f} MW; "
+        f"H{horizon} candidate {candidate_run_id} promoted: rolling MAE {score:,.1f} vs {baseline:,.1f} MW; "
         f"peak MAE {decision['candidate_peak_mae']:,.1f} vs "
         f"{decision['baseline_peak_mae']:,.1f} MW; "
         f"window win rate {decision['win_rate']:.0%}."

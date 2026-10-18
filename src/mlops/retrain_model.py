@@ -164,10 +164,19 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
     final_result = _score(booster, final_holdout, horizon, include_eia=(horizon == 24),
                           high_demand_threshold_mw=high_demand_threshold_mw)
     selection_mae = _mean_metric(selection_results, "model", "mae")
-    selection_baseline = _mean_metric(selection_results, "daily" if horizon == 24 else "weekly", "mae")
+    baseline_name = "daily" if horizon == 24 else "weekly"
+    selection_baseline = _mean_metric(selection_results, baseline_name, "mae")
+    selection_peak_baseline = _mean_metric(selection_results, baseline_name, "peak_mae")
+    selection_window_wins = sum(
+        window["model"]["mae"] < window[baseline_name]["mae"]
+        for window in selection_results
+    )
 
     result = {"horizon": horizon, "booster": booster, "features": features, "selection_mae": selection_mae,
-              "selection_baseline_mae": selection_baseline, "selection_peak_mae": _mean_metric(selection_results, "model", "peak_mae"),
+              "selection_baseline_mae": selection_baseline,
+              "selection_peak_mae": _mean_metric(selection_results, "model", "peak_mae"),
+              "selection_baseline_peak_mae": selection_peak_baseline,
+              "selection_window_wins": selection_window_wins,
               "selection_windows": len(selection_results), "final": final_result, "run_id": None}
     if MLFLOW_AVAILABLE:
         mlflow.set_experiment(EXPERIMENT_NAME)
@@ -286,6 +295,44 @@ if __name__ == "__main__" and "spark" in globals():
     results = {horizon: train_single_horizon_model(examples, horizon,
                                                    high_demand_threshold_mw=threshold) for horizon in HORIZONS}
     for horizon, result in results.items():
-        print(f"H{horizon}: rolling-selection MAE {result['selection_mae']:.1f}; final holdout MAE {result['final']['model']['mae']:.1f}")
+        baseline_name = "daily" if horizon == 24 else "weekly"
+        baseline_label = "daily naive" if horizon == 24 else "weekly naive"
+        line = (
+            f"H{horizon} candidate {result['run_id'] or 'not logged'}: "
+            f"rolling MAE {result['selection_mae']:,.1f} vs {result['selection_baseline_mae']:,.1f} MW {baseline_label}; "
+            f"peak MAE {result['selection_peak_mae']:,.1f} vs {result['selection_baseline_peak_mae']:,.1f} MW; "
+            f"window wins {result['selection_window_wins']}/{result['selection_windows']}; "
+            f"final holdout MAE {result['final']['model']['mae']:,.1f} vs "
+            f"{result['final'][baseline_name]['mae']:,.1f} MW {baseline_label}."
+        )
+        if horizon == 24:
+            matched = result["final"]["eia_matched"]
+            line += f" EIA matched hours: {matched['sample_count']:,} ({matched['coverage_pct']:.1f}% coverage)."
+        print(line)
+        model_peak = result["final"]["peak_event_metrics"]["model"]
+        baseline_peak = result["final"]["peak_event_metrics"][baseline_name]
+        print(
+            f"  Holdout peak events: {model_peak['complete_origins']} complete forecast origins; "
+            f"magnitude MAE {model_peak['peak_magnitude_mae_mw']:,.1f} vs "
+            f"{baseline_peak['peak_magnitude_mae_mw']:,.1f} MW {baseline_label}; "
+            f"timing MAE {model_peak['peak_timing_mae_hours']:,.1f} vs "
+            f"{baseline_peak['peak_timing_mae_hours']:,.1f} hours."
+        )
+        for bucket, metrics in result["final"]["lead_buckets"].items():
+            model_bucket, baseline_bucket = metrics["model"], metrics[baseline_name]
+            print(
+                f"  Holdout {bucket.replace('_', ' ')}: MAE "
+                f"{model_bucket['mae']:,.1f} vs {baseline_bucket['mae']:,.1f} MW "
+                f"{baseline_label}; rows {model_bucket['sample_count']:,}."
+            )
+        for bucket, alerts in result["final"]["threshold_metrics"].items():
+            model_alert = alerts["model"]
+            print(
+                f"  Holdout {bucket.replace('_', ' ')} at {threshold:,.0f} MW: "
+                f"actual high {model_alert['actual_high_count']:,}, "
+                f"flagged {model_alert['predicted_high_count']:,}, "
+                f"hits {model_alert['true_positive']:,}, misses {model_alert['false_negative']:,}, "
+                f"false alarms {model_alert['false_positive']:,}."
+            )
         if result["run_id"]:
             dbutils.jobs.taskValues.set(key=f"candidate_run_id_h{horizon}", value=result["run_id"])

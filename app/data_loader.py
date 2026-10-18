@@ -52,7 +52,12 @@ def load_operational_forecast_data():
     try:
         connection = get_databricks_connection()
         if connection is None:
-            return pd.DataFrame(), "Databricks connection is not configured", pd.DataFrame()
+            return (
+                pd.DataFrame(),
+                "Databricks connection is not configured",
+                pd.DataFrame(),
+                "Monitoring data is unavailable because Databricks is not configured.",
+            )
         logger.info("Databricks connected; querying latest forecast rows.")
         forecast = _query_frame(connection, """
             SELECT respondent, forecast_origin_utc, issued_at_utc, target_timestamp_utc, timestamp_local,
@@ -64,7 +69,7 @@ def load_operational_forecast_data():
         """)
         logger.info("Latest forecast query returned %s rows.", len(forecast))
         if forecast.empty:
-            return forecast, "No forecast has been issued yet", pd.DataFrame()
+            return forecast, "No forecast has been issued yet", pd.DataFrame(), "Monitoring was not queried because no forecast is available."
         forecast["target_timestamp_utc"] = pd.to_datetime(forecast["target_timestamp_utc"], utc=True)
         forecast["issued_at_utc"] = pd.to_datetime(forecast["issued_at_utc"], utc=True)
         # Derive display time from the canonical UTC instant. The persisted
@@ -84,17 +89,24 @@ def load_operational_forecast_data():
                 ORDER BY target_date_utc
             """)
             logger.info("Forecast monitoring query returned %s rows.", len(monitoring))
+            monitoring_status = (
+                "Monitoring query succeeded but returned no rows yet."
+                if monitoring.empty
+                else "Monitoring data loaded."
+            )
         except Exception:
             logger.exception("Forecast loaded, but monitoring query failed.")
             monitoring = pd.DataFrame()
+            monitoring_status = "Reliability data could not be loaded. Check the Streamlit terminal logs."
         logger.info("Dashboard data loaded in %.1f seconds.", perf_counter() - started)
-        return forecast, status, monitoring
+        return forecast, status, monitoring, monitoring_status
     except Exception as error:
         logger.exception("Could not load forecast dashboard data.")
         return (
             pd.DataFrame(),
             f"Forecast unavailable ({type(error).__name__}). Check the Streamlit terminal for details.",
             pd.DataFrame(),
+            "Monitoring data is unavailable because the Databricks connection failed.",
         )
     finally:
         if connection is not None:

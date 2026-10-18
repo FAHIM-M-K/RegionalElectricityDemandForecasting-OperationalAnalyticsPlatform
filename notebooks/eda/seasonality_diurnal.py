@@ -145,4 +145,9 @@ adj_holiday_drop = -float(beta[1])
 print(f"Date-Level Daily Observations  : {len(holiday_daily)} holiday dates vs {len(non_holiday_daily)} non-holiday weekdays.")
 print(f"Unadjusted Mean Difference     : {raw_daily_drop:,.0f} MW (Welch's t-test p = {p_val:.3e})")
 print(f"Temperature-Adjusted Drop      : {adj_holiday_drop:,.0f} MW (controlling for daily temp and nonlinear CDH/HDH response)")
-print(f"Interpretation                 : Descriptive association after this temperature adjustment; not a causal estimate or proof of forecast-feature value.")
+if p_val < 0.05:
+    print("Unadjusted Test                : Difference is statistically significant at the 0.05 level; this does not establish causality.")
+else:
+    print("Unadjusted Test                : Difference is not statistically significant at the 0.05 level.")
+print("Adjusted Estimate              : Regression point estimate only; no confidence interval is calculated, so treat it as exploratory.")
+print("Interpretation                 : Neither result proves a causal holiday effect or forecast-feature value.")

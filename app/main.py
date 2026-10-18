@@ -15,7 +15,7 @@ if st.button("Refresh forecast data"):
     st.rerun()
 
 with st.spinner("Connecting to Databricks and loading the latest forecast…"):
-    forecast, status, monitoring = load_operational_forecast_data()
+    forecast, status, monitoring, monitoring_status = load_operational_forecast_data()
 if status.startswith("Stale"):
     st.warning(status)
 else:
@@ -56,8 +56,13 @@ if forecast_source == "weekly_seasonal_naive_baseline":
 else:
     st.caption(f"Source: {forecast_source} | Model: {view.model_version.iloc[0]} | Run: {view.model_run_id.iloc[0]} | Forecast origin: {view.forecast_origin_utc.iloc[0]}")
 
-if not monitoring.empty:
-    st.subheader("Observed forecast reliability")
+st.subheader("Observed forecast reliability")
+if monitoring.empty:
+    if monitoring_status.startswith("Reliability data could not be loaded") or monitoring_status.startswith("Monitoring data is unavailable"):
+        st.warning(monitoring_status)
+    else:
+        st.info(monitoring_status)
+else:
     selected_run_id = view.model_run_id.iloc[0]
     recent = monitoring[
         (monitoring.horizon_hours == horizon)
