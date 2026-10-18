@@ -26,7 +26,8 @@ for _ in range(5):
 
 from src.mlops.backtest_multihorizon import (
     MAX_PEAK_MAE_REGRESSION, MIN_SELECTION_WINDOWS, MIN_WINDOW_WIN_RATE,
-    PROMOTION_POLICY_VERSION, compute_matched_metrics, compute_metrics, compute_naive_baselines,
+    PROMOTION_POLICY_VERSION, compute_lead_bucket_metrics, compute_matched_metrics, compute_metrics, compute_naive_baselines,
+    compute_peak_event_metrics, compute_threshold_metrics,
     generate_chronological_splits,
 )
 from src.shared.forecast_contract import FEATURE_SCHEMA_VERSION, HORIZONS, features_for_horizon
@@ -65,7 +66,8 @@ def _fit(train: pd.DataFrame, validation: pd.DataFrame, features: list[str]):
     return model
 
 
-def _score(model, frame: pd.DataFrame, horizon: int, include_eia: bool = False) -> Dict[str, Dict[str, float]]:
+def _score(model, frame: pd.DataFrame, horizon: int, include_eia: bool = False,
+           high_demand_threshold_mw: float = 75_000.0) -> Dict[str, Dict[str, float]]:
     # The booster predicts an adjustment to the forecast-origin-available
     # seasonal naive value. Score the reconstructed demand forecast.
     prediction = frame["seasonal_naive_mw"].to_numpy(dtype=float) + model.predict(frame[model.feature_name()])
@@ -83,9 +85,30 @@ def _score(model, frame: pd.DataFrame, horizon: int, include_eia: bool = False) 
         {"model": prediction, "daily_naive": daily, "eia": eia},
         peak_mask=peak,
     ) if include_eia else {"sample_count": 0, "coverage_pct": 0.0, "metrics": {}}
+    lead_buckets = compute_lead_bucket_metrics(
+        frame, {"model": prediction, "daily": daily, "weekly": weekly}, peak
+    )
+    leads = pd.to_numeric(frame["lead_hours"], errors="coerce").to_numpy(float)
+    bucket_ranges = {"lead_1_24": (1, 24)} if horizon == 24 else {
+        "lead_1_24": (1, 24), "lead_25_48": (25, 48), "lead_49_168": (49, 168)
+    }
+    threshold_metrics = {}
+    for bucket, (lower, upper) in bucket_ranges.items():
+        in_bucket = np.isfinite(leads) & (leads >= lower) & (leads <= upper)
+        threshold_metrics[bucket] = {
+            name: compute_threshold_metrics(frame["actual_demand_mw"].to_numpy()[in_bucket], values[in_bucket],
+                                            high_demand_threshold_mw)
+            for name, values in {"model": prediction, "daily": daily, "weekly": weekly}.items()
+        }
+    peak_event_metrics = compute_peak_event_metrics(
+        frame, {"model": prediction, "daily": daily, "weekly": weekly}
+    )
     return {"model": model_metrics,
             "daily": daily_metrics,
             "weekly": weekly_metrics,
+            "lead_buckets": lead_buckets,
+            "threshold_metrics": threshold_metrics,
+            "peak_event_metrics": peak_event_metrics,
             "eia_matched": matched_eia,
             "eia": compute_metrics(frame["actual_demand_mw"], eia, peak) if include_eia else
             {"mae": np.nan, "rmse": np.nan, "bias": np.nan, "smape": np.nan, "peak_mae": np.nan, "sample_count": 0}}
@@ -96,7 +119,8 @@ def _mean_metric(results: list[Dict[str, Dict[str, float]]], model_name: str, me
     return float(np.mean(values)) if values else np.nan
 
 
-def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: int = 4) -> dict:
+def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: int = 4,
+                               high_demand_threshold_mw: float = 75_000.0) -> dict:
     """Fit and score one direct horizon model without random splitting."""
     features, data = features_for_horizon(horizon), _clean_examples(examples, horizon)
     splits = generate_chronological_splits(data["forecast_origin_utc"], n_test_windows=n_windows)
@@ -111,7 +135,8 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
         if fit_train.empty or validation.empty or test.empty:
             continue
         window_result = _score(
-            _fit(fit_train, validation, features), test, horizon, include_eia=(horizon == 24)
+            _fit(fit_train, validation, features), test, horizon, include_eia=(horizon == 24),
+            high_demand_threshold_mw=high_demand_threshold_mw,
         )
         window_result["test_start_utc"] = split["test_start"].isoformat()
         window_result["test_end_utc"] = split["test_end"].isoformat()
@@ -136,7 +161,8 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
     selected_model = _fit(production_train, validation, features)
     booster = lgb.train(MODEL_PARAMS, lgb.Dataset(pre_holdout[features], label=pre_holdout["residual_target_mw"]),
                         num_boost_round=selected_model.best_iteration)
-    final_result = _score(booster, final_holdout, horizon, include_eia=(horizon == 24))
+    final_result = _score(booster, final_holdout, horizon, include_eia=(horizon == 24),
+                          high_demand_threshold_mw=high_demand_threshold_mw)
     selection_mae = _mean_metric(selection_results, "model", "mae")
     selection_baseline = _mean_metric(selection_results, "daily" if horizon == 24 else "weekly", "mae")
 
@@ -157,6 +183,27 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
                               "final_holdout_peak_mae": final_result["model"]["peak_mae"],
                               "final_holdout_daily_naive_mae": final_result["daily"]["mae"],
                               "final_holdout_weekly_naive_mae": final_result["weekly"]["mae"]}
+            baseline_name = "daily" if horizon == 24 else "weekly"
+            for label, model_key in (("model", "model"), ("baseline", baseline_name)):
+                peak = final_result["peak_event_metrics"][model_key]
+                logged_metrics[f"final_holdout_{label}_complete_peak_origins"] = peak["complete_origins"]
+                for metric in ("peak_magnitude_mae_mw", "peak_timing_mae_hours"):
+                    if np.isfinite(peak[metric]):
+                        logged_metrics[f"final_holdout_{label}_{metric}"] = peak[metric]
+            for bucket, forecasts in final_result["threshold_metrics"].items():
+                for label, model_key in (("model", "model"), ("baseline", baseline_name)):
+                    alert = forecasts[model_key]
+                    for metric in ("actual_high_count", "predicted_high_count", "true_positive", "false_positive", "false_negative"):
+                        logged_metrics[f"final_holdout_{bucket}_{label}_{metric}"] = alert[metric]
+                    for metric in ("precision", "recall"):
+                        if np.isfinite(alert[metric]):
+                            logged_metrics[f"final_holdout_{bucket}_{label}_{metric}"] = alert[metric]
+            for bucket, bucket_results in final_result["lead_buckets"].items():
+                for label, model_key in (("model", "model"), ("baseline", baseline_name)):
+                    metric = bucket_results[model_key]
+                    if np.isfinite(metric["mae"]):
+                        logged_metrics[f"final_holdout_{bucket}_{label}_mae"] = metric["mae"]
+                    logged_metrics[f"final_holdout_{bucket}_{label}_rows"] = metric["sample_count"]
             if horizon == 24:
                 matched = final_result["eia_matched"]
                 logged_metrics.update({
@@ -169,7 +216,6 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
                         "final_holdout_daily_naive_mae_on_eia_hours": matched["metrics"]["daily_naive"]["mae"],
                         "final_holdout_eia_mae_on_matched_hours": matched["metrics"]["eia"]["mae"],
                     })
-            baseline_name = "daily" if horizon == 24 else "weekly"
             logged_metrics["selection_baseline_peak_mae"] = _mean_metric(
                 selection_results, baseline_name, "peak_mae"
             )
@@ -184,6 +230,26 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
                     f"selection_window_{window_index}_model_peak_mae": window_result["model"]["peak_mae"],
                     f"selection_window_{window_index}_baseline_peak_mae": window_result[baseline_name]["peak_mae"],
                 })
+                for label, model_key in (("model", "model"), ("baseline", baseline_name)):
+                    peak = window_result["peak_event_metrics"][model_key]
+                    logged_metrics[f"selection_window_{window_index}_{label}_complete_peak_origins"] = peak["complete_origins"]
+                    for metric in ("peak_magnitude_mae_mw", "peak_timing_mae_hours"):
+                        if np.isfinite(peak[metric]):
+                            logged_metrics[f"selection_window_{window_index}_{label}_{metric}"] = peak[metric]
+                for bucket, bucket_results in window_result["lead_buckets"].items():
+                    for label, model_key in (("model", "model"), ("baseline", baseline_name)):
+                        metric = bucket_results[model_key]
+                        if np.isfinite(metric["mae"]):
+                            logged_metrics[f"selection_window_{window_index}_{bucket}_{label}_mae"] = metric["mae"]
+                        logged_metrics[f"selection_window_{window_index}_{bucket}_{label}_rows"] = metric["sample_count"]
+                for bucket, forecasts in window_result["threshold_metrics"].items():
+                    for label, model_key in (("model", "model"), ("baseline", baseline_name)):
+                        alert = forecasts[model_key]
+                        for metric in ("actual_high_count", "predicted_high_count", "true_positive", "false_positive", "false_negative"):
+                            logged_metrics[f"selection_window_{window_index}_{bucket}_{label}_{metric}"] = alert[metric]
+                        for metric in ("precision", "recall"):
+                            if np.isfinite(alert[metric]):
+                                logged_metrics[f"selection_window_{window_index}_{bucket}_{label}_{metric}"] = alert[metric]
                 if horizon == 24:
                     matched = window_result["eia_matched"]
                     logged_metrics.update({
@@ -200,7 +266,8 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
             mlflow.log_params({"promotion_policy_version": PROMOTION_POLICY_VERSION,
                                "minimum_selection_windows": MIN_SELECTION_WINDOWS,
                                "minimum_window_win_rate": MIN_WINDOW_WIN_RATE,
-                               "maximum_peak_mae_regression": MAX_PEAK_MAE_REGRESSION})
+                               "maximum_peak_mae_regression": MAX_PEAK_MAE_REGRESSION,
+                               "high_demand_threshold_mw": high_demand_threshold_mw})
             mlflow.log_dict({"horizon_hours": horizon, "importance_type": "gain",
                              "features": [{"feature_name": name, "gain_importance": float(value)}
                                           for name, value in zip(booster.feature_name(), booster.feature_importance("gain"))]},
@@ -212,8 +279,12 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
 
 
 if __name__ == "__main__" and "spark" in globals():
+    from configs.loader import load_platform_config
+
     examples = spark.table(f"{CATALOG}.gold.forecast_examples").toPandas()
-    results = {horizon: train_single_horizon_model(examples, horizon) for horizon in HORIZONS}
+    threshold = float(load_platform_config("ercot_config.json")["region"]["default_peak_threshold_mw"])
+    results = {horizon: train_single_horizon_model(examples, horizon,
+                                                   high_demand_threshold_mw=threshold) for horizon in HORIZONS}
     for horizon, result in results.items():
         print(f"H{horizon}: rolling-selection MAE {result['selection_mae']:.1f}; final holdout MAE {result['final']['model']['mae']:.1f}")
         if result["run_id"]:

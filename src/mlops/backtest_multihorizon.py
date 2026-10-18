@@ -93,6 +93,105 @@ def compute_matched_metrics(y_true, forecasts: Dict[str, Any], peak_mask=None) -
             "metrics": metrics}
 
 
+def compute_lead_bucket_metrics(df: pd.DataFrame, forecasts: Dict[str, Any], peak_mask=None) -> Dict[str, Dict[str, Dict[str, float]]]:
+    """Score forecasts by operational lead range using the same target rows.
+
+    H24 uses one 1–24 hour bucket. H168 separates day one, day two, and days
+    three through seven. The buckets are diagnostic only and do not affect
+    model promotion.
+    """
+    leads = pd.to_numeric(df["lead_hours"], errors="coerce").to_numpy(float)
+    actual = pd.to_numeric(df["actual_demand_mw"], errors="coerce").to_numpy(float)
+    peak = np.asarray(peak_mask, dtype=bool) if peak_mask is not None else None
+    predictions = {name: np.asarray(values, dtype=float) for name, values in forecasts.items()}
+    if any(values.shape != actual.shape for values in predictions.values()):
+        raise ValueError("Lead-bucket forecasts must have the same shape as actuals.")
+    horizon = int(df["horizon_hours"].iloc[0]) if len(df) else 0
+    if horizon == 24:
+        buckets = {"lead_1_24": (1, 24)}
+    elif horizon == 168:
+        buckets = {"lead_1_24": (1, 24), "lead_25_48": (25, 48), "lead_49_168": (49, 168)}
+    else:
+        buckets = {f"lead_1_{horizon}": (1, horizon)}
+
+    result = {}
+    for bucket, (lower, upper) in buckets.items():
+        in_bucket = np.isfinite(leads) & (leads >= lower) & (leads <= upper)
+        result[bucket] = {
+            name: compute_metrics(actual[in_bucket], values[in_bucket], peak[in_bucket] if peak is not None else None)
+            for name, values in predictions.items()
+        }
+    return result
+
+
+def compute_threshold_metrics(y_true, y_pred, threshold_mw: float) -> Dict[str, float]:
+    """Evaluate point-forecast threshold flags; this does not estimate risk probability."""
+    actual, predicted = np.asarray(y_true, dtype=float), np.asarray(y_pred, dtype=float)
+    if actual.shape != predicted.shape:
+        raise ValueError("Actuals and predictions must have the same shape.")
+    valid = np.isfinite(actual) & np.isfinite(predicted)
+    actual_high = actual[valid] >= threshold_mw
+    predicted_high = predicted[valid] >= threshold_mw
+    tp = int(np.sum(actual_high & predicted_high))
+    fp = int(np.sum(~actual_high & predicted_high))
+    fn = int(np.sum(actual_high & ~predicted_high))
+    precision = tp / (tp + fp) if tp + fp else np.nan
+    recall = tp / (tp + fn) if tp + fn else np.nan
+    return {"sample_count": int(valid.sum()), "actual_high_count": int(actual_high.sum()),
+            "predicted_high_count": int(predicted_high.sum()), "true_positive": tp,
+            "false_positive": fp, "false_negative": fn,
+            "precision": round(precision, 4) if np.isfinite(precision) else np.nan,
+            "recall": round(recall, 4) if np.isfinite(recall) else np.nan}
+
+
+def compute_peak_event_metrics(df: pd.DataFrame, forecasts: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
+    """Measure peak height and peak-time error for complete forecast-origin paths."""
+    required = {"forecast_origin_utc", "target_timestamp_utc", "horizon_hours", "lead_hours", "actual_demand_mw"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Peak-event evaluation is missing columns: {sorted(missing)}")
+    frame = df.reset_index(drop=True)
+    actual = pd.to_numeric(frame["actual_demand_mw"], errors="coerce").to_numpy(float)
+    predictions = {name: np.asarray(values, dtype=float) for name, values in forecasts.items()}
+    if any(values.shape != actual.shape for values in predictions.values()):
+        raise ValueError("Peak-event forecasts must have the same shape as actuals.")
+    horizon = int(frame["horizon_hours"].iloc[0]) if len(frame) else 0
+    expected_rows = horizon
+    origin_values = pd.to_datetime(frame["forecast_origin_utc"], utc=True)
+    target_values = pd.to_datetime(frame["target_timestamp_utc"], utc=True)
+    rows = []
+    for origin, indexes in origin_values.groupby(origin_values).groups.items():
+        positions = np.asarray(list(indexes), dtype=int)
+        origin_leads = pd.to_numeric(frame.iloc[positions]["lead_hours"], errors="coerce")
+        if (len(positions) != expected_rows or not np.isfinite(actual[positions]).all()
+                or set(origin_leads) != set(range(1, horizon + 1))):
+            continue
+        if not np.all((target_values.iloc[positions] - origin).dt.total_seconds().to_numpy() ==
+                      origin_leads.to_numpy(float) * 3600):
+            continue
+        actual_peak_pos = positions[int(np.argmax(actual[positions]))]
+        origin_result = {"actual_peak_mw": float(actual[actual_peak_pos]),
+                         "actual_peak_time": target_values.iloc[actual_peak_pos]}
+        for name, values in predictions.items():
+            if not np.isfinite(values[positions]).all():
+                continue
+            predicted_peak_pos = positions[int(np.argmax(values[positions]))]
+            origin_result[name] = {
+                "magnitude_error": abs(float(np.max(values[positions])) - float(np.max(actual[positions]))),
+                "timing_error_hours": abs((target_values.iloc[predicted_peak_pos] - origin_result["actual_peak_time"]).total_seconds()) / 3600,
+            }
+        rows.append(origin_result)
+    result = {}
+    for name in predictions:
+        values = [row[name] for row in rows if name in row]
+        result[name] = {
+            "complete_origins": len(values),
+            "peak_magnitude_mae_mw": round(float(np.mean([item["magnitude_error"] for item in values])), 2) if values else np.nan,
+            "peak_timing_mae_hours": round(float(np.mean([item["timing_error_hours"] for item in values])), 2) if values else np.nan,
+        }
+    return result
+
+
 def compute_naive_baselines(df: pd.DataFrame, horizon: int | None = None):
     """Return exact T-24 and T-168 benchmarks precomputed by the example builder.
 

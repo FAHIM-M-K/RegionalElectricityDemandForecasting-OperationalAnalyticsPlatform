@@ -6,7 +6,10 @@ import pandas as pd
 from src.gold.build_forecast_examples import generate_forecast_examples_df
 from src.mlops.backtest_multihorizon import (
     compute_naive_baselines,
+    compute_lead_bucket_metrics,
+    compute_threshold_metrics,
     compute_matched_metrics,
+    compute_peak_event_metrics,
     evaluate_promotion_gate,
     generate_chronological_splits,
 )
@@ -103,6 +106,61 @@ def test_matched_metrics_compare_eia_and_model_on_identical_rows():
     assert result["metrics"]["eia"]["sample_count"] == 3
     assert result["metrics"]["model"]["mae"] == 0.67
     assert result["metrics"]["eia"]["mae"] == 1.67
+
+
+def test_lead_bucket_metrics_split_week_ahead_error_by_distance():
+    frame = pd.DataFrame({
+        "horizon_hours": 168,
+        "lead_hours": [1, 24, 25, 48, 49, 168],
+        "actual_demand_mw": [100.0] * 6,
+    })
+    result = compute_lead_bucket_metrics(
+        frame,
+        {"model": [101, 102, 104, 106, 110, 118],
+         "weekly": [103, 103, 103, 103, 103, 103]},
+    )
+    assert set(result) == {"lead_1_24", "lead_25_48", "lead_49_168"}
+    assert result["lead_1_24"]["model"]["sample_count"] == 2
+    assert result["lead_1_24"]["model"]["mae"] == 1.5
+    assert result["lead_25_48"]["model"]["mae"] == 5.0
+    assert result["lead_49_168"]["model"]["mae"] == 14.0
+    assert result["lead_49_168"]["weekly"]["mae"] == 3.0
+
+
+def test_threshold_metrics_count_false_alarms_and_missed_high_demand():
+    result = compute_threshold_metrics(
+        [74_000.0, 76_000.0, 80_000.0, np.nan],
+        [77_000.0, 74_000.0, 79_000.0, 90_000.0],
+        threshold_mw=75_000.0,
+    )
+    assert result["sample_count"] == 3
+    assert result["actual_high_count"] == 2
+    assert result["predicted_high_count"] == 2
+    assert result["true_positive"] == 1
+    assert result["false_positive"] == 1
+    assert result["false_negative"] == 1
+    assert result["precision"] == 0.5
+    assert result["recall"] == 0.5
+
+
+def test_peak_event_metrics_score_peak_height_and_timing_per_complete_origin():
+    origin = pd.Timestamp("2024-01-01", tz="UTC")
+    leads = np.arange(1, 25)
+    actual = np.full(24, 50_000.0)
+    actual[4] = 80_000.0
+    predicted = np.full(24, 50_000.0)
+    predicted[6] = 82_000.0
+    frame = pd.DataFrame({
+        "forecast_origin_utc": origin,
+        "target_timestamp_utc": [origin + pd.Timedelta(hours=int(lead)) for lead in leads],
+        "horizon_hours": 24,
+        "lead_hours": leads,
+        "actual_demand_mw": actual,
+    }, index=np.arange(100, 124))
+    result = compute_peak_event_metrics(frame, {"model": predicted})["model"]
+    assert result["complete_origins"] == 1
+    assert result["peak_magnitude_mae_mw"] == 2_000.0
+    assert result["peak_timing_mae_hours"] == 2.0
 
 
 def _promotion_windows(candidate_maes, baseline_maes=None, candidate_peak=1_000.0, baseline_peak=1_000.0):
