@@ -198,23 +198,52 @@ if not spark.catalog.tableExists(TARGET_TABLE):
     )
     print(f"Initialized {TARGET_TABLE} with {total_count:,} records.")
 else:
-    delta_tbl = DeltaTable.forName(spark, TARGET_TABLE)
-    merge_cond = "target.zone_code = source.zone_code AND target.timestamp_utc = source.timestamp_utc"
+    target_schema = {
+        field.name: field.dataType.simpleString()
+        for field in spark.table(TARGET_TABLE).schema.fields
+    }
+    source_schema = {
+        field.name: field.dataType.simpleString()
+        for field in df_features.schema.fields
+    }
 
-    # F-16: Check all non-audit business columns to ensure revised system load or lags update
-    business_cols = [
-        "timestamp_local", "date_local", "hour_local", "day_of_week_local",
-        "demand_actual_mw", "zone_name", "system_total_mw", "pct_of_system_load",
-        "demand_diff_1h", "demand_diff_24h", "demand_lag_24h", "demand_lag_48h",
-        "demand_lag_168h", "demand_rolling_avg_24h", "is_valid_zonal_demand"
-    ]
-    update_cond = " OR ".join([f"NOT (target.{c} <=> source.{c})" for c in business_cols])
+    if target_schema != source_schema:
+        # Silver is fully derived from Bronze above. For a legacy/incompatible
+        # table schema, rebuild it from that validated source instead of asking
+        # Delta MERGE to update columns that no longer exist (for example the
+        # legacy demand_mw column versus demand_actual_mw).
+        print(
+            f"[SCHEMA MIGRATION] Rebuilding {TARGET_TABLE} from Bronze because its "
+            f"schema differs. Removed columns: {sorted(set(target_schema) - set(source_schema))}; "
+            f"added columns: {sorted(set(source_schema) - set(target_schema))}."
+        )
+        (
+            df_features.write
+            .format("delta")
+            .mode("overwrite")
+            .option("overwriteSchema", "true")
+            .partitionBy("zone_code")
+            .saveAsTable(TARGET_TABLE)
+        )
+        print(f"Rebuilt {TARGET_TABLE} with {total_count:,} validated records.")
+    else:
+        delta_tbl = DeltaTable.forName(spark, TARGET_TABLE)
+        merge_cond = "target.zone_code = source.zone_code AND target.timestamp_utc = source.timestamp_utc"
 
-    (
-        delta_tbl.alias("target")
-        .merge(df_features.alias("source"), merge_cond)
-        .whenMatchedUpdateAll(condition=update_cond)
-        .whenNotMatchedInsertAll()
-        .execute()
-    )
-    print(f"Idempotent MERGE completed on {TARGET_TABLE} (all 15 business columns tracked).")
+        # F-16: Check all non-audit business columns to ensure revised system load or lags update
+        business_cols = [
+            "timestamp_local", "date_local", "hour_local", "day_of_week_local",
+            "demand_actual_mw", "zone_name", "system_total_mw", "pct_of_system_load",
+            "demand_diff_1h", "demand_diff_24h", "demand_lag_24h", "demand_lag_48h",
+            "demand_lag_168h", "demand_rolling_avg_24h", "is_valid_zonal_demand"
+        ]
+        update_cond = " OR ".join([f"NOT (target.{c} <=> source.{c})" for c in business_cols])
+
+        (
+            delta_tbl.alias("target")
+            .merge(df_features.alias("source"), merge_cond)
+            .whenMatchedUpdateAll(condition=update_cond)
+            .whenNotMatchedInsertAll()
+            .execute()
+        )
+        print(f"Idempotent MERGE completed on {TARGET_TABLE} (all 15 business columns tracked).")
