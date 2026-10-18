@@ -127,14 +127,21 @@ def _production_models():
         raise RuntimeError("MLflow is required for production scoring.")
     client, experiment = mlflow.tracking.MlflowClient(), mlflow.get_experiment_by_name(EXPERIMENT_NAME)
     if experiment is None:
-        raise RuntimeError("MLflow experiment does not exist.")
+        raise RuntimeError(
+            f"MLflow experiment {EXPERIMENT_NAME!r} does not exist. "
+            "Run the monthly model workflow (build_forecast_examples → retrain_model → validate_model) "
+            "once before the daily scorer. Validation must promote production models for both H24 and H168."
+        )
     models, runs = {}, {}
     for horizon in HORIZONS:
         found = client.search_runs([experiment.experiment_id],
                                    filter_string=f"tags.pipeline_role = 'PRODUCTION' AND tags.target_horizon = 'H{horizon}'",
                                    order_by=["start_time DESC"], max_results=1)
         if not found:
-            raise RuntimeError(f"No production H{horizon} model found.")
+            raise RuntimeError(
+                f"No production H{horizon} model found in MLflow experiment {EXPERIMENT_NAME!r}. "
+                "Run the monthly retraining and validation workflow and confirm that this horizon was promoted."
+            )
         runs[horizon] = found[0].info.run_id
         models[horizon] = mlflow.lightgbm.load_model(f"runs:/{runs[horizon]}/model_direct_h{horizon}")
     return models, runs

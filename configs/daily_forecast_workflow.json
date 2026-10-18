@@ -35,6 +35,13 @@
       "timeout_seconds": 1800
     },
     {
+      "task_key": "ingest_zonal",
+      "description": "Ingests observed ERCOT weather-zone demand for dashboard analytics.",
+      "depends_on": [{"task_key": "setup_catalog"}],
+      "notebook_task": {"notebook_path": "src/bronze/ingest_ercot_zonal", "source": "GIT"},
+      "timeout_seconds": 3600
+    },
+    {
       "task_key": "clean_eia",
       "depends_on": [{"task_key": "ingest_eia"}],
       "notebook_task": {"notebook_path": "src/silver/clean_eia_demand", "source": "GIT"},
@@ -44,6 +51,12 @@
       "task_key": "clean_weather",
       "depends_on": [{"task_key": "ingest_weather"}],
       "notebook_task": {"notebook_path": "src/silver/clean_weather", "source": "GIT"},
+      "timeout_seconds": 1800
+    },
+    {
+      "task_key": "clean_zonal",
+      "depends_on": [{"task_key": "ingest_zonal"}, {"task_key": "clean_eia"}],
+      "notebook_task": {"notebook_path": "src/silver/clean_ercot_zonal", "source": "GIT"},
       "timeout_seconds": 1800
     },
     {
@@ -70,6 +83,13 @@
       "description": "Calculates forecast errors only for target hours whose actual demand is now available.",
       "depends_on": [{"task_key": "score_forecasts"}],
       "notebook_task": {"notebook_path": "src/mlops/monitor_forecasts", "source": "GIT"},
+      "timeout_seconds": 1800
+    },
+    {
+      "task_key": "build_zonal_summary",
+      "description": "Publishes observed zonal-demand analytics for the dashboard.",
+      "depends_on": [{"task_key": "clean_zonal"}],
+      "notebook_task": {"notebook_path": "src/gold/zonal_demand_summary", "source": "GIT"},
       "timeout_seconds": 1800
     }
   ],

@@ -113,9 +113,16 @@ end_param = f"{end_date_str}T23"
 
 # COMMAND ----------
 # DBTITLE 1,Paginated EIA Subregion API Client
-def fetch_eia_subregion_dataset(api_key: str, start: str, end: str, parent: str = "ERCO", page_size: int = 5000):
+def fetch_eia_subregion_dataset(
+    api_key: str,
+    start: str,
+    end: str,
+    subba: str,
+    parent: str = "ERCO",
+    page_size: int = 5000,
+):
     """
-    Fetches authentic EIA-930 subregion hourly demand records with pagination, backoff, and envelope archival.
+    Fetches one authentic EIA-930 subregion with pagination, backoff, and envelope archival.
     Fail-closed: raises a RuntimeError on failure rather than returning synthetic approximations.
     """
     def fetch_page(offset: int):
@@ -124,6 +131,7 @@ def fetch_eia_subregion_dataset(api_key: str, start: str, end: str, parent: str 
             ("frequency", "hourly"),
             ("data[0]", "value"),
             ("facets[parent][]", parent),
+            ("facets[subba][]", subba),
             ("start", start),
             ("end", end),
             ("sort[0][column]", "period"),
@@ -138,7 +146,7 @@ def fetch_eia_subregion_dataset(api_key: str, start: str, end: str, parent: str 
 
         for attempt in range(1, 4):
             try:
-                with urllib.request.urlopen(req, timeout=40) as resp:
+                with urllib.request.urlopen(req, timeout=60) as resp:
                     raw_text = resp.read().decode("utf-8")
                     payload = json.loads(raw_text)
                     break
@@ -196,15 +204,28 @@ records, raw_payloads = [], []
 date_ranges = list(date_windows(start_date_str, end_date_str))
 for window_index, (window_start, window_end) in enumerate(date_ranges, start=1):
     print(f"[BACKFILL] Fetching date window {window_index}/{len(date_ranges)}: {window_start} to {window_end}.")
-    window_records, window_payloads = fetch_eia_subregion_dataset(
-        api_key=EIA_API_KEY,
-        start=f"{window_start}T00",
-        end=f"{window_end}T23",
-        parent=EIA_PARENT,
-        page_size=EIA_PAGE_SIZE
-    )
-    records.extend(window_records)
-    raw_payloads.extend(window_payloads)
+    # Filtering by subregion keeps each response below one page for a
+    # six-month window. A small pool shortens the initial backfill without
+    # causing an unbounded burst against the public EIA API.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {
+            pool.submit(
+                fetch_eia_subregion_dataset,
+                EIA_API_KEY,
+                f"{window_start}T00",
+                f"{window_end}T23",
+                subba,
+                EIA_PARENT,
+                EIA_PAGE_SIZE,
+            ): subba
+            for subba in sorted(EXPECTED_SUBREGIONS)
+        }
+        for future in as_completed(futures):
+            subba = futures[future]
+            zone_records, zone_payloads = future.result()
+            records.extend(zone_records)
+            raw_payloads.extend(zone_payloads)
+            print(f"  Retrieved {len(zone_records):,} records for {subba}.")
 
 print(f"Total authentic subregion records extracted: {len(records)} across {len(raw_payloads)} API pages.")
 
