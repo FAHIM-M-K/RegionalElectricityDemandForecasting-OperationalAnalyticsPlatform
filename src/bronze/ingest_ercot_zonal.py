@@ -25,7 +25,9 @@ import sys
 import json
 import time
 import datetime
+import email.utils
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.error import HTTPError, URLError
 import urllib.request
 import urllib.parse
 from pyspark.sql import functions as F
@@ -113,6 +115,10 @@ end_param = f"{end_date_str}T23"
 
 # COMMAND ----------
 # DBTITLE 1,Paginated EIA Subregion API Client
+class RetryableEIARequestError(RuntimeError):
+    """Transient EIA/API gateway failure after bounded retries."""
+
+
 def fetch_eia_subregion_dataset(
     api_key: str,
     start: str,
@@ -147,16 +153,41 @@ def fetch_eia_subregion_dataset(
         request_url = f"{EIA_BASE_URL}?{encoded_query}"
         req = urllib.request.Request(request_url, headers={"User-Agent": "ERCOT-Platform/1.0"})
 
-        for attempt in range(1, 4):
+        max_attempts = 4
+        for attempt in range(1, max_attempts + 1):
             try:
                 with urllib.request.urlopen(req, timeout=60) as resp:
                     raw_text = resp.read().decode("utf-8")
                     payload = json.loads(raw_text)
                     break
-            except Exception as e:
-                if attempt == 3:
+            except HTTPError as e:
+                retryable = e.code == 429 or 500 <= e.code <= 599
+                if not retryable:
                     raise RuntimeError(f"EIA Subregion API request failed at offset {offset}: {e}")
-                time.sleep(2 * attempt)
+                if attempt == max_attempts:
+                    raise RetryableEIARequestError(
+                        f"EIA Subregion API request failed at offset {offset} after {max_attempts} attempts: {e}"
+                    ) from e
+                retry_after = e.headers.get("Retry-After") if e.headers else None
+                try:
+                    delay = float(retry_after) if retry_after else min(30, 2 ** attempt)
+                except ValueError:
+                    try:
+                        retry_at = email.utils.parsedate_to_datetime(retry_after)
+                        delay = max(0, (retry_at - datetime.datetime.now(retry_at.tzinfo)).total_seconds())
+                    except (TypeError, ValueError, OverflowError):
+                        delay = min(30, 2 ** attempt)
+                delay = max(1, min(delay, 60))
+                print(f"  Transient EIA HTTP {e.code} at offset {offset}; retry {attempt + 1}/{max_attempts} in {delay:g}s.")
+                time.sleep(delay)
+            except (URLError, TimeoutError, json.JSONDecodeError) as e:
+                if attempt == max_attempts:
+                    raise RetryableEIARequestError(
+                        f"EIA Subregion API request failed at offset {offset} after {max_attempts} attempts: {e}"
+                    ) from e
+                delay = min(30, 2 ** attempt)
+                print(f"  Transient EIA request error at offset {offset}; retry {attempt + 1}/{max_attempts} in {delay}s: {e}")
+                time.sleep(delay)
 
         sanitized_params = {k: v for k, v in query_params if k != "api_key"}
 
@@ -186,6 +217,27 @@ def fetch_eia_subregion_dataset(
                 raw_responses.append(raw_page)
                 print(f"  Retrieved {len(all_records)} / {total} authentic subregion records...")
     return all_records, raw_responses
+
+
+def fetch_window_with_split_fallback(start: str, end: str, depth: int = 0):
+    """Split a date window after exhausted transient errors, then retry smaller queries."""
+    try:
+        return fetch_eia_subregion_dataset(
+            EIA_API_KEY, f"{start}T00", f"{end}T23", EIA_PARENT, EIA_PAGE_SIZE
+        )
+    except RetryableEIARequestError:
+        start_date = datetime.date.fromisoformat(start)
+        end_date = datetime.date.fromisoformat(end)
+        if depth >= 2 or start_date >= end_date:
+            raise
+        midpoint = start_date + (end_date - start_date) // 2
+        left_start, left_end = start_date.isoformat(), midpoint.isoformat()
+        right_start = (midpoint + datetime.timedelta(days=1)).isoformat()
+        right_end = end_date.isoformat()
+        print(f"  EIA remains unavailable for {start} to {end}; splitting into smaller date requests.")
+        left_records, left_pages = fetch_window_with_split_fallback(left_start, left_end, depth + 1)
+        right_records, right_pages = fetch_window_with_split_fallback(right_start, right_end, depth + 1)
+        return left_records + right_records, left_pages + right_pages
 
 
 def date_windows(start_date: str, end_date: str, months: int = 1):
@@ -241,13 +293,7 @@ for window_index, (window_start, window_end) in enumerate(date_ranges, start=1):
         print(f"[RESUME] Reusing {len(window_records):,} cached records for {window_start} to {window_end}.")
     else:
         print(f"[BACKFILL] Fetching date window {window_index}/{len(date_ranges)}: {window_start} to {window_end}.")
-        window_records, window_payloads = fetch_eia_subregion_dataset(
-            EIA_API_KEY,
-            f"{window_start}T00",
-            f"{window_end}T23",
-            EIA_PARENT,
-            EIA_PAGE_SIZE,
-        )
+        window_records, window_payloads = fetch_window_with_split_fallback(window_start, window_end)
         if resume_backfill and window_records:
             temp_path = f"{checkpoint_path}.tmp"
             with open(temp_path, "w", encoding="utf-8") as checkpoint_file:

@@ -59,3 +59,20 @@ def validate_and_promote_horizon(horizon: int, candidate_run_id: str | None = No
 if __name__ == "__main__":
     for horizon in HORIZONS:
         validate_and_promote_horizon(horizon)
+
+    experiment = client.get_experiment_by_name(EXPERIMENT_NAME)
+    missing_production = []
+    for horizon in HORIZONS:
+        production = client.search_runs(
+            [experiment.experiment_id],
+            filter_string=f"tags.pipeline_role = 'PRODUCTION' AND tags.target_horizon = 'H{horizon}'",
+            max_results=1,
+        )
+        if not production:
+            missing_production.append(f"H{horizon}")
+    if missing_production:
+        raise RuntimeError(
+            "Validation finished without production models for " + ", ".join(missing_production) + ". "
+            "The candidate may have failed to beat its rolling-selection naive baseline. "
+            "Check the per-horizon validation output; daily scoring requires a promoted model for every horizon."
+        )

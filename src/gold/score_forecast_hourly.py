@@ -143,7 +143,8 @@ def _production_models():
         if not found:
             raise RuntimeError(
                 f"No production H{horizon} model found in MLflow experiment {EXPERIMENT_NAME!r}. "
-                "Run the monthly retraining and validation workflow and confirm that this horizon was promoted."
+                "The monthly workflow must finish validation with this horizon promoted; a successful training run alone is not enough. "
+                "Check validate_model output for a rejected candidate or promotion failure."
             )
         runs[horizon] = found[0].info.run_id
         models[horizon] = mlflow.lightgbm.load_model(f"runs:/{runs[horizon]}/model_direct_h{horizon}")
