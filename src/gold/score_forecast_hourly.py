@@ -87,6 +87,7 @@ def generate_independent_forecasts(df_history: pd.DataFrame, models: dict, model
         raise ValueError("Score one respondent per invocation.")
     origin = frame.timestamp_utc.max() if origin_utc is None else pd.to_datetime(origin_utc, utc=True)
     snapshot = _snapshot(frame, origin)
+    demand_values = dict(zip(frame["timestamp_utc"], frame["actual_demand_mw"]))
     if holiday_dates is None or calendar_dates is None:
         raise ValueError("Forward calendar dates and holiday dates are required for scoring.")
     forecast_dates = {(origin + pd.Timedelta(hours=lead)).tz_convert("America/Chicago").date()
@@ -106,8 +107,18 @@ def generate_independent_forecasts(df_history: pd.DataFrame, models: dict, model
         if hasattr(model, "feature_name") and model.feature_name() != expected_features:
             raise ValueError(f"Production H{horizon} model feature schema does not match {FEATURE_SCHEMA_VERSION}.")
         leads = list(range(1, horizon + 1))
-        feature_rows = [{"lead_hours": lead, **_calendar(origin + pd.Timedelta(hours=lead), holiday_dates), **snapshot} for lead in leads]
-        predictions = model.predict(pd.DataFrame(feature_rows)[expected_features])
+        seasonal_lag_hours = 24 if horizon == 24 else 168
+        feature_rows = []
+        for lead in leads:
+            target = origin + pd.Timedelta(hours=lead)
+            seasonal_timestamp = target - pd.Timedelta(hours=seasonal_lag_hours)
+            seasonal_value = demand_values.get(seasonal_timestamp, np.nan)
+            if pd.isna(seasonal_value):
+                raise ValueError(f"H{horizon} seasonal baseline is unavailable at lead {lead}; required history is missing.")
+            feature_rows.append({"lead_hours": lead, "seasonal_naive_mw": float(seasonal_value),
+                                 **_calendar(target, holiday_dates), **snapshot})
+        residuals = model.predict(pd.DataFrame(feature_rows)[expected_features])
+        predictions = np.asarray([row["seasonal_naive_mw"] for row in feature_rows], dtype=float) + residuals
         for lead, prediction, feature in zip(leads, predictions, feature_rows):
             target = origin + pd.Timedelta(hours=lead)
             predicted = float(prediction)
@@ -120,8 +131,8 @@ def generate_independent_forecasts(df_history: pd.DataFrame, models: dict, model
                          "hour_local": feature["hour_local"], "predicted_demand_mw": round(predicted, 1),
                          "is_predicted_high_demand": bool(predicted >= high_demand_threshold_mw),
                          "high_demand_threshold_mw": high_demand_threshold_mw, "feature_set": FEATURE_SET_OPERATIONAL,
-                         "feature_schema_version": FEATURE_SCHEMA_VERSION, "forecast_source": "Direct_LightGBM",
-                         "model_version": f"Direct_LightGBM_H{horizon}", "model_run_id": run_id})
+                         "feature_schema_version": FEATURE_SCHEMA_VERSION, "forecast_source": "SeasonalResidual_LightGBM",
+                         "model_version": f"SeasonalResidual_LightGBM_H{horizon}", "model_run_id": run_id})
     return pd.DataFrame(rows)
 
 
@@ -147,7 +158,14 @@ def _production_models():
                 "Check validate_model output for a rejected candidate or promotion failure."
             )
         runs[horizon] = found[0].info.run_id
-        models[horizon] = mlflow.lightgbm.load_model(f"runs:/{runs[horizon]}/model_direct_h{horizon}")
+        trained_schema = found[0].data.params.get("feature_schema_version")
+        if trained_schema != FEATURE_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Production H{horizon} model uses feature schema {trained_schema!r}, "
+                f"but this scorer requires {FEATURE_SCHEMA_VERSION!r}. Run monthly retraining "
+                "and promote a model trained with the current schema before daily scoring."
+            )
+        models[horizon] = mlflow.lightgbm.load_model(f"runs:/{runs[horizon]}/model_seasonal_residual_h{horizon}")
     return models, runs
 
 

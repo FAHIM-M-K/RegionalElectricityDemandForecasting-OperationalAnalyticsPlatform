@@ -8,7 +8,7 @@ holdout is retained for reporting and does not affect model promotion.
 import numpy as np
 import mlflow
 
-from src.shared.forecast_contract import HORIZONS
+from src.shared.forecast_contract import FEATURE_SCHEMA_VERSION, HORIZONS
 
 EXPERIMENT_NAME = "/Shared/ERCOT_MultiHorizon_Forecast_Platform"
 client = mlflow.tracking.MlflowClient()
@@ -34,6 +34,13 @@ def validate_and_promote_horizon(horizon: int, candidate_run_id: str | None = No
         raise RuntimeError(f"No H{horizon} candidate run was produced.")
 
     candidate = client.get_run(candidate_run_id)
+    candidate_schema = candidate.data.params.get("feature_schema_version")
+    if candidate_schema != FEATURE_SCHEMA_VERSION:
+        client.set_tag(candidate_run_id, "pipeline_role", "REJECTED_CANDIDATE")
+        raise RuntimeError(
+            f"H{horizon} candidate uses feature schema {candidate_schema!r}; "
+            f"expected {FEATURE_SCHEMA_VERSION!r}. Re-run retraining from the current code."
+        )
     metrics = candidate.data.metrics
     score, baseline, peak_score = (metrics.get(key) for key in
         ("selection_mae", "selection_baseline_mae", "selection_peak_mae"))
@@ -66,13 +73,17 @@ if __name__ == "__main__":
         production = client.search_runs(
             [experiment.experiment_id],
             filter_string=f"tags.pipeline_role = 'PRODUCTION' AND tags.target_horizon = 'H{horizon}'",
-            max_results=1,
+            order_by=["start_time DESC"], max_results=10,
         )
-        if not production:
+        compatible = any(
+            run.data.params.get("feature_schema_version") == FEATURE_SCHEMA_VERSION
+            for run in production
+        )
+        if not compatible:
             missing_production.append(f"H{horizon}")
     if missing_production:
         raise RuntimeError(
             "Validation finished without production models for " + ", ".join(missing_production) + ". "
-            "The candidate may have failed to beat its rolling-selection naive baseline. "
-            "Check the per-horizon validation output; daily scoring requires a promoted model for every horizon."
+            "No promoted model with the current feature schema is available. The candidate may have failed "
+            "to beat its rolling-selection naive baseline; inspect per-horizon output before daily scoring."
         )

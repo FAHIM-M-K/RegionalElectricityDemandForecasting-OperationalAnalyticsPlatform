@@ -14,7 +14,7 @@ HORIZONS: List[int] = [HORIZON_H24, HORIZON_H168]
 LEAD_HOURS = {HORIZON_H24: range(1, 25), HORIZON_H168: range(1, 169)}
 
 FEATURE_SET_OPERATIONAL = "operational_no_weather"
-FEATURE_SCHEMA_VERSION = "v3.0_direct_point_in_time"
+FEATURE_SCHEMA_VERSION = "v4.0_seasonal_residual_correction"
 DEMAND_MIN_VALID_MW = 10_000.0
 DEMAND_MAX_VALID_MW = 110_000.0
 
@@ -28,13 +28,13 @@ EVALUATION_GRAIN_KEYS = [
 SERVING_GRAIN_KEYS = ["respondent", "horizon_hours", "target_timestamp_utc"]
 
 OPERATIONAL_FEATURES_H24 = [
-    "lead_hours", "hour_local", "day_of_week_local", "is_weekend", "is_holiday",
+    "lead_hours", "seasonal_naive_mw", "hour_local", "day_of_week_local", "is_weekend", "is_holiday",
     "sin_hour", "cos_hour", "sin_dow", "cos_dow", "demand_origin",
     "demand_lag_24h_origin", "demand_lag_48h_origin", "demand_lag_168h_origin",
     "demand_rolling_avg_24h_origin", "demand_rolling_std_24h_origin",
 ]
 OPERATIONAL_FEATURES_H168 = [
-    "lead_hours", "hour_local", "day_of_week_local", "is_weekend", "is_holiday",
+    "lead_hours", "seasonal_naive_mw", "hour_local", "day_of_week_local", "is_weekend", "is_holiday",
     "sin_hour", "cos_hour", "sin_dow", "cos_dow", "demand_origin",
     "demand_lag_24h_origin", "demand_lag_168h_origin", "demand_lag_336h_origin",
     "demand_rolling_avg_24h_origin", "demand_rolling_avg_168h_origin",

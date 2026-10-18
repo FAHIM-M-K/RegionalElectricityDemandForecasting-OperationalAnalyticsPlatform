@@ -49,25 +49,34 @@ def _clean_examples(examples: pd.DataFrame, horizon: int) -> pd.DataFrame:
     data = data.dropna(subset=features + ["actual_demand_mw"]).sort_values("forecast_origin_utc")
     if data.empty:
         raise ValueError(f"No valid H{horizon} examples available for training.")
+    data["residual_target_mw"] = data["actual_demand_mw"] - data["seasonal_naive_mw"]
     return data
 
 
 def _fit(train: pd.DataFrame, validation: pd.DataFrame, features: list[str]):
-    model = lgb.train(MODEL_PARAMS, lgb.Dataset(train[features], label=train["actual_demand_mw"]),
+    model = lgb.train(MODEL_PARAMS, lgb.Dataset(train[features], label=train["residual_target_mw"]),
                       num_boost_round=1200,
-                      valid_sets=[lgb.Dataset(validation[features], label=validation["actual_demand_mw"])],
+                      valid_sets=[lgb.Dataset(validation[features], label=validation["residual_target_mw"])],
                       callbacks=[lgb.early_stopping(50, verbose=False)])
     return model
 
 
-def _score(model, frame: pd.DataFrame, include_eia: bool = False) -> Dict[str, Dict[str, float]]:
-    prediction = model.predict(frame[model.feature_name()])
+def _score(model, frame: pd.DataFrame, horizon: int, include_eia: bool = False) -> Dict[str, Dict[str, float]]:
+    # The booster predicts an adjustment to the forecast-origin-available
+    # seasonal naive value. Score the reconstructed demand forecast.
+    prediction = frame["seasonal_naive_mw"].to_numpy(dtype=float) + model.predict(frame[model.feature_name()])
     peak = frame["hour_local"].between(14, 18).to_numpy()
     daily, weekly = compute_naive_baselines(frame)
     eia = frame["eia_day_ahead_forecast_mw"] if "eia_day_ahead_forecast_mw" in frame else pd.Series(np.nan, index=frame.index)
-    return {"model": compute_metrics(frame["actual_demand_mw"], prediction, peak),
-            "daily": compute_metrics(frame["actual_demand_mw"], daily, peak),
-            "weekly": compute_metrics(frame["actual_demand_mw"], weekly, peak),
+    model_metrics = compute_metrics(frame["actual_demand_mw"], prediction, peak)
+    daily_metrics = compute_metrics(frame["actual_demand_mw"], daily, peak)
+    weekly_metrics = compute_metrics(frame["actual_demand_mw"], weekly, peak)
+    selection_baseline = daily_metrics if horizon == 24 else weekly_metrics
+    if model_metrics["sample_count"] != selection_baseline["sample_count"]:
+        raise ValueError(f"H{horizon} model and seasonal baseline were scored on different row counts.")
+    return {"model": model_metrics,
+            "daily": daily_metrics,
+            "weekly": weekly_metrics,
             "eia": compute_metrics(frame["actual_demand_mw"], eia, peak) if include_eia else
             {"mae": np.nan, "rmse": np.nan, "bias": np.nan, "smape": np.nan, "peak_mae": np.nan, "sample_count": 0}}
 
@@ -91,7 +100,7 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
         test = data[(data.forecast_origin_utc >= split["test_start"]) & (data.forecast_origin_utc < split["test_end"])]
         if fit_train.empty or validation.empty or test.empty:
             continue
-        selection_results.append(_score(_fit(fit_train, validation, features), test, include_eia=(horizon == 24)))
+        selection_results.append(_score(_fit(fit_train, validation, features), test, horizon, include_eia=(horizon == 24)))
     if not selection_results:
         raise ValueError(f"H{horizon} has no usable rolling selection windows.")
 
@@ -107,9 +116,9 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
     if production_train.empty or validation.empty or final_holdout.empty:
         raise ValueError(f"H{horizon} does not have sufficient pre-holdout training or final test data.")
     selected_model = _fit(production_train, validation, features)
-    booster = lgb.train(MODEL_PARAMS, lgb.Dataset(pre_holdout[features], label=pre_holdout["actual_demand_mw"]),
+    booster = lgb.train(MODEL_PARAMS, lgb.Dataset(pre_holdout[features], label=pre_holdout["residual_target_mw"]),
                         num_boost_round=selected_model.best_iteration)
-    final_result = _score(booster, final_holdout, include_eia=(horizon == 24))
+    final_result = _score(booster, final_holdout, horizon, include_eia=(horizon == 24))
     selection_mae = _mean_metric(selection_results, "model", "mae")
     selection_baseline = _mean_metric(selection_results, "daily" if horizon == 24 else "weekly", "mae")
 
@@ -118,7 +127,7 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
               "selection_windows": len(selection_results), "final": final_result, "run_id": None}
     if MLFLOW_AVAILABLE:
         mlflow.set_experiment(EXPERIMENT_NAME)
-        with mlflow.start_run(run_name=f"Direct_LightGBM_H{horizon}") as run:
+        with mlflow.start_run(run_name=f"SeasonalResidual_LightGBM_H{horizon}") as run:
             result["run_id"] = run.info.run_id
             mlflow.log_params({**MODEL_PARAMS, "horizon_hours": horizon, "feature_schema_version": FEATURE_SCHEMA_VERSION,
                                "feature_count": len(features), "selection_windows": len(selection_results),
@@ -138,8 +147,8 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
                                           for name, value in zip(booster.feature_name(), booster.feature_importance("gain"))]},
                             "feature_importance.json")
             mlflow.set_tags({"pipeline_role": "CHAMPION_CANDIDATE", "target_horizon": f"H{horizon}",
-                             "model_type": "direct_supervised_lightgbm", "weather_assumption": "no_weather"})
-            mlflow.lightgbm.log_model(booster, artifact_path=f"model_direct_h{horizon}")
+                             "model_type": "seasonal_naive_residual_lightgbm", "weather_assumption": "no_weather"})
+            mlflow.lightgbm.log_model(booster, artifact_path=f"model_seasonal_residual_h{horizon}")
     return result
 
 

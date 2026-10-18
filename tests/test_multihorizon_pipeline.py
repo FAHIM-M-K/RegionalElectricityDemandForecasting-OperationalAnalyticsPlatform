@@ -47,6 +47,14 @@ def test_naive_baselines_are_target_aligned_not_origin_persistence():
     assert daily[0] != sample.demand_origin.iloc[0]
 
 
+def test_model_seasonal_feature_matches_horizon_baseline():
+    examples = generate_forecast_examples_df(_hourly(), step_hours=24)
+    h24 = examples[examples.horizon_hours == 24]
+    h168 = examples[examples.horizon_hours == 168]
+    assert np.allclose(h24.seasonal_naive_mw, h24.daily_naive_mw)
+    assert np.allclose(h168.seasonal_naive_mw, h168.weekly_naive_mw)
+
+
 def test_contract_rejects_misaligned_target():
     record = {"forecast_origin_utc": pd.Timestamp("2024-01-01", tz="UTC"),
               "target_timestamp_utc": pd.Timestamp("2024-01-02", tz="UTC"), "horizon_hours": 24,
@@ -69,17 +77,22 @@ def test_chronological_splits_reserve_final_holdout():
 def test_scoring_issues_both_products_and_rejects_missing_model():
     class ConstantModel:
         def predict(self, features):
-            return np.repeat(55_000.0, len(features))
+            # A zero residual should reproduce the seasonal naive forecast.
+            return np.zeros(len(features))
     history = _hourly(hours=500)
     calendar_dates = set(pd.date_range("2024-01-01", periods=40, freq="D").date)
     output = generate_independent_forecasts(history, {24: ConstantModel(), 168: ConstantModel()},
                                            {24: "run-h24", 168: "run-h168"},
                                            holiday_dates=set(), calendar_dates=calendar_dates,
-                                           high_demand_threshold_mw=54_000.0)
+                                           high_demand_threshold_mw=50_000.0)
     assert set(output.horizon_hours) == {24, 168}
     assert len(output) == 24 + 168
-    assert output.high_demand_threshold_mw.eq(54_000.0).all()
+    assert output.high_demand_threshold_mw.eq(50_000.0).all()
     assert output.is_predicted_high_demand.all()
+    h24_lead1 = output[(output.horizon_hours == 24) & (output.lead_hours == 1)].iloc[0]
+    h168_lead168 = output[(output.horizon_hours == 168) & (output.lead_hours == 168)].iloc[0]
+    assert h24_lead1.predicted_demand_mw == history.iloc[-24].actual_demand_mw
+    assert h168_lead168.predicted_demand_mw == history.iloc[-1].actual_demand_mw
     invalid_history = history.copy()
     invalid_history.loc[invalid_history.index[-8], "actual_demand_mw"] = 1_000.0
     try:

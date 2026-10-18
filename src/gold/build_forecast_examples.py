@@ -119,6 +119,10 @@ def _examples_for_respondent(df: pd.DataFrame, horizons: Iterable[int], step_hou
                     **_calendar_features(target, holidays),
                     **snapshot,
                 }
+                # Give the model the same point-in-time seasonal forecast used by
+                # validation, so it can learn corrections rather than relearn
+                # the full demand level from less direct lag features.
+                row["seasonal_naive_mw"] = row["daily_naive_mw"] if horizon == 24 else row["weekly_naive_mw"]
                 required = features_for_horizon(horizon)
                 row["is_valid_training_example"] = bool(
                     pd.notna(actual)
@@ -163,9 +167,19 @@ if __name__ == "__main__" and "spark" in globals():
         raise ValueError("No valid forecast examples: inspect source continuity and demand quality.")
     incoming = spark.createDataFrame(examples)
     if spark.catalog.tableExists(target):
-        DeltaTable.forName(spark, target).alias("t").merge(
-            incoming.alias("s"), " AND ".join(f"t.{key} = s.{key}" for key in EXAMPLE_GRAIN_KEYS)
-        ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+        existing_columns = set(spark.table(target).columns)
+        if not set(incoming.columns).issubset(existing_columns):
+            # Feature-contract changes require a one-time full rebuild from the
+            # Gold fact table; a Delta MERGE cannot populate a newly added field
+            # for old rows safely without schema evolution being enabled.
+            incoming.write.format("delta").mode("overwrite").option("overwriteSchema", "true").partitionBy(
+                "horizon_hours"
+            ).saveAsTable(target)
+            print("Forecast-example schema changed; rebuilt the table from the current Gold fact history.")
+        else:
+            DeltaTable.forName(spark, target).alias("t").merge(
+                incoming.alias("s"), " AND ".join(f"t.{key} = s.{key}" for key in EXAMPLE_GRAIN_KEYS)
+            ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
     else:
         incoming.write.format("delta").mode("overwrite").partitionBy("horizon_hours").saveAsTable(target)
     print(f"Built {len(examples):,} point-in-time forecast examples in {target}.")
