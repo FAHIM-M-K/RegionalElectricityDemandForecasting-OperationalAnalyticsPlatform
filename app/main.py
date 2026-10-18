@@ -15,7 +15,9 @@ if st.button("Refresh forecast data"):
     st.rerun()
 
 with st.spinner("Connecting to Databricks and loading the latest forecast…"):
-    forecast, status, monitoring, monitoring_status = load_operational_forecast_data()
+    forecast, status, monitoring, monitoring_status = load_operational_forecast_data(
+        cache_contract_version="four-value-v2"
+    )
 if status.startswith("Stale"):
     st.warning(status)
 else:
@@ -165,8 +167,19 @@ else:
         st.dataframe(by_lead[["lead_bucket", "evaluated_rows", "mae_mw", "rmse_mw", "bias_mw"]],
                      hide_index=True, width="stretch")
     else:
-        st.info(
-            f"No matured forecast errors are available for the selected H{horizon} model run yet. "
-            f"This run has {len(view):,} issued forecast hours. Reliability metrics will appear "
-            "after matching actual demand is available and the monitoring task processes it."
-        )
+        first_target_utc = view["target_timestamp_utc"].min()
+        latest_actual_utc = view["latest_actual_timestamp_utc"].max()
+        if pd.notna(latest_actual_utc) and latest_actual_utc < first_target_utc:
+            actual_label = latest_actual_utc.strftime("%Y-%m-%d %H:%M UTC")
+            target_label = first_target_utc.strftime("%Y-%m-%d %H:%M UTC")
+            st.info(
+                f"No forecast errors are mature for H{horizon} yet. Actual demand is available "
+                f"through {actual_label}; this forecast starts at {target_label}. "
+                "Reliability metrics will appear as actual demand arrives and monitoring processes it."
+            )
+        else:
+            st.info(
+                f"No matured forecast errors are available for the selected H{horizon} model yet. "
+                f"This issue contains {len(view):,} forecast hours. Check that the monitoring task "
+                "has processed actual demand for the forecast targets."
+            )

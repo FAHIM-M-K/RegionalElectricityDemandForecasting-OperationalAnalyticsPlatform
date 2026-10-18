@@ -44,10 +44,14 @@ def get_databricks_connection():
 
 
 @st.cache_data(ttl=300)
-def load_operational_forecast_data():
-    """Return the latest persisted forecast and an honest connection status."""
+def load_operational_forecast_data(cache_contract_version="four-value-v2"):
+    """Return the latest persisted forecast and an honest connection status.
+
+    The version argument is part of Streamlit's cache key. Bump it whenever
+    the returned tuple contract changes so older cached shapes are discarded.
+    """
     started = perf_counter()
-    logger.info("Connecting to Databricks for the forecast dashboard.")
+    logger.info("Connecting to Databricks for the forecast dashboard (cache %s).", cache_contract_version)
     connection = None
     try:
         connection = get_databricks_connection()
