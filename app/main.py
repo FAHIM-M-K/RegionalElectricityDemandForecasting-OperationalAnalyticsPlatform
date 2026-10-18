@@ -34,11 +34,22 @@ if view.empty:
     st.error(f"No H{horizon} forecast rows are available.")
     st.stop()
 peak = view.loc[view.predicted_demand_mw.idxmax()]
-first, second, third = st.columns(3)
+first, second, third, fourth = st.columns(4)
 first.metric("Expected peak", f"{peak.predicted_demand_mw:,.0f} MW")
 peak_time_central = pd.Timestamp(peak.target_timestamp_utc).tz_convert("America/Chicago")
 second.metric("Peak time (Central)", peak_time_central.strftime("%b %d, %Y %I:%M %p %Z"))
 third.metric("Hours above high-demand threshold", int(view.is_predicted_high_demand.sum()))
+latest_actual_mw = view.latest_actual_demand_mw.iloc[0]
+latest_actual_time = view.latest_actual_timestamp_utc.iloc[0]
+if pd.notna(latest_actual_mw) and pd.notna(latest_actual_time):
+    latest_actual_time_central = pd.Timestamp(latest_actual_time).tz_convert("America/Chicago")
+    fourth.metric(
+        "Latest actual demand",
+        f"{latest_actual_mw:,.0f} MW",
+        help=f"Most recent observed demand, recorded {latest_actual_time_central.strftime('%b %d, %Y %I:%M %p %Z')}.",
+    )
+else:
+    fourth.metric("Latest actual demand", "Unavailable", help="No non-null actual demand is currently available.")
 
 figure = px.line(
     view, x="timestamp_local", y="predicted_demand_mw", markers=True,

@@ -283,7 +283,13 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
                             "feature_importance.json")
             mlflow.set_tags({"pipeline_role": "CHAMPION_CANDIDATE", "target_horizon": f"H{horizon}",
                              "model_type": "seasonal_naive_residual_lightgbm", "weather_assumption": "no_weather"})
-            mlflow.lightgbm.log_model(booster, artifact_path=f"model_seasonal_residual_h{horizon}")
+            # Keep the model's input contract in MLflow so registry consumers
+            # can validate the feature columns and types at load time.
+            mlflow.lightgbm.log_model(
+                booster,
+                artifact_path=f"model_seasonal_residual_h{horizon}",
+                input_example=pre_holdout[features].head(3),
+            )
     return result
 
 

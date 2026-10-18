@@ -60,18 +60,31 @@ def load_operational_forecast_data():
             )
         logger.info("Databricks connected; querying latest forecast rows.")
         forecast = _query_frame(connection, """
-            SELECT respondent, forecast_origin_utc, issued_at_utc, target_timestamp_utc, timestamp_local,
-                   horizon_hours, lead_hours, hour_local, predicted_demand_mw,
-                   is_predicted_high_demand, high_demand_threshold_mw, forecast_source, model_version, model_run_id
-            FROM main.gold.forecast_latest
-            WHERE respondent = 'ERCO'
-            ORDER BY horizon_hours, target_timestamp_utc
+            WITH latest_actual AS (
+                SELECT timestamp_utc, actual_demand_mw
+                FROM main.gold.fact_hourly_electricity_demand
+                WHERE respondent = 'ERCO' AND actual_demand_mw IS NOT NULL
+                ORDER BY timestamp_utc DESC
+                LIMIT 1
+            )
+            SELECT f.respondent, f.forecast_origin_utc, f.issued_at_utc, f.target_timestamp_utc, f.timestamp_local,
+                   f.horizon_hours, f.lead_hours, f.hour_local, f.predicted_demand_mw,
+                   f.is_predicted_high_demand, f.high_demand_threshold_mw, f.forecast_source, f.model_version, f.model_run_id,
+                   a.timestamp_utc AS latest_actual_timestamp_utc,
+                   a.actual_demand_mw AS latest_actual_demand_mw
+            FROM main.gold.forecast_latest f
+            LEFT JOIN latest_actual a ON TRUE
+            WHERE f.respondent = 'ERCO'
+            ORDER BY f.horizon_hours, f.target_timestamp_utc
         """)
         logger.info("Latest forecast query returned %s rows.", len(forecast))
         if forecast.empty:
             return forecast, "No forecast has been issued yet", pd.DataFrame(), "Monitoring was not queried because no forecast is available."
         forecast["target_timestamp_utc"] = pd.to_datetime(forecast["target_timestamp_utc"], utc=True)
         forecast["issued_at_utc"] = pd.to_datetime(forecast["issued_at_utc"], utc=True)
+        forecast["latest_actual_timestamp_utc"] = pd.to_datetime(
+            forecast["latest_actual_timestamp_utc"], utc=True
+        )
         # Derive display time from the canonical UTC instant. The persisted
         # timestamp_local column may be returned by the SQL connector as UTC.
         forecast["timestamp_local"] = forecast["target_timestamp_utc"].dt.tz_convert("America/Chicago")

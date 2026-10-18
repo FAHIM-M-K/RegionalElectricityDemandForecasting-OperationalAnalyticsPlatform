@@ -118,6 +118,7 @@ df_daily = (
     )
     .toPandas()
 )
+df_daily = df_daily.sort_values("date_local").reset_index(drop=True)
 
 holiday_daily = df_daily[df_daily["is_holiday"] == True]["daily_avg_demand_mw"]
 non_holiday_daily = df_daily[df_daily["is_holiday"] == False]["daily_avg_demand_mw"]
@@ -128,7 +129,11 @@ raw_daily_drop = float(non_holiday_daily.mean() - holiday_daily.mean())
 
 # 2. Temperature-controlled multiple regression (F-20)
 # Model: Demand = beta0 + beta_holiday * is_holiday + beta_temp * Temp + beta_temp2 * (Temp - 55.2)^2
-valid_mask = df_daily["daily_avg_demand_mw"].notnull() & df_daily["daily_avg_temp_f"].notnull()
+valid_mask = (
+    df_daily["daily_avg_demand_mw"].notnull()
+    & df_daily["daily_avg_temp_f"].notnull()
+    & df_daily["is_holiday"].notnull()
+)
 df_reg = df_daily[valid_mask].copy()
 temp_dev = df_reg["daily_avg_temp_f"] - 55.2
 
@@ -142,12 +147,54 @@ y = df_reg["daily_avg_demand_mw"].values
 beta, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
 adj_holiday_drop = -float(beta[1])
 
+# Moving-block bootstrap: resample contiguous weekday blocks to retain some
+# short-term dependence between nearby daily observations. This interval is
+# descriptive and does not remove confounding or establish a causal effect.
+BOOTSTRAP_REPLICATES = 500
+BOOTSTRAP_BLOCK_ROWS = 20  # approximately four consecutive work weeks
+bootstrap_rng = np.random.default_rng(42)
+bootstrap_adjusted_drops = []
+row_count = len(df_reg)
+block_starts = np.arange(max(1, row_count - BOOTSTRAP_BLOCK_ROWS + 1))
+for _ in range(BOOTSTRAP_REPLICATES):
+    sampled_positions = []
+    while len(sampled_positions) < row_count:
+        start = int(bootstrap_rng.choice(block_starts))
+        sampled_positions.extend(range(start, min(start + BOOTSTRAP_BLOCK_ROWS, row_count)))
+    sampled_positions = np.asarray(sampled_positions[:row_count], dtype=int)
+    bootstrap_frame = df_reg.iloc[sampled_positions]
+    bootstrap_temp = bootstrap_frame["daily_avg_temp_f"].to_numpy(float)
+    bootstrap_temp_dev = bootstrap_temp - 55.2
+    bootstrap_x = np.column_stack([
+        np.ones(row_count),
+        bootstrap_frame["is_holiday"].astype(float).to_numpy(),
+        bootstrap_temp,
+        bootstrap_temp_dev ** 2,
+    ])
+    bootstrap_y = bootstrap_frame["daily_avg_demand_mw"].to_numpy(float)
+    bootstrap_beta, _, _, _ = np.linalg.lstsq(bootstrap_x, bootstrap_y, rcond=None)
+    if np.isfinite(bootstrap_beta[1]):
+        bootstrap_adjusted_drops.append(-float(bootstrap_beta[1]))
+
+if len(bootstrap_adjusted_drops) >= BOOTSTRAP_REPLICATES * 0.9:
+    adjusted_ci_low, adjusted_ci_high = np.percentile(bootstrap_adjusted_drops, [2.5, 97.5])
+else:
+    adjusted_ci_low, adjusted_ci_high = np.nan, np.nan
+
 print(f"Date-Level Daily Observations  : {len(holiday_daily)} holiday dates vs {len(non_holiday_daily)} non-holiday weekdays.")
 print(f"Unadjusted Mean Difference     : {raw_daily_drop:,.0f} MW (Welch's t-test p = {p_val:.3e})")
 print(f"Temperature-Adjusted Drop      : {adj_holiday_drop:,.0f} MW (controlling for daily temp and nonlinear CDH/HDH response)")
+if np.isfinite(adjusted_ci_low) and np.isfinite(adjusted_ci_high):
+    print(
+        f"Adjusted 95% block-bootstrap CI: [{adjusted_ci_low:,.0f}, "
+        f"{adjusted_ci_high:,.0f}] MW ({len(bootstrap_adjusted_drops)} valid replicates; "
+        f"20-weekday-row moving blocks)"
+    )
+else:
+    print("Adjusted 95% block-bootstrap CI: unavailable (too many invalid bootstrap replicates).")
 if p_val < 0.05:
     print("Unadjusted Test                : Difference is statistically significant at the 0.05 level; this does not establish causality.")
 else:
     print("Unadjusted Test                : Difference is not statistically significant at the 0.05 level.")
-print("Adjusted Estimate              : Regression point estimate only; no confidence interval is calculated, so treat it as exploratory.")
-print("Interpretation                 : Neither result proves a causal holiday effect or forecast-feature value.")
+print("Inference Caveat               : The Welch p-value assumes independent dates; use the block-bootstrap interval to account for short-term dependence.")
+print("Interpretation                 : These adjusted observational results do not prove a causal holiday effect or forecast-feature value.")
