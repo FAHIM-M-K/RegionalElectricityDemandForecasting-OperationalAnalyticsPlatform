@@ -202,7 +202,7 @@ def test_promotion_gate_rejects_insufficient_or_incomplete_windows():
     assert incomplete["reason"] == "selection window metrics are incomplete"
 
 
-def test_scoring_issues_both_products_and_rejects_missing_model():
+def test_scoring_issues_both_products_and_uses_labeled_h168_fallback():
     class ConstantModel:
         def predict(self, features):
             # A zero residual should reproduce the seasonal naive forecast.
@@ -231,10 +231,22 @@ def test_scoring_issues_both_products_and_rejects_missing_model():
         assert "invalid load value" in str(exc)
     else:
         raise AssertionError("Scoring accepted a physically invalid value in the rolling history.")
+    fallback = generate_independent_forecasts(
+        history, {24: ConstantModel(), 168: None},
+        {24: "run-h24", 168: "baseline:weekly-seasonal-naive:v1"},
+        holiday_dates=set(), calendar_dates=calendar_dates,
+    )
+    h168 = fallback[fallback.horizon_hours == 168]
+    assert len(h168) == 168
+    assert h168.forecast_source.eq("weekly_seasonal_naive_baseline").all()
+    assert h168.model_version.eq("WeeklySeasonalNaive_Baseline_H168").all()
+    assert h168.model_run_id.eq("baseline:weekly-seasonal-naive:v1").all()
+    assert h168.predicted_demand_mw.iloc[-1] == history.iloc[-1].actual_demand_mw
+
     try:
-        generate_independent_forecasts(history, {24: ConstantModel()}, {24: "run-h24"},
+        generate_independent_forecasts(history, {168: ConstantModel()}, {168: "run-h168"},
                                        holiday_dates=set(), calendar_dates=calendar_dates)
     except ValueError as exc:
-        assert "No active production H168" in str(exc)
+        assert "No active production H24" in str(exc)
     else:
-        raise AssertionError("Scoring silently accepted a missing production model.")
+        raise AssertionError("Scoring accepted a missing required H24 production model.")

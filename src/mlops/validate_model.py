@@ -94,8 +94,9 @@ def validate_and_promote_horizon(horizon: int, candidate_run_id: str | None = No
 
 
 if __name__ == "__main__":
+    decisions = {}
     for horizon in HORIZONS:
-        validate_and_promote_horizon(horizon)
+        decisions[horizon] = validate_and_promote_horizon(horizon)
 
     experiment = client.get_experiment_by_name(EXPERIMENT_NAME)
     missing_production = []
@@ -111,9 +112,13 @@ if __name__ == "__main__":
         )
         if not compatible:
             missing_production.append(f"H{horizon}")
+    for horizon in HORIZONS:
+        status = "PROMOTED" if horizon not in missing_production and decisions[horizon] else (
+            "RETAINED EXISTING PRODUCTION" if horizon not in missing_production else "NO COMPATIBLE PRODUCTION MODEL"
+        )
+        print(f"Validation outcome H{horizon}: {status}.")
     if missing_production:
-        raise RuntimeError(
-            "Validation finished without production models for " + ", ".join(missing_production) + ". "
-            "No promoted model with the current feature schema is available. The candidate may have failed "
-            "to beat its rolling-selection naive baseline; inspect per-horizon output before daily scoring."
+        print(
+            "Validation completed: " + ", ".join(missing_production) + " has no compatible promoted model. "
+            "Daily scoring requires H24; H168 will use the labeled weekly seasonal-naive fallback until promoted."
         )

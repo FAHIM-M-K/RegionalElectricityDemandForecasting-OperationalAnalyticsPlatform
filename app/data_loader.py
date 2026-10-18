@@ -31,7 +31,7 @@ def load_operational_forecast_data():
         forecast = pd.read_sql("""
             SELECT respondent, forecast_origin_utc, issued_at_utc, target_timestamp_utc, timestamp_local,
                    horizon_hours, lead_hours, hour_local, predicted_demand_mw,
-                   is_predicted_high_demand, high_demand_threshold_mw, model_version, model_run_id
+                   is_predicted_high_demand, high_demand_threshold_mw, forecast_source, model_version, model_run_id
             FROM main.gold.forecast_latest
             WHERE respondent = 'ERCO'
             ORDER BY horizon_hours, target_timestamp_utc

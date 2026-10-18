@@ -2,11 +2,11 @@
 # COMMAND ----------
 # MAGIC %pip install lightgbm==4.7.0
 # COMMAND ----------
-"""Issue direct H24 and H168 forecasts from the active MLflow models.
+"""Issue H24/H168 forecasts, using an explicit weekly-naive fallback for H168.
 
-There is no heuristic model fallback.  If the required demand history or a
-production model is absent, this job fails so the dashboard cannot present an
-invented forecast as a model output.
+H24 requires a promoted ML model. H168 uses its promoted ML model when one is
+available; otherwise, it serves the weekly seasonal-naive benchmark with clear
+baseline metadata until an H168 candidate passes validation.
 """
 
 import math
@@ -43,6 +43,7 @@ EXPERIMENT_NAME = "/Shared/ERCOT_MultiHorizon_Forecast_Platform"
 SOURCE_FACT_TABLE = f"{CATALOG}.gold.fact_hourly_electricity_demand"
 TARGET_LATEST_TABLE = f"{CATALOG}.gold.forecast_latest"
 TARGET_EVALUATION_TABLE = f"{CATALOG}.gold.forecast_evaluation"
+H168_BASELINE_RUN_ID = "baseline:weekly-seasonal-naive:v1"
 
 
 def _calendar(timestamp: pd.Timestamp, holiday_dates: set) -> dict:
@@ -101,10 +102,11 @@ def generate_independent_forecasts(df_history: pd.DataFrame, models: dict, model
     for horizon in HORIZONS:
         model = models.get(horizon)
         run_id = model_runs.get(horizon)
-        if model is None or not run_id:
+        use_weekly_baseline = horizon == 168 and model is None and run_id == H168_BASELINE_RUN_ID
+        if (model is None and not use_weekly_baseline) or not run_id:
             raise ValueError(f"No active production H{horizon} model is available; scoring stopped.")
         expected_features = features_for_horizon(horizon)
-        if hasattr(model, "feature_name") and model.feature_name() != expected_features:
+        if model is not None and hasattr(model, "feature_name") and model.feature_name() != expected_features:
             raise ValueError(f"Production H{horizon} model feature schema does not match {FEATURE_SCHEMA_VERSION}.")
         leads = list(range(1, horizon + 1))
         seasonal_lag_hours = 24 if horizon == 24 else 168
@@ -117,7 +119,8 @@ def generate_independent_forecasts(df_history: pd.DataFrame, models: dict, model
                 raise ValueError(f"H{horizon} seasonal baseline is unavailable at lead {lead}; required history is missing.")
             feature_rows.append({"lead_hours": lead, "seasonal_naive_mw": float(seasonal_value),
                                  **_calendar(target, holiday_dates), **snapshot})
-        residuals = model.predict(pd.DataFrame(feature_rows)[expected_features])
+        residuals = (np.zeros(len(feature_rows), dtype=float) if use_weekly_baseline
+                     else model.predict(pd.DataFrame(feature_rows)[expected_features]))
         predictions = np.asarray([row["seasonal_naive_mw"] for row in feature_rows], dtype=float) + residuals
         for lead, prediction, feature in zip(leads, predictions, feature_rows):
             target = origin + pd.Timedelta(hours=lead)
@@ -130,9 +133,14 @@ def generate_independent_forecasts(df_history: pd.DataFrame, models: dict, model
                          "timestamp_local": local.tz_localize(None), "date_local": local.date(),
                          "hour_local": feature["hour_local"], "predicted_demand_mw": round(predicted, 1),
                          "is_predicted_high_demand": bool(predicted >= high_demand_threshold_mw),
-                         "high_demand_threshold_mw": high_demand_threshold_mw, "feature_set": FEATURE_SET_OPERATIONAL,
-                         "feature_schema_version": FEATURE_SCHEMA_VERSION, "forecast_source": "SeasonalResidual_LightGBM",
-                         "model_version": f"SeasonalResidual_LightGBM_H{horizon}", "model_run_id": run_id})
+                         "high_demand_threshold_mw": high_demand_threshold_mw,
+                         "feature_set": "weekly_seasonal_naive_baseline" if use_weekly_baseline else FEATURE_SET_OPERATIONAL,
+                         "feature_schema_version": "not_applicable_baseline" if use_weekly_baseline else FEATURE_SCHEMA_VERSION,
+                         "forecast_source": ("weekly_seasonal_naive_baseline" if use_weekly_baseline
+                                             else "seasonal_residual_lightgbm"),
+                         "model_version": ("WeeklySeasonalNaive_Baseline_H168" if use_weekly_baseline
+                                           else f"SeasonalResidual_LightGBM_H{horizon}"),
+                         "model_run_id": run_id})
     return pd.DataFrame(rows)
 
 
@@ -152,10 +160,14 @@ def _production_models():
                                    filter_string=f"tags.pipeline_role = 'PRODUCTION' AND tags.target_horizon = 'H{horizon}'",
                                    order_by=["start_time DESC"], max_results=1)
         if not found:
+            if horizon == 168:
+                models[horizon] = None
+                runs[horizon] = H168_BASELINE_RUN_ID
+                print("No promoted H168 ML model is available; issuing the explicitly labeled weekly seasonal-naive baseline.")
+                continue
             raise RuntimeError(
                 f"No production H{horizon} model found in MLflow experiment {EXPERIMENT_NAME!r}. "
-                "The monthly workflow must finish validation with this horizon promoted; a successful training run alone is not enough. "
-                "Check validate_model output for a rejected candidate or promotion failure."
+                "The daily scorer requires a validated H24 model. Check validate_model output."
             )
         runs[horizon] = found[0].info.run_id
         trained_schema = found[0].data.params.get("feature_schema_version")
