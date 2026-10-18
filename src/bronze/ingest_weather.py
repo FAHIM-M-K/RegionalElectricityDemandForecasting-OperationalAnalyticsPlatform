@@ -22,6 +22,7 @@ CATALOG = "main"
 TABLE_NAME = f"{CATALOG}.bronze.weather_hourly_raw"
 FULL_HISTORY_START = "2021-01-01"  # Earliest date for initial full load
 RESTATEMENT_BUFFER_DAYS = 3       # Overlap to catch weather observation corrections
+ARCHIVE_DELAY_DAYS = 5            # Open-Meteo ERA5 archive is published with a five-day delay
 
 spark.sql(f"USE CATALOG {CATALOG}")
 spark.sql("USE SCHEMA bronze")
@@ -51,7 +52,7 @@ vars_param = ",".join(weather_vars)
 # COMMAND ----------
 # DBTITLE 1,High-Water Mark: Auto-Detect Full Load vs Incremental
 now_utc = datetime.datetime.now(datetime.timezone.utc)
-end_date_str = now_utc.strftime("%Y-%m-%d")
+end_date_str = (now_utc.date() - datetime.timedelta(days=ARCHIVE_DELAY_DAYS)).strftime("%Y-%m-%d")
 
 if spark.catalog.tableExists(TABLE_NAME) and spark.table(TABLE_NAME).count() > 0:
     # Table exists with data: incremental from high-water mark minus buffer
@@ -131,86 +132,94 @@ print(f"Total weather station hourly records extracted: {len(all_weather_rows)} 
 
 # COMMAND ----------
 # DBTITLE 1,Land Raw to Volume & Append to Bronze Delta Table
-if all_weather_rows:
-    # 1. Production Landing: Save full original API responses to Volume
-    raw_weather_dir = f"/Volumes/{CATALOG}/bronze/raw_landing/weather"
-    os.makedirs(raw_weather_dir, exist_ok=True)
-    timestamp_epoch = int(time.time())
-    raw_weather_file = f"weather_ercot_raw_responses_{start_date_str}_{end_date_str}_{timestamp_epoch}.json"
-    raw_weather_path = f"{raw_weather_dir}/{raw_weather_file}"
-    
-    with open(raw_weather_path, "w", encoding="utf-8") as f:
-        json.dump(raw_api_responses, f)
-    print(f"Archived authentic raw API responses to Volume: {raw_weather_path}")
+if not all_weather_rows:
+    raise RuntimeError(
+        f"Bronze Ingestion Failure: 0 weather records retrieved across {len(weather_stations)} stations "
+        f"for window {start_date_str} to {end_date_str}. Pipeline failed closed to prevent downstream silent stale tables (C-03)."
+    )
 
-    # 2. Convert to Spark DataFrame & attach provenance metadata
-    df_weather = spark.createDataFrame(all_weather_rows)
-    df_bronze_weather = df_weather \
-        .withColumn("_ingested_at_utc", F.current_timestamp()) \
-        .withColumn("_source", F.lit("Open-Meteo-Archive")) \
-        .withColumn("_raw_payload_path", F.lit(raw_weather_path))
-        
-    # 3. Quality & Completeness Assertions
-    source_deduped = df_bronze_weather.dropDuplicates(["station_id", "time_utc"])
+# 1. Production Landing: Save full original API responses to Volume
+raw_weather_dir = f"/Volumes/{CATALOG}/bronze/raw_landing/weather"
+os.makedirs(raw_weather_dir, exist_ok=True)
+timestamp_epoch = int(time.time())
+raw_weather_file = f"weather_ercot_raw_responses_{start_date_str}_{end_date_str}_{timestamp_epoch}.json"
+raw_weather_path = f"{raw_weather_dir}/{raw_weather_file}"
+
+with open(raw_weather_path, "w", encoding="utf-8") as f:
+    json.dump(raw_api_responses, f)
+print(f"Archived authentic raw API responses to Volume: {raw_weather_path}")
+
+# 2. Convert to Spark DataFrame & attach provenance metadata
+df_weather = spark.createDataFrame(all_weather_rows)
+df_bronze_weather = df_weather \
+    .withColumn("_ingested_at_utc", F.current_timestamp()) \
+    .withColumn("_source", F.lit("Open-Meteo-Archive")) \
+    .withColumn("_raw_payload_path", F.lit(raw_weather_path))
     
-    # Assert zero null primary keys
-    null_keys = source_deduped.filter(F.col("station_id").isNull() | F.col("time_utc").isNull()).count()
-    assert null_keys == 0, f"Integrity Failure: Found {null_keys} weather records with null primary keys."
+# 3. Quality & Completeness Assertions
+duplicate_keys = (df_bronze_weather.groupBy("station_id", "time_utc")
+                  .count().filter(F.col("count") > 1).count())
+assert duplicate_keys == 0, f"Integrity Failure: Found {duplicate_keys} duplicate weather source keys in this batch."
+source_deduped = df_bronze_weather
+
+# Assert zero null primary keys
+null_keys = source_deduped.filter(F.col("station_id").isNull() | F.col("time_utc").isNull()).count()
+assert null_keys == 0, f"Integrity Failure: Found {null_keys} weather records with null primary keys."
+
+# Assert all expected stations are present
+ingested_stations = [r["station_id"] for r in source_deduped.select("station_id").distinct().collect()]
+expected_stations = [s["station_id"] for s in weather_stations]
+for exp_st in expected_stations:
+    assert exp_st in ingested_stations, f"Completeness Failure: Expected station {exp_st} not found in ingested batch."
     
-    # Assert all expected stations are present
-    ingested_stations = [r["station_id"] for r in source_deduped.select("station_id").distinct().collect()]
-    expected_stations = [s["station_id"] for s in weather_stations]
-    for exp_st in expected_stations:
-        assert exp_st in ingested_stations, f"Completeness Failure: Expected station {exp_st} not found in ingested batch."
-        
-    # Assert exact timestamp matrix equality: every single timestamp must have ALL stations reporting
-    missing_station_timestamps = (
-        source_deduped.groupBy("time_utc")
-        .agg(F.countDistinct("station_id").alias("stations_reporting"))
-        .filter(F.col("stations_reporting") != len(expected_stations))
-        .count()
+# Assert exact timestamp matrix equality: every single timestamp must have ALL stations reporting
+missing_station_timestamps = (
+    source_deduped.groupBy("time_utc")
+    .agg(F.countDistinct("station_id").alias("stations_reporting"))
+    .filter(F.col("stations_reporting") != len(expected_stations))
+    .count()
+)
+assert missing_station_timestamps == 0, (
+    f"Matrix Alignment Failure: Found {missing_station_timestamps} timestamps where not all "
+    f"{len(expected_stations)} stations reported simultaneously."
+)
+
+total_distinct_hours = source_deduped.select("time_utc").distinct().count()
+print(f"Quality Assertions Passed: 0 null keys. All {len(expected_stations)} stations aligned across exactly {total_distinct_hours:,} synchronized hours.")
+
+# 4. Idempotent Upsert into Bronze Delta table with Null-Safe Equality (<=>)
+if not spark.catalog.tableExists(TABLE_NAME):
+    source_deduped.write \
+        .format("delta") \
+        .mode("overwrite") \
+        .saveAsTable(TABLE_NAME)
+    print(f"Initialized table {TABLE_NAME} with {source_deduped.count()} records.")
+else:
+    delta_table = DeltaTable.forName(spark, TABLE_NAME)
+    merge_condition = (
+        "target.station_id = source.station_id "
+        "AND target.time_utc = source.time_utc"
     )
-    assert missing_station_timestamps == 0, (
-        f"Matrix Alignment Failure: Found {missing_station_timestamps} timestamps where not all "
-        f"{len(expected_stations)} stations reported simultaneously."
+    
+    # Null-safe inequality: NOT (target <=> source) correctly detects null -> val, val -> null, val -> new_val
+    update_condition = (
+        "NOT (target.temperature_2m <=> source.temperature_2m) OR "
+        "NOT (target.relative_humidity_2m <=> source.relative_humidity_2m) OR "
+        "NOT (target.dew_point_2m <=> source.dew_point_2m) OR "
+        "NOT (target.apparent_temperature <=> source.apparent_temperature) OR "
+        "NOT (target.precipitation <=> source.precipitation) OR "
+        "NOT (target.wind_speed_10m <=> source.wind_speed_10m) OR "
+        "NOT (target.direct_normal_irradiance <=> source.direct_normal_irradiance)"
     )
     
-    total_distinct_hours = source_deduped.select("time_utc").distinct().count()
-    print(f"Quality Assertions Passed: 0 null keys. All {len(expected_stations)} stations aligned across exactly {total_distinct_hours:,} synchronized hours.")
-    
-    # 4. Idempotent Upsert into Bronze Delta table with Null-Safe Equality (<=>)
-    if not spark.catalog.tableExists(TABLE_NAME):
-        source_deduped.write \
-            .format("delta") \
-            .mode("overwrite") \
-            .saveAsTable(TABLE_NAME)
-        print(f"Initialized table {TABLE_NAME} with {source_deduped.count()} records.")
-    else:
-        delta_table = DeltaTable.forName(spark, TABLE_NAME)
-        merge_condition = (
-            "target.station_id = source.station_id "
-            "AND target.time_utc = source.time_utc"
-        )
-        
-        # Null-safe inequality: NOT (target <=> source) correctly detects null -> val, val -> null, val -> new_val
-        update_condition = (
-            "NOT (target.temperature_2m <=> source.temperature_2m) OR "
-            "NOT (target.relative_humidity_2m <=> source.relative_humidity_2m) OR "
-            "NOT (target.dew_point_2m <=> source.dew_point_2m) OR "
-            "NOT (target.apparent_temperature <=> source.apparent_temperature) OR "
-            "NOT (target.precipitation <=> source.precipitation) OR "
-            "NOT (target.wind_speed_10m <=> source.wind_speed_10m) OR "
-            "NOT (target.direct_normal_irradiance <=> source.direct_normal_irradiance)"
-        )
-        
-        delta_table.alias("target").merge(
-            source_deduped.alias("source"),
-            merge_condition
-        ).whenMatchedUpdateAll(
-            condition=update_condition
-        ).whenNotMatchedInsertAll(
-        ).execute()
-        print(f"Idempotent MERGE completed on {TABLE_NAME} (null-safe equality enabled).")
+    delta_table.alias("target").merge(
+        source_deduped.alias("source"),
+        merge_condition
+    ).whenMatchedUpdateAll(
+        condition=update_condition
+    ).whenNotMatchedInsertAll(
+    ).execute()
+    print(f"Idempotent MERGE completed on {TABLE_NAME} (null-safe equality enabled).")
 
 # COMMAND ----------
 # MAGIC %sql

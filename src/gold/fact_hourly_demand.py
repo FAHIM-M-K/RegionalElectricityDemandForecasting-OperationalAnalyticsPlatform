@@ -192,13 +192,10 @@ def upsert_gold_fact_table(df_fact, target_table, spark_session):
             "AND target.timestamp_utc = source.timestamp_utc"
         )
         
-        update_condition = (
-            "NOT (target.actual_demand_mw <=> source.actual_demand_mw) OR "
-            "NOT (target.day_ahead_forecast_mw <=> source.day_ahead_forecast_mw) OR "
-            "NOT (target.eia_error_mw <=> source.eia_error_mw) OR "
-            "NOT (target.is_high_demand_threshold_exceeded <=> source.is_high_demand_threshold_exceeded) OR "
-            "NOT (target.weighted_temperature_f <=> source.weighted_temperature_f)"
-        )
+        # Track ALL business columns (demand, weather, calendar, error metrics) for restatements (H-11)
+        # Excludes composite primary keys and processing timestamp to prevent unnecessary file churn
+        business_cols = [c for c in df_fact.columns if c not in ["respondent", "timestamp_utc", "_gold_processed_at_utc"]]
+        update_condition = " OR ".join([f"NOT (target.{c} <=> source.{c})" for c in business_cols])
         
         delta_target.alias("target").merge(
             df_fact.alias("source"),

@@ -29,6 +29,7 @@ TARGET_TABLE = f"{CATALOG}.silver.electricity_demand_hourly"
 
 spark.sql(f"USE CATALOG {CATALOG}")
 spark.sql("USE SCHEMA silver")
+spark.conf.set("spark.sql.session.timeZone", "UTC")
 
 # COMMAND ----------
 # DBTITLE 1,Dynamic Configuration Locator

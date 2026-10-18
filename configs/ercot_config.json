@@ -3,18 +3,31 @@
     "code": "ERCO",
     "name": "Electric Reliability Council of Texas",
     "timezone": "America/Chicago",
-    "default_peak_threshold_mw": 75000.0
+    "default_peak_threshold_mw": 75000.0,
+    "peak_alert_description": "User-configured high-demand advisory threshold. It is not a capacity limit or a probability of grid stress."
   },
   "eia": {
     "base_url": "https://api.eia.gov/v2/",
     "route": "electricity/rto/region-data/data/",
+    "subregion_route": "electricity/rto/region-sub-ba-data/data/",
     "respondent": "ERCO",
     "series_types": ["D", "DF"],
     "frequency": "hourly",
     "page_size": 5000,
-    "default_start_date": "2021-01-01T00"
+    "default_start_date": "2021-01-01T00",
+    "subregions": [
+      {"code": "NCENT", "name": "North Central"},
+      {"code": "COAST", "name": "Coast"},
+      {"code": "SCENT", "name": "South Central"},
+      {"code": "FWEST", "name": "Far West"},
+      {"code": "SOUTH", "name": "South"},
+      {"code": "EAST",  "name": "East"},
+      {"code": "WEST",  "name": "West"},
+      {"code": "NORTH", "name": "North"}
+    ]
   },
   "weather": {
+    "aggregation_note": "Configured representative-site weights are a descriptive heuristic, not measured ERCOT load shares or population weights.",
     "archive_base_url": "https://archive-api.open-meteo.com/v1/archive",
     "forecast_base_url": "https://api.open-meteo.com/v1/forecast",
     "hourly_variables": [

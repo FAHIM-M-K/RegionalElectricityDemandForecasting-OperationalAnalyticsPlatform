@@ -1,111 +1,279 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Bronze: ERCOT Zonal Demand Ingestion
+# MAGIC # Bronze: ERCOT Subregion (Zonal) Electricity Demand Ingestion
 # MAGIC
-# MAGIC **Source:** ERCOT Public Zonal Load Data / Historical Weather Zone Distribution  
+# MAGIC **Source:** U.S. Energy Information Administration (EIA) Open Data API v2 (Form EIA-930 Subregion Data)  
+# MAGIC **Route:** `electricity/rto/subregion-data/data/`  
+# MAGIC **Parent Balancing Authority:** ERCOT (`ERCO`)  
+# MAGIC **Subregions / Weather Zones:** 
+# MAGIC - `NCENT` (North Central)
+# MAGIC - `COAST` (Coast)
+# MAGIC - `SCENT` (South Central)
+# MAGIC - `FWEST` (Far West)
+# MAGIC - `SOUTH` (South)
+# MAGIC - `EAST` (East)
+# MAGIC - `WEST` (West)
+# MAGIC - `NORTH` (North)
+# MAGIC
 # MAGIC **Target Table:** `main.bronze.ercot_zonal_raw`  
-# MAGIC **Granularity:** Hourly by Zone (COAST, EAST, FWEST, NORTH, NCENT, SOUTH, SCENT, WEST)
+# MAGIC **Quality Guarantees:** Zero synthetic approximations, complete envelope raw-payload archival, and null-safe idempotent Delta upsert.
 
 # COMMAND ----------
 # DBTITLE 1,Imports & Configuration
 import os
 import sys
 import json
-import numpy as np
-import pandas as pd
-from datetime import datetime, timezone
-try:
-    from pyspark.sql import functions as F
-    from pyspark.sql.types import (
-        StructType, StructField, StringType, DoubleType, TimestampType
-    )
-except ImportError:
-    F = None
+import time
+import datetime
+import urllib.request
+import urllib.parse
+from pyspark.sql import functions as F
+from delta.tables import DeltaTable
 
 CATALOG = "main"
-TARGET_TABLE = f"{CATALOG}.bronze.ercot_zonal_raw"
-SOURCE_EIA_TABLE = f"{CATALOG}.silver.clean_eia_demand"
+TABLE_NAME = f"{CATALOG}.bronze.ercot_zonal_raw"
+FULL_HISTORY_START = "2021-01-01"
+RESTATEMENT_BUFFER_DAYS = 5
 
+# Retrieve API Key securely: Databricks Secret Scope -> Cluster Env Var
+EIA_API_KEY = None
 try:
-    spark.sql(f"USE CATALOG {CATALOG}")
-    spark.sql("USE SCHEMA bronze")
-except Exception as e:
-    print(f"Catalog setup notice: {e}")
+    EIA_API_KEY = dbutils.secrets.get(scope="grid_platform", key="eia_api_key")
+except Exception:
+    pass
 
-# Weather zone baseline load shares (sums to 1.00)
-ZONE_CONFIGS = [
-    {"zone_code": "NCENT", "zone_name": "North Central", "share": 0.345, "temp_coeff": 0.012},
-    {"zone_code": "COAST", "zone_name": "Coast",         "share": 0.275, "temp_coeff": 0.015},
-    {"zone_code": "SCENT", "zone_name": "South Central", "share": 0.165, "temp_coeff": 0.010},
-    {"zone_code": "FWEST", "zone_name": "Far West",      "share": 0.075, "temp_coeff": 0.005},
-    {"zone_code": "SOUTH", "zone_name": "South",         "share": 0.060, "temp_coeff": 0.008},
-    {"zone_code": "EAST",  "zone_name": "East",          "share": 0.035, "temp_coeff": 0.003},
-    {"zone_code": "WEST",  "zone_name": "West",          "share": 0.025, "temp_coeff": 0.002},
-    {"zone_code": "NORTH", "zone_name": "North",         "share": 0.020, "temp_coeff": 0.002},
-]
+if not EIA_API_KEY:
+    EIA_API_KEY = os.getenv("EIA_API_KEY", "")
+
+assert EIA_API_KEY, (
+    "EIA_API_KEY is required. Please ensure it is stored in Databricks Secret Scope "
+    "(scope='grid_platform', key='eia_api_key') or as cluster environment variable 'EIA_API_KEY'."
+)
+
+spark.sql(f"USE CATALOG {CATALOG}")
+spark.sql("USE SCHEMA bronze")
 
 # COMMAND ----------
-# DBTITLE 1,Ingest or Construct Zonal Demand Series
-print("Checking for existing system-wide demand in silver layer...")
+# DBTITLE 1,Load Configuration & Establish Boundaries
+_repo_root = os.getcwd()
+for _ in range(5):
+    if os.path.isdir(os.path.join(_repo_root, "configs")):
+        if _repo_root not in sys.path:
+            sys.path.insert(0, _repo_root)
+        break
+    _parent = os.path.dirname(_repo_root)
+    if _parent == _repo_root:
+        break
+    _repo_root = _parent
 
-try:
-    df_system = (
-        spark.table(SOURCE_EIA_TABLE)
-        .filter(F.col("respondent") == "ERCO")
-        .select("timestamp_utc", "timestamp_local", "demand_actual_mw")
-        .filter(F.col("demand_actual_mw").isNotNull())
-    )
-    pdf_system = df_system.toPandas()
-    print(f"Loaded {len(pdf_system):,} system-level hourly records.")
-except Exception as e:
-    print(f"Warning: Could not read {SOURCE_EIA_TABLE} ({e}). Generating standard 90-day hourly window.")
-    date_rng = pd.date_range(end=pd.Timestamp.now(tz="UTC"), periods=2160, freq="h")
-    # Base diurnal pattern
-    hours = date_rng.hour.values
-    diurnal = 45000 + 15000 * np.sin((hours - 6) * np.pi / 12).clip(min=-0.8)
-    pdf_system = pd.DataFrame({
-        "timestamp_utc": date_rng,
-        "timestamp_local": date_rng.tz_convert("America/Chicago").tz_localize(None),
-        "demand_actual_mw": diurnal + np.random.normal(0, 800, len(date_rng))
-    })
+from configs.loader import load_platform_config
+
+config = load_platform_config("ercot_config.json")
+eia_cfg = config.get("eia", {})
+EIA_PARENT = eia_cfg.get("respondent", "ERCO")
+EIA_PAGE_SIZE = eia_cfg.get("page_size", 5000)
+SUBREGION_ROUTE = eia_cfg.get("subregion_route", "electricity/rto/region-sub-ba-data/data/")
+EIA_BASE_URL = urllib.parse.urljoin(eia_cfg.get("base_url", "https://api.eia.gov/v2/"), SUBREGION_ROUTE)
+
+EXPECTED_SUBREGIONS = {
+    s["code"] for s in eia_cfg.get("subregions", [
+        {"code": "NCENT"}, {"code": "COAST"}, {"code": "SCENT"}, {"code": "FWEST"},
+        {"code": "SOUTH"}, {"code": "EAST"}, {"code": "WEST"}, {"code": "NORTH"}
+    ])
+}
 
 # COMMAND ----------
-# DBTITLE 1,Generate Hourly Load by Zone
-rows = []
-ingested_at = datetime.now(timezone.utc)
+# DBTITLE 1,High-Water Mark Detection
+now_utc = datetime.datetime.now(datetime.timezone.utc)
+end_date_str = now_utc.strftime("%Y-%m-%d")
 
-for _, r in pdf_system.iterrows():
-    ts_utc = r["timestamp_utc"]
-    total_mw = float(r["demand_actual_mw"])
-    
-    # Slight dynamic fluctuation per zone around nominal share
-    for z in ZONE_CONFIGS:
-        zone_demand = round(total_mw * z["share"], 1)
-        rows.append({
-            "zone_code": z["zone_code"],
-            "zone_name": z["zone_name"],
-            "timestamp_utc": pd.to_datetime(ts_utc),
-            "demand_mw": zone_demand,
-            "system_total_mw": total_mw,
-            "nominal_share_pct": round(z["share"] * 100.0, 2),
-            "ingested_at": ingested_at
+if spark.catalog.tableExists(TABLE_NAME) and spark.table(TABLE_NAME).count() > 0:
+    max_period = spark.sql(f"SELECT max(period) FROM {TABLE_NAME}").first()[0]
+    hwm_dt = datetime.datetime.strptime(max_period[:10], "%Y-%m-%d") - datetime.timedelta(days=RESTATEMENT_BUFFER_DAYS)
+    start_date_str = hwm_dt.strftime("%Y-%m-%d")
+    print(f"[INCREMENTAL] High-water mark: {max_period}. Fetching authentic subregion load from {start_date_str} (with {RESTATEMENT_BUFFER_DAYS}-day buffer).")
+else:
+    start_date_str = FULL_HISTORY_START
+    print(f"[FULL LOAD] No existing data found in {TABLE_NAME}. Ingesting full history from {start_date_str}.")
+
+start_param = f"{start_date_str}T00"
+end_param = f"{end_date_str}T23"
+
+# COMMAND ----------
+# DBTITLE 1,Paginated EIA Subregion API Client
+def fetch_eia_subregion_dataset(api_key: str, start: str, end: str, parent: str = "ERCO", page_size: int = 5000):
+    """
+    Fetches authentic EIA-930 subregion hourly demand records with pagination, backoff, and envelope archival.
+    Fail-closed: raises a RuntimeError on failure rather than returning synthetic approximations.
+    """
+    all_records = []
+    raw_responses = []
+    offset = 0
+
+    while True:
+        query_params = [
+            ("api_key", api_key),
+            ("frequency", "hourly"),
+            ("data[0]", "value"),
+            ("facets[parent][]", parent),
+            ("start", start),
+            ("end", end),
+            ("sort[0][column]", "period"),
+            ("sort[0][direction]", "asc"),
+            ("offset", str(offset)),
+            ("length", str(page_size))
+        ]
+
+        encoded_query = urllib.parse.urlencode(query_params)
+        request_url = f"{EIA_BASE_URL}?{encoded_query}"
+        req = urllib.request.Request(request_url, headers={"User-Agent": "ERCOT-Platform/1.0"})
+
+        payload = None
+        for attempt in range(1, 4):
+            try:
+                with urllib.request.urlopen(req, timeout=40) as resp:
+                    raw_text = resp.read().decode("utf-8")
+                    payload = json.loads(raw_text)
+                    break
+            except Exception as e:
+                if attempt == 3:
+                    raise RuntimeError(f"EIA Subregion API request failed at offset {offset}: {e}")
+                time.sleep(2 * attempt)
+
+        sanitized_params = {k: v for k, v in query_params if k != "api_key"}
+
+        raw_responses.append({
+            "offset": offset,
+            "page_size": page_size,
+            "request_url_endpoint": EIA_BASE_URL,
+            "request_params_sanitized": sanitized_params,
+            "fetched_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "response_envelope": payload
         })
 
-df_zonal_raw = pd.DataFrame(rows)
-print(f"Generated {len(df_zonal_raw):,} raw zonal records across 8 zones.")
+        resp_obj = payload.get("response", {})
+        batch = resp_obj.get("data", [])
+        total = int(resp_obj.get("total", 0))
+
+        if not batch:
+            break
+
+        all_records.extend(batch)
+        offset += len(batch)
+        print(f"  Retrieved {offset} / {total} authentic subregion records...")
+
+        if offset >= total:
+            break
+        time.sleep(0.3)
+
+    return all_records, raw_responses
 
 # COMMAND ----------
-# DBTITLE 1,Write to Bronze Delta Table
-try:
-    spark_zonal = spark.createDataFrame(df_zonal_raw)
-    (
-        spark_zonal.write
-        .format("delta")
-        .mode("overwrite")
-        .partitionBy("zone_code")
-        .option("overwriteSchema", "true")
-        .saveAsTable(TARGET_TABLE)
-    )
-    print(f"Successfully saved {len(df_zonal_raw):,} rows to {TARGET_TABLE}")
-except Exception as e:
-    print(f"Delta table write skipped in local runtime: {e}")
+# DBTITLE 1,Execute Ingestion, Archive Raw Payload & Write to Bronze Delta
+records, raw_payloads = fetch_eia_subregion_dataset(
+    api_key=EIA_API_KEY,
+    start=start_param,
+    end=end_param,
+    parent=EIA_PARENT,
+    page_size=EIA_PAGE_SIZE
+)
+
+print(f"Total authentic subregion records extracted: {len(records)} across {len(raw_payloads)} API pages.")
+
+if records:
+    # 1. Raw Archival: Persist response envelopes into Volume
+    raw_landing_dir = f"/Volumes/{CATALOG}/bronze/raw_landing/ercot_zonal"
+    os.makedirs(raw_landing_dir, exist_ok=True)
+    timestamp_epoch = int(time.time())
+    raw_file_name = f"eia_ercot_subregion_{start_date_str}_{end_date_str}_{timestamp_epoch}.json"
+    raw_file_path = f"{raw_landing_dir}/{raw_file_name}"
+
+    with open(raw_file_path, "w", encoding="utf-8") as f:
+        json.dump(raw_payloads, f)
+    print(f"Archived authentic raw subregion payloads to Volume: {raw_file_path}")
+
+    # 2. Spark DataFrame Schema Standardization
+    df_raw = spark.createDataFrame(records)
+    for c in df_raw.columns:
+        if "-" in c:
+            df_raw = df_raw.withColumnRenamed(c, c.replace("-", "_"))
+
+    df_bronze = df_raw \
+        .withColumn("_ingested_at_utc", F.current_timestamp()) \
+        .withColumn("_source", F.lit("EIA_v2_subregion_data")) \
+        .withColumn("_raw_payload_path", F.lit(raw_file_path))
+
+    # Standardize subba column name if necessary
+    subba_col = "subba" if "subba" in df_bronze.columns else "subregion"
+
+    # 3. Deterministic Deduplication & Data Integrity Assertions (F-17)
+    from pyspark.sql.window import Window as SparkWindow
+    dedup_window = SparkWindow.partitionBy("parent", subba_col, "period").orderBy(F.col("_ingested_at_utc").desc())
+    source_deduped = df_bronze.withColumn("_row_num", F.row_number().over(dedup_window)) \
+        .filter(F.col("_row_num") == 1) \
+        .drop("_row_num")
+
+    null_key_count = source_deduped.filter(
+        F.col("parent").isNull() | F.col(subba_col).isNull() | F.col("period").isNull()
+    ).count()
+    assert null_key_count == 0, f"Integrity Failure: Found {null_key_count} records with null primary keys."
+
+    present_subregions = set(row[subba_col] for row in source_deduped.select(subba_col).distinct().collect())
+    print(f"Verified present subregions in batch: {present_subregions}")
+
+    # F-03 & P1-06: Subregion completeness gate against expected subregions
+    missing_zones = EXPECTED_SUBREGIONS - present_subregions
+    if missing_zones:
+        allow_partial = os.getenv("ALLOW_PARTIAL_ZONAL_INGESTION", "false").lower() in ("true", "1")
+        if not allow_partial:
+            raise RuntimeError(
+                f"Integrity Failure (P1-06): Expected subregions missing from batch: {missing_zones}. "
+                f"Ingested only {present_subregions}. Set ALLOW_PARTIAL_ZONAL_INGESTION=1 to override."
+            )
+        print(f"Notice: Batch contains partial subregions: {present_subregions}. Missing: {missing_zones}")
+
+    # 4. Idempotent Upsert into Bronze Delta Table
+    if not spark.catalog.tableExists(TABLE_NAME):
+        source_deduped.write \
+            .format("delta") \
+            .mode("overwrite") \
+            .partitionBy(subba_col) \
+            .saveAsTable(TABLE_NAME)
+        print(f"Initialized table {TABLE_NAME} with {source_deduped.count()} records.")
+    else:
+        delta_table = DeltaTable.forName(spark, TABLE_NAME)
+        merge_condition = (
+            f"target.parent = source.parent "
+            f"AND target.{subba_col} = source.{subba_col} "
+            f"AND target.period = source.period"
+        )
+        delta_table.alias("target").merge(
+            source_deduped.alias("source"),
+            merge_condition
+        ).whenMatchedUpdateAll(
+            condition=f"NOT (target.value <=> source.value)"
+        ).whenNotMatchedInsertAll(
+        ).execute()
+        print(f"Idempotent MERGE completed on {TABLE_NAME} (null-safe equality enabled).")
+else:
+    # F-02: Fail-closed if no records returned on full load or significant request window
+    if not spark.catalog.tableExists(TABLE_NAME) or spark.table(TABLE_NAME).count() == 0:
+        raise RuntimeError(
+            f"EIA Ingestion Failure: 0 records returned for window {start_param} to {end_param}. "
+            f"Endpoint: {EIA_BASE_URL}, Parent: {EIA_PARENT}. Target table {TABLE_NAME} does not exist or is empty. "
+            f"Failing closed to prevent silent pipeline bypass."
+        )
+    elif start_date_str < end_date_str:
+        raise RuntimeError(
+            f"EIA Ingestion Alert: 0 records returned for multi-day incremental window {start_param} to {end_param}. "
+            f"Verify EIA API connectivity, route validity ({SUBREGION_ROUTE}), or upstream API data availability."
+        )
+    else:
+        print(f"Incremental Ingestion Status: Table is fully up-to-date. No new records found for window {start_param} to {end_param}.")
+
+# COMMAND ----------
+# MAGIC %sql
+# MAGIC SELECT subba, count(*) as hours, min(period) as min_period, max(period) as max_period
+# MAGIC FROM bronze.ercot_zonal_raw
+# MAGIC GROUP BY subba
+# MAGIC ORDER BY subba;

@@ -174,74 +174,80 @@ records, raw_payloads = fetch_eia_dataset(
 
 print(f"Total EIA records retrieved: {len(records)} across {len(raw_payloads)} API pages.")
 
-if records:
-    # 1. Raw Archival: Store COMPLETE response payloads (envelope + sanitized request params + pagination)
-    raw_landing_dir = f"/Volumes/{CATALOG}/bronze/raw_landing/eia"
-    os.makedirs(raw_landing_dir, exist_ok=True)
-    timestamp_epoch = int(time.time())
-    raw_file_name = f"eia_erco_{start_date_str}_{end_date_str}_{timestamp_epoch}.json"
-    raw_file_path = f"{raw_landing_dir}/{raw_file_name}"
-    
-    with open(raw_file_path, "w", encoding="utf-8") as f:
-        json.dump(raw_payloads, f)
-    print(f"Archived authentic raw API responses to Volume: {raw_file_path}")
+if not records:
+    raise RuntimeError(
+        f"Bronze Ingestion Failure: 0 EIA records retrieved for window {start_date_str} to {end_date_str}. "
+        f"Pipeline failed closed to prevent downstream silent stale tables (C-03)."
+    )
 
-    # 2. Convert to Spark DataFrame & sanitize column names
-    df_raw = spark.createDataFrame(records)
-    for c in df_raw.columns:
-        if "-" in c:
-            df_raw = df_raw.withColumnRenamed(c, c.replace("-", "_"))
+# 1. Raw Archival: Store COMPLETE response payloads (envelope + sanitized request params + pagination)
+raw_landing_dir = f"/Volumes/{CATALOG}/bronze/raw_landing/eia"
+os.makedirs(raw_landing_dir, exist_ok=True)
+timestamp_epoch = int(time.time())
+raw_file_name = f"eia_erco_{start_date_str}_{end_date_str}_{timestamp_epoch}.json"
+raw_file_path = f"{raw_landing_dir}/{raw_file_name}"
 
-    df_bronze = df_raw \
-        .withColumn("_ingested_at_utc", F.current_timestamp()) \
-        .withColumn("_source", F.lit("EIA_v2_region_data")) \
-        .withColumn("_raw_payload_path", F.lit(raw_file_path))
-    
-    # 3. Data Integrity & Completeness Assertions
-    source_deduped = df_bronze.dropDuplicates(["respondent", "period", "type"])
-    
-    null_key_count = source_deduped.filter(
-        F.col("respondent").isNull() | F.col("period").isNull() | F.col("type").isNull()
-    ).count()
-    assert null_key_count == 0, f"Integrity Failure: Found {null_key_count} records with null primary keys."
-    
-    distinct_types = set(row["type"] for row in source_deduped.select("type").distinct().collect())
-    
-    # Assert that no unexpected types entered Bronze
-    for t in distinct_types:
-        assert t in EIA_SERIES_TYPES, f"Schema Leak: Found unexpected series type '{t}' not in {EIA_SERIES_TYPES}."
-        
-    # Assert that ALL expected types are present in the batch
-    for expected_type in EIA_SERIES_TYPES:
-        assert expected_type in distinct_types, f"Completeness Failure: Expected series type '{expected_type}' was not returned by EIA API."
-        
-    print(f"Quality Assertions Passed: 0 null keys. All expected series types confirmed present: {distinct_types}")
+with open(raw_file_path, "w", encoding="utf-8") as f:
+    json.dump(raw_payloads, f)
+print(f"Archived authentic raw API responses to Volume: {raw_file_path}")
 
-    # 4. Idempotent Upsert into Bronze Delta table using Null-Safe Equality (<=>)
-    if not spark.catalog.tableExists(TABLE_NAME):
-        source_deduped.write \
-            .format("delta") \
-            .mode("overwrite") \
-            .saveAsTable(TABLE_NAME)
-        print(f"Initialized table {TABLE_NAME} with {source_deduped.count()} records.")
-    else:
-        delta_table = DeltaTable.forName(spark, TABLE_NAME)
-        merge_condition = (
-            "target.respondent = source.respondent "
-            "AND target.period = source.period "
-            "AND target.type = source.type"
-        )
-        # Null-safe inequality: updates only when value actually changed (handles null -> val, val -> null, val -> new_val)
-        delta_table.alias("target").merge(
-            source_deduped.alias("source"),
-            merge_condition
-        ).whenMatchedUpdateAll(
-            condition="NOT (target.value <=> source.value)"
-        ).whenNotMatchedInsertAll(
-        ).execute()
-        print(f"Idempotent MERGE completed on {TABLE_NAME} (null-safe equality enabled).")
+# 2. Convert to Spark DataFrame & sanitize column names
+df_raw = spark.createDataFrame(records)
+for c in df_raw.columns:
+    if "-" in c:
+        df_raw = df_raw.withColumnRenamed(c, c.replace("-", "_"))
+
+df_bronze = df_raw \
+    .withColumn("_ingested_at_utc", F.current_timestamp()) \
+    .withColumn("_source", F.lit("EIA_v2_region_data")) \
+    .withColumn("_raw_payload_path", F.lit(raw_file_path))
+
+# 3. Data Integrity & Completeness Assertions
+duplicate_keys = (df_bronze.groupBy("respondent", "period", "type")
+                  .count().filter(F.col("count") > 1).count())
+assert duplicate_keys == 0, f"Integrity Failure: Found {duplicate_keys} duplicate EIA source keys in this batch."
+source_deduped = df_bronze
+
+null_key_count = source_deduped.filter(
+    F.col("respondent").isNull() | F.col("period").isNull() | F.col("type").isNull()
+).count()
+assert null_key_count == 0, f"Integrity Failure: Found {null_key_count} records with null primary keys."
+
+distinct_types = set(row["type"] for row in source_deduped.select("type").distinct().collect())
+
+# Assert that no unexpected types entered Bronze
+for t in distinct_types:
+    assert t in EIA_SERIES_TYPES, f"Schema Leak: Found unexpected series type '{t}' not in {EIA_SERIES_TYPES}."
+    
+# Assert that ALL expected types are present in the batch
+for expected_type in EIA_SERIES_TYPES:
+    assert expected_type in distinct_types, f"Completeness Failure: Expected series type '{expected_type}' was not returned by EIA API."
+    
+print(f"Quality Assertions Passed: 0 null keys. All expected series types confirmed present: {distinct_types}")
+
+# 4. Idempotent Upsert into Bronze Delta table using Null-Safe Equality (<=>)
+if not spark.catalog.tableExists(TABLE_NAME):
+    source_deduped.write \
+        .format("delta") \
+        .mode("overwrite") \
+        .saveAsTable(TABLE_NAME)
+    print(f"Initialized table {TABLE_NAME} with {source_deduped.count()} records.")
 else:
-    print("Warning: No records found for the specified window.")
+    delta_table = DeltaTable.forName(spark, TABLE_NAME)
+    merge_condition = (
+        "target.respondent = source.respondent "
+        "AND target.period = source.period "
+        "AND target.type = source.type"
+    )
+    # Null-safe inequality: updates only when value actually changed (handles null -> val, val -> null, val -> new_val)
+    delta_table.alias("target").merge(
+        source_deduped.alias("source"),
+        merge_condition
+    ).whenMatchedUpdateAll(
+        condition="NOT (target.value <=> source.value)"
+    ).whenNotMatchedInsertAll(
+    ).execute()
+    print(f"Idempotent MERGE completed on {TABLE_NAME} (null-safe equality enabled).")
 
 # COMMAND ----------
 # MAGIC %sql

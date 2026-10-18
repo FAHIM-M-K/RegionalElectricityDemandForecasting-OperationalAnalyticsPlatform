@@ -1,310 +1,173 @@
 # Databricks notebook source
-# MAGIC %md
-# MAGIC # Gold Layer: Production Forecast Inference Engine (`gold.forecast_hourly`)
-# MAGIC
-# MAGIC **Input Table:** `main.gold.features_hourly`  
-# MAGIC **Output Table:** `main.gold.forecast_hourly`  
-# MAGIC **Model Source:** Databricks MLflow Registry / Experiment (`/Shared/regional_demand_forecasting`)  
-# MAGIC
-# MAGIC ### Core Production Pipeline Responsibilities:
-# MAGIC 1. **Model Retrieval:** Dynamically loads the active production model artifact (`LightGBM_EIA_Hybrid_Production`) from MLflow.
-# MAGIC 2. **Inference Execution:** Generates point forecasts (`predicted_demand_mw`) across the chronological evaluation grid.
-# MAGIC 3. **Uncertainty & Risk Quantification:**
-# MAGIC    - 95% Confidence Intervals (`prediction_lower_95_mw`, `prediction_upper_95_mw`).
-# MAGIC    - Operational Peak Warning (`is_predicted_peak_risk` when $\hat{y} \ge 75,000$ MW).
-# MAGIC 4. **Live Benchmarking:** Computes error metrics (`model_error_mw`, `model_abs_error_mw`) comparing our predictions vs. actuals alongside EIA Day-Ahead benchmark metrics.
-# MAGIC 5. **Idempotent Delta MERGE:** Null-safe upsert ensuring atomic commits without Parquet file churn.
+"""Issue direct H24 and H168 forecasts from the active MLflow models.
 
-# COMMAND ----------
-# MAGIC %pip install lightgbm --quiet
+There is no heuristic model fallback.  If the required demand history or a
+production model is absent, this job fails so the dashboard cannot present an
+invented forecast as a model output.
+"""
 
-# COMMAND ----------
-# DBTITLE 1,Imports & Setup
+import math
 import os
 import sys
+from datetime import datetime, timezone
+
 import numpy as np
 import pandas as pd
-from pyspark.sql import functions as F
-from pyspark.sql.types import DoubleType, StringType, BooleanType, TimestampType
-from delta.tables import DeltaTable
 
-import lightgbm as lgb
-import mlflow
-import mlflow.lightgbm
+_root = os.getcwd()
+for _ in range(5):
+    if os.path.isdir(os.path.join(_root, "configs")):
+        sys.path.insert(0, _root)
+        break
+    _root = os.path.dirname(_root)
+
+from src.shared.forecast_contract import (
+    DEMAND_MAX_VALID_MW, DEMAND_MIN_VALID_MW, FEATURE_SCHEMA_VERSION,
+    FEATURE_SET_OPERATIONAL, HORIZONS, features_for_horizon,
+)
+
+try:
+    import mlflow
+    import mlflow.lightgbm
+    from delta.tables import DeltaTable
+    from pyspark.sql import functions as F
+    MLFLOW_AVAILABLE = True
+except ImportError:
+    MLFLOW_AVAILABLE = False
 
 CATALOG = "main"
-SOURCE_FEATURES_TABLE = f"{CATALOG}.gold.features_hourly"
-TARGET_FORECAST_TABLE = f"{CATALOG}.gold.forecast_hourly"
+EXPERIMENT_NAME = "/Shared/ERCOT_MultiHorizon_Forecast_Platform"
+SOURCE_FACT_TABLE = f"{CATALOG}.gold.fact_hourly_electricity_demand"
+TARGET_LATEST_TABLE = f"{CATALOG}.gold.forecast_latest"
+TARGET_EVALUATION_TABLE = f"{CATALOG}.gold.forecast_evaluation"
 
-spark.sql(f"USE CATALOG {CATALOG}")
-spark.sql("USE SCHEMA gold")
 
-# COMMAND ----------
-# DBTITLE 1,Dynamic Configuration Locator
-_repo_root = os.getcwd()
-for _ in range(5):
-    if os.path.isdir(os.path.join(_repo_root, "configs")):
-        if _repo_root not in sys.path:
-            sys.path.insert(0, _repo_root)
-        break
-    _parent = os.path.dirname(_repo_root)
-    if _parent == _repo_root:
-        break
-    _repo_root = _parent
-from configs.loader import load_platform_config
-from src.shared.feature_transforms import (
-    FEATURE_COLS,
-    BASE_COLS,
-    compute_derived_features,
-)
+def _calendar(timestamp: pd.Timestamp, holiday_dates: set) -> dict:
+    local = timestamp.tz_convert("America/Chicago")
+    return {"hour_local": local.hour, "day_of_week_local": local.dayofweek,
+            "is_weekend": int(local.dayofweek >= 5), "is_holiday": int(local.date() in holiday_dates),
+            "sin_hour": round(math.sin(2 * math.pi * local.hour / 24), 6),
+            "cos_hour": round(math.cos(2 * math.pi * local.hour / 24), 6),
+            "sin_dow": round(math.sin(2 * math.pi * local.dayofweek / 7), 6),
+            "cos_dow": round(math.cos(2 * math.pi * local.dayofweek / 7), 6)}
 
-config = load_platform_config("ercot_config.json")
-BA_CODE = config.get("region", {}).get("code", "ERCO")
-PEAK_THRESHOLD_MW = float(config.get("region", {}).get("default_peak_threshold_mw", 75000.0))
 
-# COMMAND ----------
-# DBTITLE 1,Retrieve Active Production Model from MLflow
-EXPERIMENT_NAME = "/Shared/regional_demand_forecasting"
-PRODUCTION_RUN_NAME = "LightGBM_EIA_Hybrid_Production"
-LEGACY_RUN_NAME = "LightGBM_EIA_Hybrid_Champion_H24"
+def _snapshot(frame: pd.DataFrame, origin: pd.Timestamp) -> dict:
+    values = dict(zip(frame["timestamp_utc"], frame["actual_demand_mw"]))
+    required = [origin, origin - pd.Timedelta(hours=24), origin - pd.Timedelta(hours=48),
+                origin - pd.Timedelta(hours=168), origin - pd.Timedelta(hours=336)]
+    missing = [value for value in required if pd.isna(values.get(value, np.nan))]
+    if missing:
+        raise ValueError(f"Cannot forecast from {origin}: required exact demand history is incomplete.")
+    window24 = [values.get(origin - pd.Timedelta(hours=i), np.nan) for i in range(24)]
+    window168 = [values.get(origin - pd.Timedelta(hours=i), np.nan) for i in range(168)]
+    if any(pd.isna(window24)) or any(pd.isna(window168)):
+        raise ValueError("Cannot forecast: trailing demand window contains missing hours.")
+    if any(not DEMAND_MIN_VALID_MW <= float(value) <= DEMAND_MAX_VALID_MW for value in window168):
+        raise ValueError("Cannot forecast: trailing demand window contains an invalid load value.")
+    if any(not DEMAND_MIN_VALID_MW <= float(values[ts]) <= DEMAND_MAX_VALID_MW for ts in required):
+        raise ValueError("Cannot forecast: required demand history contains an invalid load value.")
+    return {"demand_origin": values[origin], "demand_lag_24h_origin": values[required[1]],
+            "demand_lag_48h_origin": values[required[2]], "demand_lag_168h_origin": values[required[3]],
+            "demand_lag_336h_origin": values[required[4]], "demand_rolling_avg_24h_origin": float(np.mean(window24)),
+            "demand_rolling_std_24h_origin": float(np.std(window24)), "demand_rolling_avg_168h_origin": float(np.mean(window168))}
 
-client = mlflow.tracking.MlflowClient()
-experiment = client.get_experiment_by_name(EXPERIMENT_NAME)
-assert experiment is not None, f"MLflow Experiment {EXPERIMENT_NAME} not found! Run modeling notebook first."
 
-# Find latest successful run for the production model (or legacy name fallback)
-runs = client.search_runs(
-    experiment_ids=[experiment.experiment_id],
-    filter_string=f"tags.mlflow.runName = '{PRODUCTION_RUN_NAME}'",
-    order_by=["start_time DESC"],
-    max_results=1
-)
+def generate_independent_forecasts(df_history: pd.DataFrame, models: dict, model_runs: dict, origin_utc=None,
+                                  holiday_dates: set | None = None, calendar_dates: set | None = None,
+                                  high_demand_threshold_mw: float = 75_000.0) -> pd.DataFrame:
+    """Return direct predictions for every lead in H24 and H168."""
+    frame = df_history.copy()
+    frame["timestamp_utc"] = pd.to_datetime(frame["timestamp_utc"], utc=True)
+    frame = frame.sort_values("timestamp_utc").drop_duplicates(["respondent", "timestamp_utc"], keep="last")
+    if frame["respondent"].nunique() != 1:
+        raise ValueError("Score one respondent per invocation.")
+    origin = frame.timestamp_utc.max() if origin_utc is None else pd.to_datetime(origin_utc, utc=True)
+    snapshot = _snapshot(frame, origin)
+    if holiday_dates is None or calendar_dates is None:
+        raise ValueError("Forward calendar dates and holiday dates are required for scoring.")
+    forecast_dates = {(origin + pd.Timedelta(hours=lead)).tz_convert("America/Chicago").date()
+                       for horizon in HORIZONS for lead in range(1, horizon + 1)}
+    missing_calendar = forecast_dates - set(calendar_dates)
+    if missing_calendar:
+        raise ValueError(f"Calendar reference does not cover forecast dates: {sorted(missing_calendar)}")
+    respondent = str(frame.respondent.iloc[0])
+    issued_at = datetime.now(timezone.utc)
+    rows = []
+    for horizon in HORIZONS:
+        model = models.get(horizon)
+        run_id = model_runs.get(horizon)
+        if model is None or not run_id:
+            raise ValueError(f"No active production H{horizon} model is available; scoring stopped.")
+        expected_features = features_for_horizon(horizon)
+        if hasattr(model, "feature_name") and model.feature_name() != expected_features:
+            raise ValueError(f"Production H{horizon} model feature schema does not match {FEATURE_SCHEMA_VERSION}.")
+        leads = list(range(1, horizon + 1))
+        feature_rows = [{"lead_hours": lead, **_calendar(origin + pd.Timedelta(hours=lead), holiday_dates), **snapshot} for lead in leads]
+        predictions = model.predict(pd.DataFrame(feature_rows)[expected_features])
+        for lead, prediction, feature in zip(leads, predictions, feature_rows):
+            target = origin + pd.Timedelta(hours=lead)
+            predicted = float(prediction)
+            if not DEMAND_MIN_VALID_MW <= predicted <= DEMAND_MAX_VALID_MW:
+                raise ValueError(f"H{horizon} prediction {predicted:.1f} MW is outside plausibility bounds.")
+            local = target.tz_convert("America/Chicago")
+            rows.append({"respondent": respondent, "forecast_origin_utc": origin, "target_timestamp_utc": target,
+                         "issued_at_utc": issued_at, "horizon_hours": horizon, "lead_hours": lead,
+                         "timestamp_local": local.tz_localize(None), "date_local": local.date(),
+                         "hour_local": feature["hour_local"], "predicted_demand_mw": round(predicted, 1),
+                         "is_predicted_high_demand": bool(predicted >= high_demand_threshold_mw),
+                         "high_demand_threshold_mw": high_demand_threshold_mw, "feature_set": FEATURE_SET_OPERATIONAL,
+                         "feature_schema_version": FEATURE_SCHEMA_VERSION, "forecast_source": "Direct_LightGBM",
+                         "model_version": f"Direct_LightGBM_H{horizon}", "model_run_id": run_id})
+    return pd.DataFrame(rows)
 
-if not runs:
-    runs = client.search_runs(
-        experiment_ids=[experiment.experiment_id],
-        filter_string=f"tags.mlflow.runName = '{LEGACY_RUN_NAME}'",
-        order_by=["start_time DESC"],
-        max_results=1
+
+def _production_models():
+    if not MLFLOW_AVAILABLE:
+        raise RuntimeError("MLflow is required for production scoring.")
+    client, experiment = mlflow.tracking.MlflowClient(), mlflow.get_experiment_by_name(EXPERIMENT_NAME)
+    if experiment is None:
+        raise RuntimeError("MLflow experiment does not exist.")
+    models, runs = {}, {}
+    for horizon in HORIZONS:
+        found = client.search_runs([experiment.experiment_id],
+                                   filter_string=f"tags.pipeline_role = 'PRODUCTION' AND tags.target_horizon = 'H{horizon}'",
+                                   order_by=["start_time DESC"], max_results=1)
+        if not found:
+            raise RuntimeError(f"No production H{horizon} model found.")
+        runs[horizon] = found[0].info.run_id
+        models[horizon] = mlflow.lightgbm.load_model(f"runs:/{runs[horizon]}/model_direct_h{horizon}")
+    return models, runs
+
+
+if __name__ == "__main__" and "spark" in globals():
+    from configs.loader import load_platform_config
+
+    spark.conf.set("spark.sql.session.timeZone", "UTC")
+    high_demand_threshold_mw = float(load_platform_config("ercot_config.json")["region"]["default_peak_threshold_mw"])
+    history = (spark.table(SOURCE_FACT_TABLE)
+               .filter((F.col("respondent") == "ERCO") & F.col("actual_demand_mw").isNotNull())
+               .orderBy(F.col("timestamp_utc").desc()).limit(600).toPandas())
+    latest_observation = pd.to_datetime(history["timestamp_utc"], utc=True).max()
+    age_hours = (datetime.now(timezone.utc) - latest_observation.to_pydatetime()).total_seconds() / 3600
+    if age_hours < 0 or age_hours > 6:
+        raise RuntimeError(f"Latest actual demand is {age_hours:.1f} hours old; refusing to label stale predictions operational.")
+    calendar = spark.table(f"{CATALOG}.bronze.calendar_reference").select("date", "is_holiday").toPandas()
+    holidays = set(pd.to_datetime(calendar.loc[calendar.is_holiday.astype(bool), "date"]).dt.date)
+    calendar_dates = set(pd.to_datetime(calendar["date"]).dt.date)
+    models, run_ids = _production_models()
+    forecast = generate_independent_forecasts(
+        history, models, run_ids, holiday_dates=holidays, calendar_dates=calendar_dates,
+        high_demand_threshold_mw=high_demand_threshold_mw,
     )
-
-assert len(runs) > 0, f"No logged runs found with name '{PRODUCTION_RUN_NAME}' or '{LEGACY_RUN_NAME}' in {EXPERIMENT_NAME}."
-prod_run = runs[0]
-prod_run_id = prod_run.info.run_id
-model_uri = f"runs:/{prod_run_id}/lightgbm_eia_hybrid"
-
-print(f"Loading Production Model from MLflow:")
-print(f"  - Experiment: {EXPERIMENT_NAME}")
-print(f"  - Run Name:   {prod_run.info.run_name}")
-print(f"  - Run ID:     {prod_run_id}")
-print(f"  - Model URI:  {model_uri}")
-
-model_booster = mlflow.lightgbm.load_model(model_uri)
-print("Successfully loaded Production LightGBM Booster!")
-
-# COMMAND ----------
-# DBTITLE 1,Execute Batch Scoring
-def generate_forecast_predictions(df_features_spark, booster, feature_cols=FEATURE_COLS, base_cols=BASE_COLS, model_version=None):
-    """
-    Computes scale-invariant features and generates Day-Ahead model predictions.
-    """
-    if model_version is None:
-        model_version = f"LightGBM_Hybrid_{prod_run_id[:8]}" if "prod_run_id" in globals() else "LightGBM_Hybrid_Production"
-
-    # Pull candidate rows (requires valid 24h lag and day_ahead_forecast_mw)
-    df_eligible = (
-        df_features_spark
-        .filter(F.col("respondent") == BA_CODE)
-        .filter(F.col("demand_lag_24h").isNotNull())
-        .filter(F.col("day_ahead_forecast_mw").isNotNull())
-        .select(*[c for c in base_cols if c in df_features_spark.columns])
-    )
-    
-    pdf_raw = df_eligible.toPandas()
-    pdf = compute_derived_features(pdf_raw)
-            
-    X = pdf[feature_cols].copy()
-    
-    # Predict EIA error correction residual
-    predicted_eia_error = booster.predict(X)
-    
-    # Reconstruct Day-Ahead point prediction: y_pred = EIA_forecast + predicted_eia_error
-    pdf["predicted_demand_mw"] = np.round(pdf["day_ahead_forecast_mw"] + predicted_eia_error, 1)
-    
-    # Empirical 95% Confidence Interval (based on 1.96 * RMSE ~ 1,587 MW)
-    HALF_WIDTH_95_MW = 1.96 * 1587.6
-    pdf["prediction_lower_95_mw"] = np.round(pdf["predicted_demand_mw"] - HALF_WIDTH_95_MW, 1)
-    pdf["prediction_upper_95_mw"] = np.round(pdf["predicted_demand_mw"] + HALF_WIDTH_95_MW, 1)
-    
-    # Operational Peak Risk Flag (True if predicted demand exceeds operator threshold)
-    pdf["is_predicted_peak_risk"] = pdf["predicted_demand_mw"] >= PEAK_THRESHOLD_MW
-    
-    # Model tracking lineage
-    pdf["model_version"] = model_version
-    
-    # Convert back to Spark
-    spark_df = spark.createDataFrame(pdf[[
-        "respondent", "timestamp_utc", "timestamp_local", "date_local", "hour_local", "day_of_week_local",
-        "actual_demand_mw", "day_ahead_forecast_mw", "predicted_demand_mw",
-        "prediction_lower_95_mw", "prediction_upper_95_mw", "is_predicted_peak_risk",
-        "model_version"
-    ]])
-    
-    # Attach evaluation metrics for hours where actual demand has been observed
-    df_scored = (
-        spark_df
-        .withColumn("timestamp_utc", F.col("timestamp_utc").cast(TimestampType()))
-        .withColumn("timestamp_local", F.col("timestamp_local").cast(TimestampType()))
-        .withColumn(
-            "model_error_mw",
-            F.when(F.col("actual_demand_mw").isNotNull(),
-                   F.round(F.col("predicted_demand_mw") - F.col("actual_demand_mw"), 1))
-             .otherwise(F.lit(None).cast(DoubleType()))
-        )
-        .withColumn(
-            "model_abs_error_mw",
-            F.when(F.col("actual_demand_mw").isNotNull(), F.abs(F.col("model_error_mw")))
-             .otherwise(F.lit(None).cast(DoubleType()))
-        )
-        .withColumn(
-            "model_ape_pct",
-            F.when(
-                (F.col("actual_demand_mw").isNotNull()) & (F.col("actual_demand_mw") > 0.0),
-                F.round((F.col("model_abs_error_mw") / F.col("actual_demand_mw")) * 100.0, 3)
-            ).otherwise(F.lit(None).cast(DoubleType()))
-        )
-        .withColumn(
-            "eia_error_mw",
-            F.when(F.col("actual_demand_mw").isNotNull(),
-                   F.round(F.col("day_ahead_forecast_mw") - F.col("actual_demand_mw"), 1))
-             .otherwise(F.lit(None).cast(DoubleType()))
-        )
-        .withColumn(
-            "eia_abs_error_mw",
-            F.when(F.col("actual_demand_mw").isNotNull(), F.abs(F.col("eia_error_mw")))
-             .otherwise(F.lit(None).cast(DoubleType()))
-        )
-        .withColumn(
-            "is_model_better_than_eia",
-            F.when(
-                F.col("actual_demand_mw").isNotNull(),
-                F.col("model_abs_error_mw") < F.col("eia_abs_error_mw")
-            ).otherwise(F.lit(None).cast(BooleanType()))
-        )
-        .withColumn("_scored_at_utc", F.current_timestamp())
-    )
-    
-    return df_scored
-
-# COMMAND ----------
-# DBTITLE 1,Pre-Write Quality Gate Assertions
-def validate_forecast_predictions(df_scored):
-    """
-    Enforces data quality contracts before persisting into main.gold.forecast_hourly:
-    1. Zero null keys (respondent, timestamp_utc)
-    2. Zero duplicate timestamps
-    3. Predictions stay within physically plausible grid limits (10k - 110k MW)
-    4. Prediction bounds consistency (lower <= predicted <= upper)
-    """
-    total_rows = df_scored.count()
-    distinct_keys = df_scored.select("respondent", "timestamp_utc").distinct().count()
-    null_keys = df_scored.filter(F.col("respondent").isNull() | F.col("timestamp_utc").isNull()).count()
-    
-    assert null_keys == 0, f"Integrity Failure: Found {null_keys} null keys in scored forecast!"
-    assert total_rows == distinct_keys, f"Integrity Failure: Found {total_rows - distinct_keys} duplicate timestamp records!"
-    
-    # Boundary checks (10k to 110k MW)
-    out_of_bounds = df_scored.filter(
-        (F.col("predicted_demand_mw") < 10000.0) | (F.col("predicted_demand_mw") > 110000.0)
-    ).count()
-    assert out_of_bounds == 0, f"Physical Boundary Failure: Found {out_of_bounds} predictions outside physical limits!"
-    
-    # Confidence interval order
-    interval_inverted = df_scored.filter(
-        (F.col("prediction_lower_95_mw") > F.col("predicted_demand_mw")) |
-        (F.col("prediction_upper_95_mw") < F.col("predicted_demand_mw"))
-    ).count()
-    assert interval_inverted == 0, f"Math Failure: Found {interval_inverted} inverted confidence intervals!"
-    
-    print(f"Pre-Write Quality Gate Passed: {total_rows:,} verified forecasts.")
-
-# COMMAND ----------
-# DBTITLE 1,Idempotent Delta Upsert
-def upsert_forecast_table(df_scored, target_table=TARGET_FORECAST_TABLE, spark_session=spark):
-    """
-    Idempotent MERGE into Gold Forecast table on (respondent, timestamp_utc).
-    """
-    if not spark_session.catalog.tableExists(target_table):
-        df_scored.write \
-            .format("delta") \
-            .mode("overwrite") \
-            .saveAsTable(target_table)
-        print(f"Initialized Gold forecast table {target_table} with {df_scored.count():,} rows.")
+    incoming = spark.createDataFrame(forecast)
+    # Serving table is replaceable by design: it contains only the newest issue.
+    incoming.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(TARGET_LATEST_TABLE)
+    # Evaluation table is append-only at issued-forecast grain.
+    if spark.catalog.tableExists(TARGET_EVALUATION_TABLE):
+        DeltaTable.forName(spark, TARGET_EVALUATION_TABLE).alias("t").merge(incoming.alias("s"),
+            "t.model_run_id=s.model_run_id AND t.horizon_hours=s.horizon_hours AND t.forecast_origin_utc=s.forecast_origin_utc AND t.target_timestamp_utc=s.target_timestamp_utc"
+        ).whenNotMatchedInsertAll().execute()
     else:
-        delta_target = DeltaTable.forName(spark_session, target_table)
-        
-        merge_condition = (
-            "target.respondent = source.respondent AND "
-            "target.timestamp_utc = source.timestamp_utc"
-        )
-        
-        # Update if prediction, actuals, or error metrics changed
-        update_condition = (
-            "NOT (target.predicted_demand_mw <=> source.predicted_demand_mw) OR "
-            "NOT (target.actual_demand_mw <=> source.actual_demand_mw) OR "
-            "NOT (target.model_error_mw <=> source.model_error_mw)"
-        )
-        
-        delta_target.alias("target").merge(
-            df_scored.alias("source"),
-            merge_condition
-        ).whenMatchedUpdateAll(
-            condition=update_condition
-        ).whenNotMatchedInsertAll(
-        ).execute()
-        
-        print(f"Successfully executed idempotent MERGE on {target_table}.")
-
-# COMMAND ----------
-# DBTITLE 1,Post-Write Read-Back Storage Audit
-def audit_persisted_forecast_table(target_table, spark_session):
-    df_persisted = spark_session.table(target_table)
-    persisted_rows = df_persisted.count()
-    distinct_keys = df_persisted.select("respondent", "timestamp_utc").distinct().count()
-    null_keys = df_persisted.filter(
-        F.col("respondent").isNull() | F.col("timestamp_utc").isNull()
-    ).count()
-
-    assert null_keys == 0, f"Post-Write Failure: Found {null_keys} null keys in {target_table}!"
-    assert persisted_rows == distinct_keys, (
-        f"Post-Write Failure: Found {persisted_rows - distinct_keys} duplicate keys in {target_table}!"
-    )
-    print(f"Post-Write Storage Audit Passed: {persisted_rows:,} verified records in {target_table}.")
-
-# COMMAND ----------
-# DBTITLE 1,Execute Forecast Scoring Pipeline
-assert spark.catalog.tableExists(SOURCE_FEATURES_TABLE), f"Source {SOURCE_FEATURES_TABLE} does not exist!"
-df_features = spark.table(SOURCE_FEATURES_TABLE)
-
-df_scored = generate_forecast_predictions(df_features, model_booster)
-validate_forecast_predictions(df_scored)
-upsert_forecast_table(df_scored, TARGET_FORECAST_TABLE, spark)
-audit_persisted_forecast_table(TARGET_FORECAST_TABLE, spark)
-
-# COMMAND ----------
-# MAGIC %sql
-# MAGIC -- Sample Verification of Live Production Predictions vs EIA Benchmark
-# MAGIC SELECT 
-# MAGIC     date_local,
-# MAGIC     hour_local,
-# MAGIC     actual_demand_mw,
-# MAGIC     day_ahead_forecast_mw as eia_forecast_mw,
-# MAGIC     predicted_demand_mw as model_forecast_mw,
-# MAGIC     model_abs_error_mw,
-# MAGIC     eia_abs_error_mw,
-# MAGIC     is_model_better_than_eia,
-# MAGIC     is_predicted_peak_risk
-# MAGIC FROM gold.forecast_hourly
-# MAGIC WHERE actual_demand_mw IS NOT NULL
-# MAGIC ORDER BY timestamp_utc DESC
-# MAGIC LIMIT 24;
+        incoming.write.format("delta").mode("overwrite").saveAsTable(TARGET_EVALUATION_TABLE)
+    print(f"Issued {len(forecast):,} direct forecast rows from {forecast.forecast_origin_utc.iloc[0]}.")

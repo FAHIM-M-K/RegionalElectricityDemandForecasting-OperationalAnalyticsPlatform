@@ -1,0 +1,77 @@
+{
+  "name": "ERCOT_Daily_Forecast_and_Monitoring",
+  "schedule": {
+    "quartz_cron_expression": "0 0 13 * * ?",
+    "timezone_id": "UTC",
+    "pause_status": "PAUSED"
+  },
+  "max_concurrent_runs": 1,
+  "tasks": [
+    {
+      "task_key": "setup_catalog",
+      "description": "Ensures the Unity Catalog medallion schemas and raw landing volume exist.",
+      "notebook_task": {"notebook_path": "src/bronze/setup_schemas", "source": "GIT"},
+      "timeout_seconds": 600
+    },
+    {
+      "task_key": "seed_calendar",
+      "description": "Refreshes the small known calendar and holiday reference table.",
+      "depends_on": [{"task_key": "setup_catalog"}],
+      "notebook_task": {"notebook_path": "src/bronze/seed_calendar", "source": "GIT"},
+      "timeout_seconds": 600
+    },
+    {
+      "task_key": "ingest_eia",
+      "description": "Ingests real ERCOT demand and EIA day-ahead benchmark data.",
+      "depends_on": [{"task_key": "setup_catalog"}],
+      "notebook_task": {"notebook_path": "src/bronze/ingest_eia", "source": "GIT"},
+      "timeout_seconds": 1800
+    },
+    {
+      "task_key": "ingest_weather",
+      "description": "Ingests retrospective Open-Meteo archive observations through the available date.",
+      "depends_on": [{"task_key": "setup_catalog"}],
+      "notebook_task": {"notebook_path": "src/bronze/ingest_weather", "source": "GIT"},
+      "timeout_seconds": 1800
+    },
+    {
+      "task_key": "clean_eia",
+      "depends_on": [{"task_key": "ingest_eia"}],
+      "notebook_task": {"notebook_path": "src/silver/clean_eia_demand", "source": "GIT"},
+      "timeout_seconds": 1800
+    },
+    {
+      "task_key": "clean_weather",
+      "depends_on": [{"task_key": "ingest_weather"}],
+      "notebook_task": {"notebook_path": "src/silver/clean_weather", "source": "GIT"},
+      "timeout_seconds": 1800
+    },
+    {
+      "task_key": "conform_grid_weather",
+      "depends_on": [{"task_key": "clean_eia"}, {"task_key": "clean_weather"}, {"task_key": "seed_calendar"}],
+      "notebook_task": {"notebook_path": "src/silver/conformed_grid_weather", "source": "GIT"},
+      "timeout_seconds": 1800
+    },
+    {
+      "task_key": "build_demand_fact",
+      "depends_on": [{"task_key": "conform_grid_weather"}],
+      "notebook_task": {"notebook_path": "src/gold/fact_hourly_demand", "source": "GIT"},
+      "timeout_seconds": 1800
+    },
+    {
+      "task_key": "score_forecasts",
+      "description": "Issues the latest H24 and H168 forecasts only from active production models.",
+      "depends_on": [{"task_key": "build_demand_fact"}],
+      "notebook_task": {"notebook_path": "src/gold/score_forecast_hourly", "source": "GIT"},
+      "timeout_seconds": 1800
+    },
+    {
+      "task_key": "monitor_forecasts",
+      "description": "Calculates forecast errors only for target hours whose actual demand is now available.",
+      "depends_on": [{"task_key": "score_forecasts"}],
+      "notebook_task": {"notebook_path": "src/mlops/monitor_forecasts", "source": "GIT"},
+      "timeout_seconds": 1800
+    }
+  ],
+  "format": "MULTI_TASK"
+}

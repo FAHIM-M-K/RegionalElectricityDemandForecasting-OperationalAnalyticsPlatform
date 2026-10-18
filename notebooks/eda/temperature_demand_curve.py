@@ -51,14 +51,17 @@ display(df_bins)
 pdf_curve = df_bins.toPandas()
 
 # Degree-3 polynomial fit to binned median demand
+# Identifies the empirical descriptive inflection point where heating transitions to cooling
 poly_func = np.poly1d(np.polyfit(pdf_curve["temp_bin_f"], pdf_curve["median_demand_mw"], deg=3))
 temp_dense = np.linspace(pdf_curve["temp_bin_f"].min(), pdf_curve["temp_bin_f"].max(), 1000)
 demand_dense = poly_func(temp_dense)
 
-empirical_balance_f = float(temp_dense[np.argmin(demand_dense)])
-min_demand_mw = float(np.min(demand_dense))
+# Constrain balance point search to plausible interior range [48°F, 68°F] to prevent edge fit artifacts (F-21)
+interior_mask = (temp_dense >= 48.0) & (temp_dense <= 68.0)
+empirical_balance_f = float(temp_dense[interior_mask][np.argmin(demand_dense[interior_mask])])
+min_demand_mw = float(np.min(demand_dense[interior_mask]))
 
-print(f"Empirical Grid Balance Point : {empirical_balance_f:.1f}°F (vs 65.0°F standard convention)")
+print(f"Empirical Grid Balance Point : {empirical_balance_f:.1f}°F (Empirical descriptive inflection point vs 65.0°F standard convention)")
 print(f"Minimum Basal Demand         : {min_demand_mw:,.0f} MW")
 
 # Plot

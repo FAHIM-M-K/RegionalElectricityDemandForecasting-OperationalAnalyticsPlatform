@@ -41,15 +41,17 @@ $RECYCLE.BIN/
 .DS_Store
 
 # .md files
-plan.md
+
 README.md
 preference.md
 prompt.md
 progress.md
 modelling.md
-powerbi_dashboard_guide.md
-plan_phase_2.md
+to_fix.md
+fix_plan.md
 
-GridDashBoard.pbix
+ERCOTGridBI.pbix
+powerBI.md 
+
 # tests
 # notebooks

@@ -1,74 +1,49 @@
-import os
-import sys
+"""Small operational viewer for the persisted H24 and H168 forecast products."""
+
+import plotly.express as px
+import pandas as pd
 import streamlit as st
 
-# Configure wide layout and page metadata
-st.set_page_config(
-    page_title="ERCOT Operational Grid What-If Simulator",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# Add repo root to path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
 from app.data_loader import load_operational_forecast_data
-from app.views.scenario_simulator import render_scenario_simulator_view
 
-# Load Custom CSS Styling
-css_path = os.path.join(os.path.dirname(__file__), "style.css")
-if os.path.exists(css_path):
-    with open(css_path, "r") as f:
-        st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
+st.set_page_config(page_title="ERCOT Demand Forecast", layout="wide")
+st.title("ERCOT Demand Forecast")
+st.caption("Direct demand-only LightGBM forecasts. H24 supports day-ahead operations; H168 supports week-ahead planning.")
 
-# ---------------- Sidebar Configuration ----------------
-with st.sidebar:
-    st.markdown("#### Grid Dispatch Controls")
-    st.caption("Operational What-If Stress Testing Simulator.")
-    st.divider()
+forecast, status, monitoring = load_operational_forecast_data()
+if status.startswith("Stale"):
+    st.warning(status)
+else:
+    st.caption(status)
+if forecast.empty:
+    st.info("No persisted forecast is available. Run the scoring workflow after a production H24 and H168 model has been promoted.")
+    st.stop()
 
-    selected_region = st.selectbox(
-        "Balancing Authority",
-        ["ERCO (Electric Reliability Council of Texas)"],
-        index=0
-    )
+horizon = st.radio("Forecast product", [24, 168], horizontal=True,
+                   format_func=lambda h: "Day ahead (H24)" if h == 24 else "Week ahead (H168)")
+view = forecast[forecast.horizon_hours == horizon].copy()
+peak = view.loc[view.predicted_demand_mw.idxmax()]
+first, second, third = st.columns(3)
+first.metric("Expected peak", f"{peak.predicted_demand_mw:,.0f} MW")
+second.metric("Peak time (Central)", str(peak.timestamp_local))
+third.metric("Hours above high-demand threshold", int(view.is_predicted_high_demand.sum()))
 
-    installed_cap_gw = st.number_input(
-        "Total Available Grid Capacity (GW)",
-        min_value=70.0,
-        max_value=110.0,
-        value=86.5,
-        step=0.5,
-        help="Effective thermal, nuclear, wind, and solar dispatch capacity."
-    )
+figure = px.line(view, x="timestamp_local", y="predicted_demand_mw", markers=True,
+                 labels={"timestamp_local": "Central time", "predicted_demand_mw": "Forecast demand (MW)"})
+figure.add_hline(y=float(view.high_demand_threshold_mw.iloc[0]), line_dash="dash", line_color="#b91c1c",
+                 annotation_text="High-demand threshold")
+st.plotly_chart(figure, use_container_width=True)
+st.caption(f"Model: {view.model_version.iloc[0]} | Run: {view.model_run_id.iloc[0]} | Forecast origin: {view.forecast_origin_utc.iloc[0]}")
 
-    st.divider()
-
-    # Load Baseline Data
-    with st.spinner("Connecting to Gold Forecast Mart..."):
-        df_forecast, data_source = load_operational_forecast_data()
-
-    st.markdown("##### Connection Status")
-    if "Databricks" in data_source:
-        st.markdown(f'<span class="status-pill-success">{data_source}</span>', unsafe_allow_html=True)
+if not monitoring.empty:
+    st.subheader("Observed forecast reliability")
+    recent = monitoring[monitoring.horizon_hours == horizon].copy()
+    if not recent.empty:
+        recent["target_date_utc"] = pd.to_datetime(recent["target_date_utc"])
+        reliability = recent.groupby("target_date_utc", as_index=False).agg(mae_mw=("mae_mw", "mean"), rmse_mw=("rmse_mw", "mean"))
+        reliability_figure = px.line(reliability, x="target_date_utc", y=["mae_mw", "rmse_mw"], markers=True,
+                                     labels={"value": "Error (MW)", "target_date_utc": "Target date UTC", "variable": "Metric"})
+        st.plotly_chart(reliability_figure, use_container_width=True)
+        st.caption("Errors are grouped by forecast horizon and lead hour. Early lead hours may have more evaluated observations than later leads.")
     else:
-        st.markdown(f'<span class="status-pill-neutral">{data_source}</span>', unsafe_allow_html=True)
-
-    st.divider()
-    st.markdown("""
-    **Production Dashboards:** Power BI  
-    - Page 1: Executive Dispatch  
-    - Page 2: Grid Stress & Growth  
-    - Page 3: Thermodynamic Response  
-    - Page 4: ERCOT Zonal Map  
-
-    **Streamlit Role:** Real-Time Simulation Engine  
-    *(Zero triggers; runs dynamic in-memory what-if perturbations).*
-    """)
-
-# ---------------- Main Layout ----------------
-st.title("ERCOT Operational Stress & What-If Simulation Engine")
-st.caption("Dynamic thermodynamic perturbator and reserve margin estimator (Zero-trigger interactive simulator).")
-
-# Render Simulator
-render_scenario_simulator_view(df_forecast)
+        st.info("No matured forecast errors are available for this horizon yet.")
