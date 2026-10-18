@@ -25,6 +25,7 @@ import sys
 import json
 import time
 import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.request
 import urllib.parse
 from pyspark.sql import functions as F
@@ -117,11 +118,7 @@ def fetch_eia_subregion_dataset(api_key: str, start: str, end: str, parent: str 
     Fetches authentic EIA-930 subregion hourly demand records with pagination, backoff, and envelope archival.
     Fail-closed: raises a RuntimeError on failure rather than returning synthetic approximations.
     """
-    all_records = []
-    raw_responses = []
-    offset = 0
-
-    while True:
+    def fetch_page(offset: int):
         query_params = [
             ("api_key", api_key),
             ("frequency", "hourly"),
@@ -139,7 +136,6 @@ def fetch_eia_subregion_dataset(api_key: str, start: str, end: str, parent: str 
         request_url = f"{EIA_BASE_URL}?{encoded_query}"
         req = urllib.request.Request(request_url, headers={"User-Agent": "ERCOT-Platform/1.0"})
 
-        payload = None
         for attempt in range(1, 4):
             try:
                 with urllib.request.urlopen(req, timeout=40) as resp:
@@ -153,35 +149,36 @@ def fetch_eia_subregion_dataset(api_key: str, start: str, end: str, parent: str 
 
         sanitized_params = {k: v for k, v in query_params if k != "api_key"}
 
-        raw_responses.append({
+        response = payload.get("response", {})
+        return response.get("data", []), int(response.get("total", 0)), {
             "offset": offset,
             "page_size": page_size,
             "request_url_endpoint": EIA_BASE_URL,
             "request_params_sanitized": sanitized_params,
             "fetched_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "response_envelope": payload
-        })
+            "response_envelope": payload,
+        }
 
-        resp_obj = payload.get("response", {})
-        batch = resp_obj.get("data", [])
-        total = int(resp_obj.get("total", 0))
-
-        if not batch:
-            break
-
-        all_records.extend(batch)
-        offset += len(batch)
-        print(f"  Retrieved {offset} / {total} authentic subregion records...")
-
-        if offset >= total:
-            break
-        time.sleep(0.3)
-
+    first_batch, total, first_raw = fetch_page(0)
+    all_records = list(first_batch)
+    raw_responses = [first_raw] if first_batch else []
+    offsets = range(page_size, total, page_size)
+    if offsets:
+        # EIA pages within a fixed historical window are independent. Fetch a
+        # few at once to reduce backfill wall time without launching an
+        # unbounded request storm; each page still has bounded retries.
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(fetch_page, offset): offset for offset in offsets}
+            for future in as_completed(futures):
+                batch, _, raw_page = future.result()
+                all_records.extend(batch)
+                raw_responses.append(raw_page)
+                print(f"  Retrieved {len(all_records)} / {total} authentic subregion records...")
     return all_records, raw_responses
 
 
-def date_windows(start_date: str, end_date: str, months: int = 3):
-    """Bound pagination offsets during full backfills by querying quarterly windows."""
+def date_windows(start_date: str, end_date: str, months: int = 6):
+    """Bound pagination offsets during full backfills by querying half-year windows."""
     current = datetime.date.fromisoformat(start_date)
     end = datetime.date.fromisoformat(end_date)
     while current <= end:

@@ -172,6 +172,10 @@ df_conformed = df_regional \
     ) \
     .withColumn("_transformed_at_utc", F.current_timestamp())
 
+# temp_weight_sum is an aggregation intermediate used to normalize the station
+# weights; it is not part of the conformed Silver contract.
+df_conformed = df_conformed.drop("temp_weight_sum")
+
 # COMMAND ----------
 # DBTITLE 1,Pre-Merge Integrity Assertions
 null_time_count = df_conformed.filter(F.col("timestamp_utc").isNull()).count()
@@ -200,9 +204,19 @@ if not spark.catalog.tableExists(TARGET_TABLE):
         .saveAsTable(TARGET_TABLE)
     print(f"Initialized Silver table {TARGET_TABLE} with {total_hours:,} records.")
 else:
-    delta_target = DeltaTable.forName(spark, TARGET_TABLE)
     merge_condition = "target.timestamp_utc = source.timestamp_utc"
-    
+
+    # Add the newly introduced quality flag to existing Silver tables before
+    # referencing it in MERGE. Databricks does not resolve source-only columns
+    # on the target side of a matched-update condition.
+    target_columns = set(spark.table(TARGET_TABLE).columns)
+    if "is_complete_weather_reading" not in target_columns:
+        spark.sql(
+            f"ALTER TABLE {TARGET_TABLE} "
+            "ADD COLUMNS (is_complete_weather_reading BOOLEAN)"
+        )
+    delta_target = DeltaTable.forName(spark, TARGET_TABLE)
+
     # Check all conformed weather attributes to ensure restatements propagate completely
     weather_business_cols = [
         "weighted_temperature_c", "weighted_apparent_temperature_c", "weighted_dew_point_c",
