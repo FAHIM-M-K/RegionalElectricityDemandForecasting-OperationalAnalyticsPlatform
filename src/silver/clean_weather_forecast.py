@@ -67,7 +67,6 @@ if unknown_station:
 
 group_columns = [
     "snapshot_batch_id",
-    "snapshot_requested_at_utc",
     "snapshot_available_at_utc",
     "target_timestamp_utc",
 ]
@@ -82,6 +81,8 @@ def weighted_mean(column_name: str):
 
 
 regional = weighted.groupBy(*group_columns).agg(
+    F.min("snapshot_requested_at_utc").alias("first_station_requested_at_utc"),
+    F.max("snapshot_requested_at_utc").alias("last_station_requested_at_utc"),
     F.countDistinct("station_id").alias("reporting_stations_count"),
     F.countDistinct(F.when(F.col("temperature_2m").isNotNull(), F.col("station_id")))
      .alias("temperature_reporting_stations_count"),
