@@ -73,7 +73,7 @@
     },
     {
       "task_key": "score_forecasts",
-      "description": "Issues the latest H24 and H168 forecasts only from active production models.",
+      "description": "Requires a promoted H24 model; uses the promoted H168 model or an explicitly labeled weekly-naive fallback.",
       "depends_on": [{"task_key": "build_demand_fact"}],
       "notebook_task": {"notebook_path": "src/gold/score_forecast_hourly", "source": "GIT"},
       "timeout_seconds": 1800

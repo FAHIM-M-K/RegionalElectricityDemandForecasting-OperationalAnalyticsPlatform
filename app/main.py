@@ -4,7 +4,7 @@ import plotly.express as px
 import pandas as pd
 import streamlit as st
 
-from app.data_loader import load_operational_forecast_data
+from data_loader import load_operational_forecast_data
 
 st.set_page_config(page_title="ERCOT Demand Forecast", layout="wide")
 st.title("ERCOT Demand Forecast")
@@ -25,14 +25,17 @@ view = forecast[forecast.horizon_hours == horizon].copy()
 peak = view.loc[view.predicted_demand_mw.idxmax()]
 first, second, third = st.columns(3)
 first.metric("Expected peak", f"{peak.predicted_demand_mw:,.0f} MW")
-second.metric("Peak time (Central)", str(peak.timestamp_local))
+peak_time_central = pd.Timestamp(peak.target_timestamp_utc).tz_convert("America/Chicago")
+second.metric("Peak time (Central)", peak_time_central.strftime("%b %d, %Y %I:%M %p %Z"))
 third.metric("Hours above high-demand threshold", int(view.is_predicted_high_demand.sum()))
 
 figure = px.line(view, x="timestamp_local", y="predicted_demand_mw", markers=True,
                  labels={"timestamp_local": "Central time", "predicted_demand_mw": "Forecast demand (MW)"})
 figure.add_hline(y=float(view.high_demand_threshold_mw.iloc[0]), line_dash="dash", line_color="#b91c1c",
-                 annotation_text="High-demand threshold")
-st.plotly_chart(figure, use_container_width=True)
+                 annotation_text="Configured demand advisory threshold")
+figure.update_layout(height=480, font={"size": 13}, margin={"l": 30, "r": 30, "t": 45, "b": 30})
+st.plotly_chart(figure, width="stretch")
+st.caption("Above-threshold flags identify high forecast demand only; they do not estimate grid-stress probability or available reserve capacity.")
 forecast_source = str(view.forecast_source.iloc[0])
 if forecast_source == "weekly_seasonal_naive_baseline":
     st.warning("No H168 ML model has passed validation yet. This week-ahead view is the weekly seasonal-naive benchmark, not an ML forecast.")
@@ -61,20 +64,28 @@ if not monitoring.empty:
         reliability["bias_mw"] = reliability["signed_error_sum"] / reliability["evaluated_rows"]
         sample_rows = int(reliability["evaluated_rows"].sum())
         sample_days = int(reliability["target_date_utc"].nunique())
-        if sample_rows < 168 or sample_days < 7:
+        enough_monitoring_history = sample_rows >= 168 and sample_days >= 7
+        if not enough_monitoring_history:
             st.warning(
                 f"Preliminary reliability only: {sample_rows} matured forecast errors across "
                 f"{sample_days} target date(s) for this model. Wait for at least 168 errors "
-                "across 7 dates before treating the trend as a useful weekly monitoring signal."
+                "across 7 dates before treating trend charts as useful monitoring signals."
             )
         else:
             st.caption(
                 f"Monitoring coverage: {sample_rows:,} matured forecast errors across "
                 f"{sample_days} target dates for the selected production model."
             )
-        reliability_figure = px.line(reliability, x="target_date_utc", y=["mae_mw", "rmse_mw"], markers=True,
-                                     labels={"value": "Error (MW)", "target_date_utc": "Target date UTC", "variable": "Metric"})
-        st.plotly_chart(reliability_figure, use_container_width=True)
+        if enough_monitoring_history:
+            reliability_figure = px.line(
+                reliability, x="target_date_utc", y=["mae_mw", "rmse_mw"], markers=True,
+                labels={"value": "Error (MW)", "target_date_utc": "Target date UTC", "variable": "Metric"},
+            )
+            reliability_figure.update_layout(
+                height=360, font={"size": 13},
+                legend={"orientation": "h", "y": 1.08, "x": 1, "xanchor": "right"},
+            )
+            st.plotly_chart(reliability_figure, width="stretch")
         st.caption("Daily error metrics are weighted by the number of matured forecast rows in each lead-hour bucket.")
 
         lead_rows = recent.copy()
@@ -102,12 +113,19 @@ if not monitoring.empty:
         st.subheader("Observed error by forecast lead")
         if horizon == 168:
             st.caption("Week-ahead errors are separated into day one, day two, and days three through seven.")
-        lead_figure = px.bar(
-            by_lead, x="lead_bucket", y=["mae_mw", "rmse_mw"], barmode="group",
-            labels={"lead_bucket": "Forecast lead", "value": "Error (MW)", "variable": "Metric"},
-        )
-        st.plotly_chart(lead_figure, use_container_width=True)
+        if enough_monitoring_history:
+            lead_figure = px.bar(
+                by_lead, x="lead_bucket", y=["mae_mw", "rmse_mw"], barmode="group",
+                labels={"lead_bucket": "Forecast lead", "value": "Error (MW)", "variable": "Metric"},
+            )
+            lead_figure.update_layout(
+                height=360, font={"size": 13},
+                legend={"orientation": "h", "y": 1.08, "x": 1, "xanchor": "right"},
+            )
+            st.plotly_chart(lead_figure, width="stretch")
+        else:
+            st.caption("Lead-bucket trend chart will appear after at least 168 matured errors across 7 target dates.")
         st.dataframe(by_lead[["lead_bucket", "evaluated_rows", "mae_mw", "rmse_mw", "bias_mw"]],
-                     hide_index=True, use_container_width=True)
+                     hide_index=True, width="stretch")
     else:
         st.info("No matured forecast errors are available for this horizon yet.")
