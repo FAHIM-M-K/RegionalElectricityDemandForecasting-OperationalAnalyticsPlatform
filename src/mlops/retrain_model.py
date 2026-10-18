@@ -1,4 +1,7 @@
 # Databricks notebook source
+# COMMAND ----------
+# MAGIC %pip install lightgbm==4.7.0
+# COMMAND ----------
 """Train direct, point-in-time LightGBM models for H24 and H168.
 
 Model selection uses rolling chronological windows.  The final 30 days are

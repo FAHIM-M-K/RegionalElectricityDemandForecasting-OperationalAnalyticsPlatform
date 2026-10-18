@@ -1,4 +1,7 @@
 # Databricks notebook source
+# COMMAND ----------
+# MAGIC %pip install lightgbm==4.7.0
+# COMMAND ----------
 """Issue direct H24 and H168 forecasts from the active MLflow models.
 
 There is no heuristic model fallback.  If the required demand history or a

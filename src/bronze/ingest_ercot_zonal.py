@@ -188,8 +188,8 @@ def fetch_eia_subregion_dataset(
     return all_records, raw_responses
 
 
-def date_windows(start_date: str, end_date: str, months: int = 6):
-    """Bound pagination offsets during full backfills by querying half-year windows."""
+def date_windows(start_date: str, end_date: str, months: int = 1):
+    """Use monthly windows to keep EIA queries small and pagination shallow."""
     current = datetime.date.fromisoformat(start_date)
     end = datetime.date.fromisoformat(end_date)
     while current <= end:
@@ -205,18 +205,56 @@ def date_windows(start_date: str, end_date: str, months: int = 6):
 # DBTITLE 1,Execute Ingestion, Archive Raw Payload & Write to Bronze Delta
 records, raw_payloads = [], []
 date_ranges = list(date_windows(start_date_str, end_date_str))
+checkpoint_dir = f"/Volumes/{CATALOG}/bronze/raw_landing/ercot_zonal/checkpoints"
+os.makedirs(checkpoint_dir, exist_ok=True)
+resume_backfill = (not table_has_rows) or legacy_table_schema
 for window_index, (window_start, window_end) in enumerate(date_ranges, start=1):
-    print(f"[BACKFILL] Fetching date window {window_index}/{len(date_ranges)}: {window_start} to {window_end}.")
-    # Fetch the parent-level window once, then validate the actual subba codes
-    # in returned data. Six months is small enough for bounded pagination and
-    # avoids per-zone facet filters that silently omit valid ERCOT zones.
-    window_records, window_payloads = fetch_eia_subregion_dataset(
-        EIA_API_KEY,
-        f"{window_start}T00",
-        f"{window_end}T23",
-        EIA_PARENT,
-        EIA_PAGE_SIZE,
-    )
+    checkpoint_path = os.path.join(checkpoint_dir, f"{window_start}_{window_end}.json")
+    window_records, window_payloads = [], []
+    reused_checkpoint = False
+
+    # A failed first-time/legacy-schema backfill must not repeat already
+    # completed API windows. Reuse only checkpoints from the last 30 days;
+    # regular incremental runs always refetch their restatement window.
+    if resume_backfill and os.path.isfile(checkpoint_path):
+        checkpoint_age_days = (time.time() - os.path.getmtime(checkpoint_path)) / 86400
+        if checkpoint_age_days <= 30:
+            try:
+                with open(checkpoint_path, "r", encoding="utf-8") as checkpoint_file:
+                    checkpoint = json.load(checkpoint_file)
+                if (checkpoint.get("version") == 1
+                        and checkpoint.get("start") == window_start
+                        and checkpoint.get("end") == window_end):
+                    window_payloads = checkpoint["pages"]
+                    window_records = [
+                        record
+                        for page in window_payloads
+                        for record in page["response_envelope"]["response"]["data"]
+                    ]
+                    reused_checkpoint = bool(window_records)
+            except (OSError, ValueError, KeyError, TypeError):
+                # An incomplete checkpoint from an interrupted write is safely
+                # replaced by a fresh API fetch below.
+                pass
+
+    if reused_checkpoint:
+        print(f"[RESUME] Reusing {len(window_records):,} cached records for {window_start} to {window_end}.")
+    else:
+        print(f"[BACKFILL] Fetching date window {window_index}/{len(date_ranges)}: {window_start} to {window_end}.")
+        window_records, window_payloads = fetch_eia_subregion_dataset(
+            EIA_API_KEY,
+            f"{window_start}T00",
+            f"{window_end}T23",
+            EIA_PARENT,
+            EIA_PAGE_SIZE,
+        )
+        if resume_backfill and window_records:
+            temp_path = f"{checkpoint_path}.tmp"
+            with open(temp_path, "w", encoding="utf-8") as checkpoint_file:
+                json.dump({"version": 1, "start": window_start, "end": window_end,
+                           "pages": window_payloads}, checkpoint_file)
+            os.replace(temp_path, checkpoint_path)
+
     records.extend(window_records)
     raw_payloads.extend(window_payloads)
     print(f"  Retrieved {len(window_records):,} records across configured ERCOT subregions.")
