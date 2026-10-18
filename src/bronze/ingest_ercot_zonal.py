@@ -87,14 +87,25 @@ EXPECTED_SUBREGIONS = {
 now_utc = datetime.datetime.now(datetime.timezone.utc)
 end_date_str = now_utc.strftime("%Y-%m-%d")
 
-if spark.catalog.tableExists(TABLE_NAME) and spark.table(TABLE_NAME).count() > 0:
+table_exists = spark.catalog.tableExists(TABLE_NAME)
+existing_columns = set(spark.table(TABLE_NAME).columns) if table_exists else set()
+has_raw_grain = {"parent", "period", "value"}.issubset(existing_columns) and bool(
+    {"subba", "subregion"} & existing_columns
+)
+table_has_rows = table_exists and spark.table(TABLE_NAME).limit(1).count() > 0
+legacy_table_schema = table_exists and not has_raw_grain
+
+if table_has_rows and has_raw_grain:
     max_period = spark.sql(f"SELECT max(period) FROM {TABLE_NAME}").first()[0]
     hwm_dt = datetime.datetime.strptime(max_period[:10], "%Y-%m-%d") - datetime.timedelta(days=RESTATEMENT_BUFFER_DAYS)
     start_date_str = hwm_dt.strftime("%Y-%m-%d")
     print(f"[INCREMENTAL] High-water mark: {max_period}. Fetching authentic subregion load from {start_date_str} (with {RESTATEMENT_BUFFER_DAYS}-day buffer).")
 else:
     start_date_str = FULL_HISTORY_START
-    print(f"[FULL LOAD] No existing data found in {TABLE_NAME}. Ingesting full history from {start_date_str}.")
+    if legacy_table_schema:
+        print(f"[SCHEMA MIGRATION] Existing {TABLE_NAME} is not raw EIA Bronze grain. Refetching history to replace it with canonical raw records.")
+    else:
+        print(f"[FULL LOAD] No existing raw data found in {TABLE_NAME}. Ingesting full history from {start_date_str}.")
 
 start_param = f"{start_date_str}T00"
 end_param = f"{end_date_str}T23"
@@ -233,13 +244,14 @@ if records:
         print(f"Notice: Batch contains partial subregions: {present_subregions}. Missing: {missing_zones}")
 
     # 4. Idempotent Upsert into Bronze Delta Table
-    if not spark.catalog.tableExists(TABLE_NAME):
+    if not table_exists or legacy_table_schema:
         source_deduped.write \
             .format("delta") \
             .mode("overwrite") \
+            .option("overwriteSchema", "true") \
             .partitionBy(subba_col) \
             .saveAsTable(TABLE_NAME)
-        print(f"Initialized table {TABLE_NAME} with {source_deduped.count()} records.")
+        print(f"Initialized or migrated table {TABLE_NAME} with {source_deduped.count()} authentic raw records.")
     else:
         delta_table = DeltaTable.forName(spark, TABLE_NAME)
         merge_condition = (

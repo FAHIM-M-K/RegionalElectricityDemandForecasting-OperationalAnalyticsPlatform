@@ -122,10 +122,10 @@ df_regional = df_weighted_base.groupBy("timestamp_utc", "timestamp_local").agg(
     ).alias("weighted_precipitation_mm"),
     
     # Weighted wind speed (m/s)
-    F.round(
+    F.round((
         F.sum(F.when(F.col("wind_speed_10m").isNotNull(), F.col("wind_speed_10m") * F.col("station_weight"))) /
-        F.nullif(F.sum(F.when(F.col("wind_speed_10m").isNotNull(), F.col("station_weight"))), F.lit(0.0)),
-        2
+        F.nullif(F.sum(F.when(F.col("wind_speed_10m").isNotNull(), F.col("station_weight"))), F.lit(0.0))
+    ) / 3.6, 2
     ).alias("weighted_wind_speed_ms"),
     
     # Weighted direct solar irradiance (W/m²)

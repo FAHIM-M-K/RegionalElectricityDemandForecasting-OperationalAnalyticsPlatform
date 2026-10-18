@@ -15,6 +15,7 @@ import time
 import datetime
 import urllib.request
 import urllib.parse
+import urllib.error
 from pyspark.sql import functions as F
 from delta.tables import DeltaTable
 
@@ -49,6 +50,37 @@ weather_vars = weather_cfg.get("hourly_variables", [])
 ARCHIVE_BASE_URL = weather_cfg.get("archive_base_url", "https://archive-api.open-meteo.com/v1/archive")
 vars_param = ",".join(weather_vars)
 
+
+def date_chunks(start_date: str, end_date: str, days: int = 30):
+    """Split archive backfills into small requests so one bad range cannot sink a full load."""
+    current, end = datetime.date.fromisoformat(start_date), datetime.date.fromisoformat(end_date)
+    while current <= end:
+        chunk_end = min(current + datetime.timedelta(days=days - 1), end)
+        yield current.isoformat(), chunk_end.isoformat()
+        current = chunk_end + datetime.timedelta(days=1)
+
+
+def fetch_weather_chunk(url: str, params: dict, station_id: str) -> dict:
+    request_url = f"{url}?{urllib.parse.urlencode(params)}"
+    request = urllib.request.Request(request_url, headers={"User-Agent": "ERCOT-Platform/1.0"})
+    for attempt in range(1, 4):
+        try:
+            with urllib.request.urlopen(request, timeout=40) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as error:
+            body = error.read().decode("utf-8", errors="replace")[:1000]
+            if error.code < 500 and error.code != 429:
+                raise RuntimeError(f"Open-Meteo rejected {station_id} request (HTTP {error.code}): {body}") from error
+            if attempt == 3:
+                raise RuntimeError(f"Open-Meteo request failed for {station_id} after 3 attempts (HTTP {error.code}): {body}") from error
+        except Exception as error:
+            if attempt == 3:
+                raise RuntimeError(f"Open-Meteo request failed for {station_id} after 3 attempts: {error}") from error
+        wait_time = 2 * attempt
+        print(f"  Attempt {attempt} failed for {station_id}; retrying in {wait_time}s...")
+        time.sleep(wait_time)
+    raise RuntimeError(f"Open-Meteo request failed for {station_id}.")
+
 # COMMAND ----------
 # DBTITLE 1,High-Water Mark: Auto-Detect Full Load vs Incremental
 now_utc = datetime.datetime.now(datetime.timezone.utc)
@@ -76,57 +108,32 @@ for st in weather_stations:
     lon = st["longitude"]
     print(f"Fetching weather for {st['name']} ({station_id})...")
     
-    archive_url = (
-        f"{ARCHIVE_BASE_URL}?"
-        f"latitude={lat}&longitude={lon}&start_date={start_date_str}&end_date={end_date_str}&"
-        f"hourly={vars_param}&timezone=UTC"
-    )
-    
-    req = urllib.request.Request(archive_url, headers={"User-Agent": "ERCOT-Platform/1.0"})
-    
-    w_data = None
-    for attempt in range(1, 4):
-        try:
-            with urllib.request.urlopen(req, timeout=40) as resp:
-                raw_text = resp.read().decode("utf-8")
-                w_data = json.loads(raw_text)
-                break
-        except Exception as e:
-            if attempt == 3:
-                raise RuntimeError(f"Open-Meteo request failed for {station_id} after 3 attempts: {e}")
-            wait_time = 2 * attempt
-            print(f"  Attempt {attempt} failed for {station_id} ({e}). Retrying in {wait_time}s...")
-            time.sleep(wait_time)
-            
-    # Preserve full, authentic API response envelope and request parameters
-    raw_api_responses[station_id] = {
-        "station_id": station_id,
-        "latitude": lat,
-        "longitude": lon,
-        "request_url": archive_url,
-        "fetched_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "response_envelope": w_data
-    }
-        
-    hourly = w_data.get("hourly", {})
-    timestamps = hourly.get("time", [])
-    
-    for i, t in enumerate(timestamps):
-        row = {
-            "station_id": station_id,
-            "latitude": lat,
-            "longitude": lon,
-            "time_utc": t,
-            "temperature_2m": hourly.get("temperature_2m", [])[i] if i < len(hourly.get("temperature_2m", [])) else None,
-            "relative_humidity_2m": hourly.get("relative_humidity_2m", [])[i] if i < len(hourly.get("relative_humidity_2m", [])) else None,
-            "dew_point_2m": hourly.get("dew_point_2m", [])[i] if i < len(hourly.get("dew_point_2m", [])) else None,
-            "apparent_temperature": hourly.get("apparent_temperature", [])[i] if i < len(hourly.get("apparent_temperature", [])) else None,
-            "precipitation": hourly.get("precipitation", [])[i] if i < len(hourly.get("precipitation", [])) else None,
-            "wind_speed_10m": hourly.get("wind_speed_10m", [])[i] if i < len(hourly.get("wind_speed_10m", [])) else None,
-            "direct_normal_irradiance": hourly.get("direct_normal_irradiance", [])[i] if i < len(hourly.get("direct_normal_irradiance", [])) else None,
-        }
-        all_weather_rows.append(row)
-    time.sleep(0.5)
+    raw_api_responses[station_id] = []
+    for chunk_start, chunk_end in date_chunks(start_date_str, end_date_str):
+        params = {"latitude": lat, "longitude": lon, "start_date": chunk_start, "end_date": chunk_end,
+                  "hourly": vars_param, "timezone": "UTC"}
+        w_data = fetch_weather_chunk(ARCHIVE_BASE_URL, params, station_id)
+        raw_api_responses[station_id].append({
+            "request_params": params,
+            "fetched_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "response_envelope": w_data,
+        })
+        if w_data.get("error"):
+            raise RuntimeError(f"Open-Meteo rejected {station_id} request: {w_data.get('reason', 'unknown API error')}")
+        hourly = w_data.get("hourly", {})
+        timestamps = hourly.get("time", [])
+        for i, timestamp in enumerate(timestamps):
+            all_weather_rows.append({
+                "station_id": station_id, "latitude": lat, "longitude": lon, "time_utc": timestamp,
+                "temperature_2m": hourly.get("temperature_2m", [])[i] if i < len(hourly.get("temperature_2m", [])) else None,
+                "relative_humidity_2m": hourly.get("relative_humidity_2m", [])[i] if i < len(hourly.get("relative_humidity_2m", [])) else None,
+                "dew_point_2m": hourly.get("dew_point_2m", [])[i] if i < len(hourly.get("dew_point_2m", [])) else None,
+                "apparent_temperature": hourly.get("apparent_temperature", [])[i] if i < len(hourly.get("apparent_temperature", [])) else None,
+                "precipitation": hourly.get("precipitation", [])[i] if i < len(hourly.get("precipitation", [])) else None,
+                "wind_speed_10m": hourly.get("wind_speed_10m", [])[i] if i < len(hourly.get("wind_speed_10m", [])) else None,
+                "direct_normal_irradiance": hourly.get("direct_normal_irradiance", [])[i] if i < len(hourly.get("direct_normal_irradiance", [])) else None,
+            })
+        time.sleep(0.5)
 
 print(f"Total weather station hourly records extracted: {len(all_weather_rows)} across {len(raw_api_responses)} stations.")
 
