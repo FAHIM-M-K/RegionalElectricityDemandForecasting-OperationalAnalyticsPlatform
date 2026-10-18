@@ -117,12 +117,16 @@ def fetch_eia_subregion_dataset(
     api_key: str,
     start: str,
     end: str,
-    subba: str,
     parent: str = "ERCO",
     page_size: int = 5000,
 ):
     """
-    Fetches one authentic EIA-930 subregion with pagination, backoff, and envelope archival.
+    Fetches all authentic EIA-930 subregions for one parent and date window.
+
+    Keep this request unfiltered by subba: the EIA route has returned empty
+    results for valid ERCOT subba facets even though the parent-level query
+    contains those zones. Validate returned subba codes after fetching instead
+    of trusting a per-zone facet filter.
     Fail-closed: raises a RuntimeError on failure rather than returning synthetic approximations.
     """
     def fetch_page(offset: int):
@@ -131,7 +135,6 @@ def fetch_eia_subregion_dataset(
             ("frequency", "hourly"),
             ("data[0]", "value"),
             ("facets[parent][]", parent),
-            ("facets[subba][]", subba),
             ("start", start),
             ("end", end),
             ("sort[0][column]", "period"),
@@ -204,28 +207,19 @@ records, raw_payloads = [], []
 date_ranges = list(date_windows(start_date_str, end_date_str))
 for window_index, (window_start, window_end) in enumerate(date_ranges, start=1):
     print(f"[BACKFILL] Fetching date window {window_index}/{len(date_ranges)}: {window_start} to {window_end}.")
-    # Filtering by subregion keeps each response below one page for a
-    # six-month window. A small pool shortens the initial backfill without
-    # causing an unbounded burst against the public EIA API.
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {
-            pool.submit(
-                fetch_eia_subregion_dataset,
-                EIA_API_KEY,
-                f"{window_start}T00",
-                f"{window_end}T23",
-                subba,
-                EIA_PARENT,
-                EIA_PAGE_SIZE,
-            ): subba
-            for subba in sorted(EXPECTED_SUBREGIONS)
-        }
-        for future in as_completed(futures):
-            subba = futures[future]
-            zone_records, zone_payloads = future.result()
-            records.extend(zone_records)
-            raw_payloads.extend(zone_payloads)
-            print(f"  Retrieved {len(zone_records):,} records for {subba}.")
+    # Fetch the parent-level window once, then validate the actual subba codes
+    # in returned data. Six months is small enough for bounded pagination and
+    # avoids per-zone facet filters that silently omit valid ERCOT zones.
+    window_records, window_payloads = fetch_eia_subregion_dataset(
+        EIA_API_KEY,
+        f"{window_start}T00",
+        f"{window_end}T23",
+        EIA_PARENT,
+        EIA_PAGE_SIZE,
+    )
+    records.extend(window_records)
+    raw_payloads.extend(window_payloads)
+    print(f"  Retrieved {len(window_records):,} records across configured ERCOT subregions.")
 
 print(f"Total authentic subregion records extracted: {len(records)} across {len(raw_payloads)} API pages.")
 
@@ -269,6 +263,7 @@ if records:
 
     present_subregions = set(row[subba_col] for row in source_deduped.select(subba_col).distinct().collect())
     print(f"Verified present subregions in batch: {present_subregions}")
+    source_deduped.groupBy(subba_col).count().orderBy(subba_col).show(truncate=False)
 
     # F-03 & P1-06: Subregion completeness gate against expected subregions
     missing_zones = EXPECTED_SUBREGIONS - present_subregions
