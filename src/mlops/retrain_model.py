@@ -26,7 +26,7 @@ for _ in range(5):
 
 from src.mlops.backtest_multihorizon import (
     MAX_PEAK_MAE_REGRESSION, MIN_SELECTION_WINDOWS, MIN_WINDOW_WIN_RATE,
-    PROMOTION_POLICY_VERSION, compute_metrics, compute_naive_baselines,
+    PROMOTION_POLICY_VERSION, compute_matched_metrics, compute_metrics, compute_naive_baselines,
     generate_chronological_splits,
 )
 from src.shared.forecast_contract import FEATURE_SCHEMA_VERSION, HORIZONS, features_for_horizon
@@ -78,9 +78,15 @@ def _score(model, frame: pd.DataFrame, horizon: int, include_eia: bool = False) 
     selection_baseline = daily_metrics if horizon == 24 else weekly_metrics
     if model_metrics["sample_count"] != selection_baseline["sample_count"]:
         raise ValueError(f"H{horizon} model and seasonal baseline were scored on different row counts.")
+    matched_eia = compute_matched_metrics(
+        frame["actual_demand_mw"],
+        {"model": prediction, "daily_naive": daily, "eia": eia},
+        peak_mask=peak,
+    ) if include_eia else {"sample_count": 0, "coverage_pct": 0.0, "metrics": {}}
     return {"model": model_metrics,
             "daily": daily_metrics,
             "weekly": weekly_metrics,
+            "eia_matched": matched_eia,
             "eia": compute_metrics(frame["actual_demand_mw"], eia, peak) if include_eia else
             {"mae": np.nan, "rmse": np.nan, "bias": np.nan, "smape": np.nan, "peak_mae": np.nan, "sample_count": 0}}
 
@@ -104,7 +110,12 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
         test = data[(data.forecast_origin_utc >= split["test_start"]) & (data.forecast_origin_utc < split["test_end"])]
         if fit_train.empty or validation.empty or test.empty:
             continue
-        selection_results.append(_score(_fit(fit_train, validation, features), test, horizon, include_eia=(horizon == 24)))
+        window_result = _score(
+            _fit(fit_train, validation, features), test, horizon, include_eia=(horizon == 24)
+        )
+        window_result["test_start_utc"] = split["test_start"].isoformat()
+        window_result["test_end_utc"] = split["test_end"].isoformat()
+        selection_results.append(window_result)
     if len(selection_results) < MIN_SELECTION_WINDOWS:
         raise ValueError(
             f"H{horizon} has {len(selection_results)} usable rolling selection windows; "
@@ -146,19 +157,45 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
                               "final_holdout_peak_mae": final_result["model"]["peak_mae"],
                               "final_holdout_daily_naive_mae": final_result["daily"]["mae"],
                               "final_holdout_weekly_naive_mae": final_result["weekly"]["mae"]}
-            if np.isfinite(final_result["eia"]["mae"]):
-                logged_metrics["final_holdout_eia_mae"] = final_result["eia"]["mae"]
+            if horizon == 24:
+                matched = final_result["eia_matched"]
+                logged_metrics.update({
+                    "final_holdout_eia_matched_rows": matched["sample_count"],
+                    "final_holdout_eia_coverage_pct": matched["coverage_pct"],
+                })
+                if matched["sample_count"]:
+                    logged_metrics.update({
+                        "final_holdout_model_mae_on_eia_hours": matched["metrics"]["model"]["mae"],
+                        "final_holdout_daily_naive_mae_on_eia_hours": matched["metrics"]["daily_naive"]["mae"],
+                        "final_holdout_eia_mae_on_matched_hours": matched["metrics"]["eia"]["mae"],
+                    })
             baseline_name = "daily" if horizon == 24 else "weekly"
             logged_metrics["selection_baseline_peak_mae"] = _mean_metric(
                 selection_results, baseline_name, "peak_mae"
             )
             for window_index, window_result in enumerate(selection_results, start=1):
+                mlflow.log_params({
+                    f"selection_window_{window_index}_start_utc": window_result["test_start_utc"],
+                    f"selection_window_{window_index}_end_utc": window_result["test_end_utc"],
+                })
                 logged_metrics.update({
                     f"selection_window_{window_index}_model_mae": window_result["model"]["mae"],
                     f"selection_window_{window_index}_baseline_mae": window_result[baseline_name]["mae"],
                     f"selection_window_{window_index}_model_peak_mae": window_result["model"]["peak_mae"],
                     f"selection_window_{window_index}_baseline_peak_mae": window_result[baseline_name]["peak_mae"],
                 })
+                if horizon == 24:
+                    matched = window_result["eia_matched"]
+                    logged_metrics.update({
+                        f"selection_window_{window_index}_eia_matched_rows": matched["sample_count"],
+                        f"selection_window_{window_index}_eia_coverage_pct": matched["coverage_pct"],
+                    })
+                    if matched["sample_count"]:
+                        logged_metrics.update({
+                            f"selection_window_{window_index}_model_mae_on_eia_hours": matched["metrics"]["model"]["mae"],
+                            f"selection_window_{window_index}_daily_naive_mae_on_eia_hours": matched["metrics"]["daily_naive"]["mae"],
+                            f"selection_window_{window_index}_eia_mae_on_matched_hours": matched["metrics"]["eia"]["mae"],
+                        })
             mlflow.log_metrics(logged_metrics)
             mlflow.log_params({"promotion_policy_version": PROMOTION_POLICY_VERSION,
                                "minimum_selection_windows": MIN_SELECTION_WINDOWS,

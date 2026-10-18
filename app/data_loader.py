@@ -46,7 +46,8 @@ def load_operational_forecast_data():
             status = f"Stale persisted forecast — last issued {issue_age:.1f} hours ago"
         try:
             monitoring = pd.read_sql("""
-                SELECT horizon_hours, lead_hours, target_date_utc, evaluated_rows, mae_mw, rmse_mw, bias_mw
+                SELECT model_run_id, horizon_hours, lead_hours, target_date_utc,
+                       evaluated_rows, mae_mw, rmse_mw, bias_mw
                 FROM main.gold.forecast_monitoring_daily
                 WHERE target_date_utc >= date_sub(current_date(), 30)
                 ORDER BY target_date_utc

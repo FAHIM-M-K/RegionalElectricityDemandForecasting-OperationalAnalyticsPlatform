@@ -6,6 +6,7 @@ import pandas as pd
 from src.gold.build_forecast_examples import generate_forecast_examples_df
 from src.mlops.backtest_multihorizon import (
     compute_naive_baselines,
+    compute_matched_metrics,
     evaluate_promotion_gate,
     generate_chronological_splits,
 )
@@ -87,6 +88,21 @@ def test_chronological_splits_reserve_final_holdout():
     splits = generate_chronological_splits(pd.Series(origins), n_test_windows=3)
     assert splits[-1]["kind"] == "final_holdout"
     assert all(split["test_end"] <= splits[-1]["test_start"] for split in splits[:-1])
+
+
+def test_matched_metrics_compare_eia_and_model_on_identical_rows():
+    actual = np.array([10.0, 20.0, 30.0, 40.0])
+    result = compute_matched_metrics(
+        actual,
+        {"model": np.array([11.0, 19.0, 30.0, 41.0]),
+         "eia": np.array([12.0, np.nan, 29.0, 42.0])},
+    )
+    assert result["sample_count"] == 3
+    assert result["coverage_pct"] == 75.0
+    assert result["metrics"]["model"]["sample_count"] == 3
+    assert result["metrics"]["eia"]["sample_count"] == 3
+    assert result["metrics"]["model"]["mae"] == 0.67
+    assert result["metrics"]["eia"]["mae"] == 1.67
 
 
 def _promotion_windows(candidate_maes, baseline_maes=None, candidate_peak=1_000.0, baseline_peak=1_000.0):

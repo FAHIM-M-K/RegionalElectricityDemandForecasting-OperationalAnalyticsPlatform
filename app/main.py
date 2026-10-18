@@ -37,13 +37,41 @@ st.caption(f"Model: {view.model_version.iloc[0]} | Run: {view.model_run_id.iloc[
 
 if not monitoring.empty:
     st.subheader("Observed forecast reliability")
-    recent = monitoring[monitoring.horizon_hours == horizon].copy()
+    selected_run_id = view.model_run_id.iloc[0]
+    recent = monitoring[
+        (monitoring.horizon_hours == horizon)
+        & (monitoring.model_run_id == selected_run_id)
+    ].copy()
     if not recent.empty:
         recent["target_date_utc"] = pd.to_datetime(recent["target_date_utc"])
-        reliability = recent.groupby("target_date_utc", as_index=False).agg(mae_mw=("mae_mw", "mean"), rmse_mw=("rmse_mw", "mean"))
+        recent["absolute_error_sum"] = recent["mae_mw"] * recent["evaluated_rows"]
+        recent["squared_error_sum"] = recent["rmse_mw"].pow(2) * recent["evaluated_rows"]
+        recent["signed_error_sum"] = recent["bias_mw"] * recent["evaluated_rows"]
+        reliability = recent.groupby("target_date_utc", as_index=False).agg(
+            evaluated_rows=("evaluated_rows", "sum"),
+            absolute_error_sum=("absolute_error_sum", "sum"),
+            squared_error_sum=("squared_error_sum", "sum"),
+            signed_error_sum=("signed_error_sum", "sum"),
+        )
+        reliability["mae_mw"] = reliability["absolute_error_sum"] / reliability["evaluated_rows"]
+        reliability["rmse_mw"] = (reliability["squared_error_sum"] / reliability["evaluated_rows"]).pow(0.5)
+        reliability["bias_mw"] = reliability["signed_error_sum"] / reliability["evaluated_rows"]
+        sample_rows = int(reliability["evaluated_rows"].sum())
+        sample_days = int(reliability["target_date_utc"].nunique())
+        if sample_rows < 168 or sample_days < 7:
+            st.warning(
+                f"Preliminary reliability only: {sample_rows} matured forecast errors across "
+                f"{sample_days} target date(s) for this model. Wait for at least 168 errors "
+                "across 7 dates before treating the trend as a useful weekly monitoring signal."
+            )
+        else:
+            st.caption(
+                f"Monitoring coverage: {sample_rows:,} matured forecast errors across "
+                f"{sample_days} target dates for the selected production model."
+            )
         reliability_figure = px.line(reliability, x="target_date_utc", y=["mae_mw", "rmse_mw"], markers=True,
                                      labels={"value": "Error (MW)", "target_date_utc": "Target date UTC", "variable": "Metric"})
         st.plotly_chart(reliability_figure, use_container_width=True)
-        st.caption("Errors are grouped by forecast horizon and lead hour. Early lead hours may have more evaluated observations than later leads.")
+        st.caption("Daily error metrics are weighted by the number of matured forecast rows in each lead-hour bucket.")
     else:
         st.info("No matured forecast errors are available for this horizon yet.")
