@@ -10,6 +10,10 @@ st.set_page_config(page_title="ERCOT Demand Forecast", layout="wide")
 st.title("ERCOT Demand Forecast")
 st.caption("H24 is the day-ahead forecast. H168 is a separate model forecast for all 168 hours of the week-ahead horizon.")
 
+if st.button("Refresh forecast data"):
+    load_operational_forecast_data.clear()
+    st.rerun()
+
 with st.spinner("Connecting to Databricks and loading the latest forecast…"):
     forecast, status, monitoring = load_operational_forecast_data()
 if status.startswith("Stale"):
@@ -145,4 +149,8 @@ if not monitoring.empty:
         st.dataframe(by_lead[["lead_bucket", "evaluated_rows", "mae_mw", "rmse_mw", "bias_mw"]],
                      hide_index=True, width="stretch")
     else:
-        st.info("No matured forecast errors are available for this horizon yet.")
+        st.info(
+            f"No matured forecast errors are available for the selected H{horizon} model run yet. "
+            f"This run has {len(view):,} issued forecast hours. Reliability metrics will appear "
+            "after matching actual demand is available and the monitoring task processes it."
+        )

@@ -54,8 +54,15 @@ def _exact_window(values: dict, origin: pd.Timestamp, hours: int) -> np.ndarray 
 
 
 def _examples_for_respondent(df: pd.DataFrame, horizons: Iterable[int], step_hours: int) -> list[dict]:
-    df = df.sort_values("timestamp_utc").drop_duplicates("timestamp_utc", keep="last").copy()
+    df = df.copy()
     df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
+    duplicated = df.loc[df["timestamp_utc"].duplicated(keep=False), "timestamp_utc"]
+    if not duplicated.empty:
+        examples = duplicated.drop_duplicates().head(5).astype(str).tolist()
+        raise ValueError(
+            f"Duplicate demand timestamps for respondent {df['respondent'].iloc[0]}: {examples}"
+        )
+    df = df.sort_values("timestamp_utc")
     values = dict(zip(df["timestamp_utc"], df["actual_demand_mw"]))
     eia_values = df["day_ahead_forecast_mw"] if "day_ahead_forecast_mw" in df else pd.Series(np.nan, index=df.index)
     holiday_values = df["is_holiday"] if "is_holiday" in df else pd.Series(False, index=df.index)

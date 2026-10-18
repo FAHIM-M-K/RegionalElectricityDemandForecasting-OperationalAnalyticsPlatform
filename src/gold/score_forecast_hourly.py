@@ -83,7 +83,14 @@ def generate_independent_forecasts(df_history: pd.DataFrame, models: dict, model
     """Return direct predictions for every lead in H24 and H168."""
     frame = df_history.copy()
     frame["timestamp_utc"] = pd.to_datetime(frame["timestamp_utc"], utc=True)
-    frame = frame.sort_values("timestamp_utc").drop_duplicates(["respondent", "timestamp_utc"], keep="last")
+    duplicated = frame.loc[
+        frame.duplicated(["respondent", "timestamp_utc"], keep=False),
+        ["respondent", "timestamp_utc"],
+    ]
+    if not duplicated.empty:
+        examples = duplicated.drop_duplicates().head(5).astype(str).to_dict("records")
+        raise ValueError(f"Duplicate demand keys in scoring history: {examples}")
+    frame = frame.sort_values("timestamp_utc")
     if frame["respondent"].nunique() != 1:
         raise ValueError("Score one respondent per invocation.")
     origin = frame.timestamp_utc.max() if origin_utc is None else pd.to_datetime(origin_utc, utc=True)
