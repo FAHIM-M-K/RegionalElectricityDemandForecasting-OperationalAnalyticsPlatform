@@ -15,6 +15,42 @@ EXPERIMENT_NAME = "/Shared/ERCOT_MultiHorizon_Forecast_Platform"
 client = mlflow.tracking.MlflowClient()
 
 
+def _compatible_production_runs(experiment_id: str, horizon: int):
+    """Return current-schema production runs, newest first."""
+    production = client.search_runs(
+        [experiment_id],
+        filter_string=f"tags.pipeline_role = 'PRODUCTION' AND tags.target_horizon = 'H{horizon}'",
+        order_by=["start_time DESC"],
+        max_results=10,
+    )
+    return [run for run in production
+            if run.data.params.get("feature_schema_version") == FEATURE_SCHEMA_VERSION]
+
+
+def _report_retained_production(experiment_id: str, horizon: int) -> bool:
+    """Make candidate rejection distinct from loss of the serving model."""
+    compatible = _compatible_production_runs(experiment_id, horizon)
+    if not compatible:
+        print(f"H{horizon}: no current-schema production model is available.")
+        return False
+    incumbent = compatible[0]
+    params, metrics = incumbent.data.params, incumbent.data.metrics
+    policy = params.get("promotion_policy_version")
+    policy_label = (f"policy {policy}" if policy == PROMOTION_POLICY_VERSION
+                    else f"legacy/unrecorded policy {policy!r}")
+    baseline = "daily" if horizon == 24 else "weekly"
+    selection = metrics.get("selection_mae")
+    naive = metrics.get("selection_baseline_mae")
+    selection_text = f"{selection:,.1f}" if selection is not None and np.isfinite(selection) else "unavailable"
+    naive_text = f"{naive:,.1f}" if naive is not None and np.isfinite(naive) else "unavailable"
+    print(
+        f"H{horizon}: retaining production run {incumbent.info.run_id} "
+        f"({policy_label}; selection MAE {selection_text} MW "
+        f"vs {naive_text} MW {baseline} naive)."
+    )
+    return True
+
+
 def validate_and_promote_horizon(horizon: int, candidate_run_id: str | None = None) -> bool:
     experiment = client.get_experiment_by_name(EXPERIMENT_NAME)
     if experiment is None:
@@ -75,6 +111,7 @@ def validate_and_promote_horizon(horizon: int, candidate_run_id: str | None = No
             f"{decision['baseline_peak_mae']:,.1f} MW; "
             f"window win rate {decision['win_rate']:.0%}."
         )
+        _report_retained_production(experiment.experiment_id, horizon)
         return False
 
     incumbents = client.search_runs([experiment.experiment_id],
@@ -101,16 +138,7 @@ if __name__ == "__main__":
     experiment = client.get_experiment_by_name(EXPERIMENT_NAME)
     missing_production = []
     for horizon in HORIZONS:
-        production = client.search_runs(
-            [experiment.experiment_id],
-            filter_string=f"tags.pipeline_role = 'PRODUCTION' AND tags.target_horizon = 'H{horizon}'",
-            order_by=["start_time DESC"], max_results=10,
-        )
-        compatible = any(
-            run.data.params.get("feature_schema_version") == FEATURE_SCHEMA_VERSION
-            for run in production
-        )
-        if not compatible:
+        if not _compatible_production_runs(experiment.experiment_id, horizon):
             missing_production.append(f"H{horizon}")
     for horizon in HORIZONS:
         status = "PROMOTED" if horizon not in missing_production and decisions[horizon] else (
