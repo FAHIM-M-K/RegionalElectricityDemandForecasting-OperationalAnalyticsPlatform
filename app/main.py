@@ -10,13 +10,17 @@ st.set_page_config(page_title="ERCOT Demand Forecast", layout="wide")
 st.title("ERCOT Demand Forecast")
 st.caption("H24 is the day-ahead forecast. H168 is a separate model forecast for all 168 hours of the week-ahead horizon.")
 
-forecast, status, monitoring = load_operational_forecast_data()
+with st.spinner("Connecting to Databricks and loading the latest forecast…"):
+    forecast, status, monitoring = load_operational_forecast_data()
 if status.startswith("Stale"):
     st.warning(status)
 else:
     st.caption(status)
 if forecast.empty:
-    st.info("No persisted forecast is available. Run the scoring workflow after an H24 production model has been promoted.")
+    if status.startswith("Forecast unavailable") or status == "Databricks connection is not configured":
+        st.error(status)
+    else:
+        st.info(status or "No persisted forecast is available yet.")
     st.stop()
 
 horizon = st.radio("Forecast product", [24, 168], horizontal=True,
