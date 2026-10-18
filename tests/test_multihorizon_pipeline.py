@@ -4,7 +4,11 @@ import numpy as np
 import pandas as pd
 
 from src.gold.build_forecast_examples import generate_forecast_examples_df
-from src.mlops.backtest_multihorizon import compute_naive_baselines, generate_chronological_splits
+from src.mlops.backtest_multihorizon import (
+    compute_naive_baselines,
+    evaluate_promotion_gate,
+    generate_chronological_splits,
+)
 from src.gold.score_forecast_hourly import generate_independent_forecasts
 from src.shared.forecast_contract import validate_example_record
 from src.shared.ercot_zones import canonical_zone_code, source_to_zone_code_map
@@ -83,6 +87,45 @@ def test_chronological_splits_reserve_final_holdout():
     splits = generate_chronological_splits(pd.Series(origins), n_test_windows=3)
     assert splits[-1]["kind"] == "final_holdout"
     assert all(split["test_end"] <= splits[-1]["test_start"] for split in splits[:-1])
+
+
+def _promotion_windows(candidate_maes, baseline_maes=None, candidate_peak=1_000.0, baseline_peak=1_000.0):
+    baseline_maes = baseline_maes or [2_000.0] * len(candidate_maes)
+    return [
+        {"candidate_mae": candidate, "baseline_mae": baseline,
+         "candidate_peak_mae": candidate_peak, "baseline_peak_mae": baseline_peak}
+        for candidate, baseline in zip(candidate_maes, baseline_maes)
+    ]
+
+
+def test_promotion_gate_requires_repeatable_improvement_and_peak_guard():
+    accepted = evaluate_promotion_gate(_promotion_windows([1_800.0, 1_900.0, 1_950.0, 1_700.0]))
+    assert accepted["accepted"]
+    assert accepted["win_rate"] == 1.0
+
+    weak_repeatability = evaluate_promotion_gate(
+        _promotion_windows([1_500.0, 1_500.0, 2_100.0, 2_100.0])
+    )
+    assert not weak_repeatability["accepted"]
+    assert "wins only 50%" in weak_repeatability["reason"]
+
+    peak_regression = evaluate_promotion_gate(
+        _promotion_windows([1_800.0] * 4, candidate_peak=1_100.0)
+    )
+    assert not peak_regression["accepted"]
+    assert "peak-hour MAE regresses" in peak_regression["reason"]
+
+
+def test_promotion_gate_rejects_insufficient_or_incomplete_windows():
+    insufficient = evaluate_promotion_gate(_promotion_windows([1_800.0] * 3))
+    assert not insufficient["accepted"]
+    assert "at least 4" in insufficient["reason"]
+
+    incomplete_windows = _promotion_windows([1_800.0] * 4)
+    incomplete_windows[2]["candidate_peak_mae"] = np.nan
+    incomplete = evaluate_promotion_gate(incomplete_windows)
+    assert not incomplete["accepted"]
+    assert incomplete["reason"] == "selection window metrics are incomplete"
 
 
 def test_scoring_issues_both_products_and_rejects_missing_model():

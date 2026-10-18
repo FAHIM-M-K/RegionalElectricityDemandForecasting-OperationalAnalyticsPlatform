@@ -6,6 +6,54 @@ import numpy as np
 import pandas as pd
 
 
+PROMOTION_POLICY_VERSION = "rolling_win_rate_and_peak_guard_v1"
+MIN_SELECTION_WINDOWS = 4
+MIN_WINDOW_WIN_RATE = 0.75
+MAX_PEAK_MAE_REGRESSION = 0.05
+
+
+def evaluate_promotion_gate(window_metrics: list[Dict[str, float]]) -> Dict[str, Any]:
+    """Require aggregate skill, repeatability, and bounded peak-hour regression.
+
+    Each item contains candidate_mae, baseline_mae, candidate_peak_mae, and
+    baseline_peak_mae for one chronological selection window. This rule is
+    intentionally small and uses selection data only; the final holdout is not
+    an input to promotion.
+    """
+    required = ("candidate_mae", "baseline_mae", "candidate_peak_mae", "baseline_peak_mae")
+    if len(window_metrics) < MIN_SELECTION_WINDOWS:
+        return {"accepted": False, "reason": f"requires at least {MIN_SELECTION_WINDOWS} selection windows",
+                "window_count": len(window_metrics), "win_rate": np.nan,
+                "candidate_mae": np.nan, "baseline_mae": np.nan,
+                "candidate_peak_mae": np.nan, "baseline_peak_mae": np.nan}
+    if any(any(key not in window or not np.isfinite(window[key]) for key in required)
+           for window in window_metrics):
+        return {"accepted": False, "reason": "selection window metrics are incomplete",
+                "window_count": len(window_metrics), "win_rate": np.nan,
+                "candidate_mae": np.nan, "baseline_mae": np.nan,
+                "candidate_peak_mae": np.nan, "baseline_peak_mae": np.nan}
+
+    candidate_mae = float(np.mean([w["candidate_mae"] for w in window_metrics]))
+    baseline_mae = float(np.mean([w["baseline_mae"] for w in window_metrics]))
+    candidate_peak = float(np.mean([w["candidate_peak_mae"] for w in window_metrics]))
+    baseline_peak = float(np.mean([w["baseline_peak_mae"] for w in window_metrics]))
+    win_rate = float(np.mean([w["candidate_mae"] < w["baseline_mae"] for w in window_metrics]))
+
+    failures = []
+    if candidate_mae >= baseline_mae:
+        failures.append("aggregate MAE does not beat the seasonal baseline")
+    if win_rate < MIN_WINDOW_WIN_RATE:
+        failures.append(f"candidate wins only {win_rate:.0%} of selection windows")
+    if candidate_peak > baseline_peak * (1.0 + MAX_PEAK_MAE_REGRESSION):
+        failures.append(
+            f"peak-hour MAE regresses by more than {MAX_PEAK_MAE_REGRESSION:.0%}"
+        )
+    return {"accepted": not failures, "reason": "; ".join(failures) if failures else "passed",
+            "window_count": len(window_metrics), "win_rate": win_rate,
+            "candidate_mae": candidate_mae, "baseline_mae": baseline_mae,
+            "candidate_peak_mae": candidate_peak, "baseline_peak_mae": baseline_peak}
+
+
 def compute_metrics(y_true, y_pred, peak_mask=None) -> Dict[str, float]:
     actual, predicted = np.asarray(y_true, float), np.asarray(y_pred, float)
     valid = np.isfinite(actual) & np.isfinite(predicted)

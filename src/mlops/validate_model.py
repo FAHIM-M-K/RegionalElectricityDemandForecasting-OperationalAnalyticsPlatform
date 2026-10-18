@@ -8,6 +8,7 @@ holdout is retained for reporting and does not affect model promotion.
 import numpy as np
 import mlflow
 
+from src.mlops.backtest_multihorizon import PROMOTION_POLICY_VERSION, evaluate_promotion_gate
 from src.shared.forecast_contract import FEATURE_SCHEMA_VERSION, HORIZONS
 
 EXPERIMENT_NAME = "/Shared/ERCOT_MultiHorizon_Forecast_Platform"
@@ -41,15 +42,39 @@ def validate_and_promote_horizon(horizon: int, candidate_run_id: str | None = No
             f"H{horizon} candidate uses feature schema {candidate_schema!r}; "
             f"expected {FEATURE_SCHEMA_VERSION!r}. Re-run retraining from the current code."
         )
+    candidate_policy = candidate.data.params.get("promotion_policy_version")
+    if candidate_policy != PROMOTION_POLICY_VERSION:
+        client.set_tag(candidate_run_id, "pipeline_role", "REJECTED_CANDIDATE")
+        raise RuntimeError(
+            f"H{horizon} candidate was trained under promotion policy {candidate_policy!r}; "
+            f"expected {PROMOTION_POLICY_VERSION!r}. Re-run retraining from the current code."
+        )
     metrics = candidate.data.metrics
     score, baseline, peak_score = (metrics.get(key) for key in
         ("selection_mae", "selection_baseline_mae", "selection_peak_mae"))
     if any(value is None or not np.isfinite(value) for value in (score, baseline, peak_score)):
         client.set_tag(candidate_run_id, "pipeline_role", "REJECTED_CANDIDATE")
         raise ValueError(f"H{horizon} candidate has incomplete rolling-selection metrics.")
-    if score >= baseline:
+    baseline_name = "daily" if horizon == 24 else "weekly"
+    window_count = int(candidate.data.params.get("selection_windows", 0))
+    window_metrics = []
+    for window_index in range(1, window_count + 1):
+        window_metrics.append({
+            "candidate_mae": metrics.get(f"selection_window_{window_index}_model_mae", np.nan),
+            "baseline_mae": metrics.get(f"selection_window_{window_index}_baseline_mae", np.nan),
+            "candidate_peak_mae": metrics.get(f"selection_window_{window_index}_model_peak_mae", np.nan),
+            "baseline_peak_mae": metrics.get(f"selection_window_{window_index}_baseline_peak_mae", np.nan),
+        })
+    decision = evaluate_promotion_gate(window_metrics)
+    if not decision["accepted"]:
         client.set_tag(candidate_run_id, "pipeline_role", "REJECTED_CANDIDATE")
-        print(f"H{horizon} rejected: candidate MAE {score:,.1f} did not beat naive baseline {baseline:,.1f} MW.")
+        print(
+            f"H{horizon} rejected: {decision['reason']}. "
+            f"Rolling MAE {score:,.1f} vs {baseline:,.1f} MW; "
+            f"peak MAE {decision['candidate_peak_mae']:,.1f} vs "
+            f"{decision['baseline_peak_mae']:,.1f} MW; "
+            f"window win rate {decision['win_rate']:.0%}."
+        )
         return False
 
     incumbents = client.search_runs([experiment.experiment_id],
@@ -59,7 +84,12 @@ def validate_and_promote_horizon(horizon: int, candidate_run_id: str | None = No
     client.set_tag(candidate_run_id, "target_horizon", f"H{horizon}")
     for incumbent in incumbents:
         client.set_tag(incumbent.info.run_id, "pipeline_role", "ARCHIVED")
-    print(f"H{horizon} promoted: rolling MAE {score:,.1f} MW vs naive {baseline:,.1f} MW; peak-hour MAE {peak_score:,.1f} MW.")
+    print(
+        f"H{horizon} promoted: rolling MAE {score:,.1f} vs {baseline:,.1f} MW; "
+        f"peak MAE {decision['candidate_peak_mae']:,.1f} vs "
+        f"{decision['baseline_peak_mae']:,.1f} MW; "
+        f"window win rate {decision['win_rate']:.0%}."
+    )
     return True
 
 

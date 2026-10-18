@@ -24,7 +24,11 @@ for _ in range(5):
         break
     _root = os.path.dirname(_root)
 
-from src.mlops.backtest_multihorizon import compute_metrics, compute_naive_baselines, generate_chronological_splits
+from src.mlops.backtest_multihorizon import (
+    MAX_PEAK_MAE_REGRESSION, MIN_SELECTION_WINDOWS, MIN_WINDOW_WIN_RATE,
+    PROMOTION_POLICY_VERSION, compute_metrics, compute_naive_baselines,
+    generate_chronological_splits,
+)
 from src.shared.forecast_contract import FEATURE_SCHEMA_VERSION, HORIZONS, features_for_horizon
 
 try:
@@ -101,8 +105,11 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
         if fit_train.empty or validation.empty or test.empty:
             continue
         selection_results.append(_score(_fit(fit_train, validation, features), test, horizon, include_eia=(horizon == 24)))
-    if not selection_results:
-        raise ValueError(f"H{horizon} has no usable rolling selection windows.")
+    if len(selection_results) < MIN_SELECTION_WINDOWS:
+        raise ValueError(
+            f"H{horizon} has {len(selection_results)} usable rolling selection windows; "
+            f"at least {MIN_SELECTION_WINDOWS} are required for promotion evaluation."
+        )
 
     final = next(item for item in splits if item["kind"] == "final_holdout")
     validation_start = final["test_start"] - pd.Timedelta(days=30)
@@ -141,7 +148,22 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
                               "final_holdout_weekly_naive_mae": final_result["weekly"]["mae"]}
             if np.isfinite(final_result["eia"]["mae"]):
                 logged_metrics["final_holdout_eia_mae"] = final_result["eia"]["mae"]
+            baseline_name = "daily" if horizon == 24 else "weekly"
+            logged_metrics["selection_baseline_peak_mae"] = _mean_metric(
+                selection_results, baseline_name, "peak_mae"
+            )
+            for window_index, window_result in enumerate(selection_results, start=1):
+                logged_metrics.update({
+                    f"selection_window_{window_index}_model_mae": window_result["model"]["mae"],
+                    f"selection_window_{window_index}_baseline_mae": window_result[baseline_name]["mae"],
+                    f"selection_window_{window_index}_model_peak_mae": window_result["model"]["peak_mae"],
+                    f"selection_window_{window_index}_baseline_peak_mae": window_result[baseline_name]["peak_mae"],
+                })
             mlflow.log_metrics(logged_metrics)
+            mlflow.log_params({"promotion_policy_version": PROMOTION_POLICY_VERSION,
+                               "minimum_selection_windows": MIN_SELECTION_WINDOWS,
+                               "minimum_window_win_rate": MIN_WINDOW_WIN_RATE,
+                               "maximum_peak_mae_regression": MAX_PEAK_MAE_REGRESSION})
             mlflow.log_dict({"horizon_hours": horizon, "importance_type": "gain",
                              "features": [{"feature_name": name, "gain_importance": float(value)}
                                           for name, value in zip(booster.feature_name(), booster.feature_importance("gain"))]},
