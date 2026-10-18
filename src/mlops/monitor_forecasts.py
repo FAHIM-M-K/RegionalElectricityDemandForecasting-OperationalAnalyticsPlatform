@@ -44,22 +44,34 @@ if __name__ == "__main__" and "spark" in globals():
         spark.table(FACT)
         .select("respondent", "timestamp_utc", "actual_demand_mw")
         .filter(F.col("actual_demand_mw").isNotNull())
+        # Compare hour instants in UTC rather than relying on implicit casts
+        # between timestamp and timestamp_ntz columns from different tables.
+        .withColumn("_actual_epoch_seconds", F.unix_timestamp("timestamp_utc"))
     )
     _assert_unique(actuals, ["respondent", "timestamp_utc"], "actual demand")
+    issued_with_key = issued.withColumn(
+        "_target_epoch_seconds", F.unix_timestamp("target_timestamp_utc")
+    )
     evaluated = (
-        issued.join(
+        issued_with_key.join(
             actuals,
-            (issued.respondent == actuals.respondent)
-            & (issued.target_timestamp_utc == actuals.timestamp_utc),
+            (issued_with_key.respondent == actuals.respondent)
+            & (issued_with_key._target_epoch_seconds == actuals._actual_epoch_seconds),
             "inner",
         )
-        .select(issued["*"], actuals.actual_demand_mw.alias("actual_demand_mw"))
+        .select(issued_with_key["*"], actuals.actual_demand_mw.alias("actual_demand_mw"))
+        .drop("_target_epoch_seconds")
         .filter(F.col("predicted_demand_mw").isNotNull())
         .withColumn(
             "absolute_error_mw",
             F.abs(F.col("predicted_demand_mw") - F.col("actual_demand_mw")),
         )
     )
+    if evaluated.limit(1).count() == 0:
+        raise RuntimeError(
+            f"No issued forecasts matched non-null actual demand in {FACT}; "
+            f"leaving {METRICS} unchanged. Check UTC hourly timestamps and respondent keys."
+        )
     daily = evaluated.groupBy(
         "model_run_id",
         "horizon_hours",
