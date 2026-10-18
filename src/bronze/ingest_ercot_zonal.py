@@ -84,6 +84,9 @@ EXPECTED_SUBREGIONS = {
         {"code": "SOUTH"}, {"code": "EAST"}, {"code": "WEST"}, {"code": "NORTH"}
     ])
 }
+from src.shared.ercot_zones import canonical_zone_code, source_to_zone_code_map
+
+SOURCE_TO_ZONE_CODE = source_to_zone_code_map(eia_cfg.get("subregions", []))
 
 # COMMAND ----------
 # DBTITLE 1,High-Water Mark Detection
@@ -117,6 +120,25 @@ end_param = f"{end_date_str}T23"
 # DBTITLE 1,Paginated EIA Subregion API Client
 class RetryableEIARequestError(RuntimeError):
     """Transient EIA/API gateway failure after bounded retries."""
+
+
+class IncompleteEIAWindowError(RuntimeError):
+    """A completed response window omitted one or more configured zones."""
+
+
+def validate_window_subregions(records, start: str, end: str):
+    """Fail a window before caching/writing it if any configured zone is absent."""
+    received = {
+        canonical_zone_code(record.get("subba") or record.get("subregion") or "", SOURCE_TO_ZONE_CODE)
+        for record in records
+    }
+    received.discard("")
+    missing = EXPECTED_SUBREGIONS - received
+    if missing:
+        raise IncompleteEIAWindowError(
+            f"EIA window {start} to {end} is incomplete: missing subregions {sorted(missing)}; "
+            f"received {sorted(received)}. Window was not checkpointed or written."
+        )
 
 
 def fetch_eia_subregion_dataset(
@@ -283,17 +305,19 @@ for window_index, (window_start, window_end) in enumerate(date_ranges, start=1):
                         for page in window_payloads
                         for record in page["response_envelope"]["response"]["data"]
                     ]
+                    validate_window_subregions(window_records, window_start, window_end)
                     reused_checkpoint = bool(window_records)
-            except (OSError, ValueError, KeyError, TypeError):
+            except (OSError, ValueError, KeyError, TypeError, IncompleteEIAWindowError):
                 # An incomplete checkpoint from an interrupted write is safely
                 # replaced by a fresh API fetch below.
-                pass
+                window_records, window_payloads, reused_checkpoint = [], [], False
 
     if reused_checkpoint:
         print(f"[RESUME] Reusing {len(window_records):,} cached records for {window_start} to {window_end}.")
     else:
         print(f"[BACKFILL] Fetching date window {window_index}/{len(date_ranges)}: {window_start} to {window_end}.")
         window_records, window_payloads = fetch_window_with_split_fallback(window_start, window_end)
+        validate_window_subregions(window_records, window_start, window_end)
         if resume_backfill and window_records:
             temp_path = f"{checkpoint_path}.tmp"
             with open(temp_path, "w", encoding="utf-8") as checkpoint_file:
@@ -345,8 +369,9 @@ if records:
     ).count()
     assert null_key_count == 0, f"Integrity Failure: Found {null_key_count} records with null primary keys."
 
-    present_subregions = set(row[subba_col] for row in source_deduped.select(subba_col).distinct().collect())
-    print(f"Verified present subregions in batch: {present_subregions}")
+    present_source_codes = set(row[subba_col] for row in source_deduped.select(subba_col).distinct().collect())
+    present_subregions = {canonical_zone_code(code, SOURCE_TO_ZONE_CODE) for code in present_source_codes}
+    print(f"Verified EIA source codes: {present_source_codes}; canonical zones: {present_subregions}")
     source_deduped.groupBy(subba_col).count().orderBy(subba_col).show(truncate=False)
 
     # F-03 & P1-06: Subregion completeness gate against expected subregions

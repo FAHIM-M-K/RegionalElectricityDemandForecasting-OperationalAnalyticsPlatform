@@ -16,14 +16,14 @@
     "page_size": 5000,
     "default_start_date": "2021-01-01T00",
     "subregions": [
-      {"code": "NCENT", "name": "North Central"},
-      {"code": "COAST", "name": "Coast"},
-      {"code": "SCENT", "name": "South Central"},
-      {"code": "FWEST", "name": "Far West"},
-      {"code": "SOUTH", "name": "South"},
-      {"code": "EAST",  "name": "East"},
-      {"code": "WEST",  "name": "West"},
-      {"code": "NORTH", "name": "North"}
+      {"code": "NCENT", "eia_code": "NCEN", "name": "North Central"},
+      {"code": "COAST", "eia_code": "COAS", "name": "Coast"},
+      {"code": "SCENT", "eia_code": "SCEN", "name": "South Central"},
+      {"code": "FWEST", "eia_code": "FWES", "name": "Far West"},
+      {"code": "SOUTH", "eia_code": "SOUT", "name": "South"},
+      {"code": "EAST",  "eia_code": "EAST", "name": "East"},
+      {"code": "WEST",  "eia_code": "WEST", "name": "West"},
+      {"code": "NORTH", "eia_code": "NRTH", "name": "North"}
     ]
   },
   "weather": {

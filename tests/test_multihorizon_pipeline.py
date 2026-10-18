@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 import pandas as pd
 
@@ -5,6 +7,7 @@ from src.gold.build_forecast_examples import generate_forecast_examples_df
 from src.mlops.backtest_multihorizon import compute_naive_baselines, generate_chronological_splits
 from src.gold.score_forecast_hourly import generate_independent_forecasts
 from src.shared.forecast_contract import validate_example_record
+from src.shared.ercot_zones import canonical_zone_code, source_to_zone_code_map
 
 
 def _hourly(hours=800, gap=None):
@@ -53,6 +56,14 @@ def test_model_seasonal_feature_matches_horizon_baseline():
     h168 = examples[examples.horizon_hours == 168]
     assert np.allclose(h24.seasonal_naive_mw, h24.daily_naive_mw)
     assert np.allclose(h168.seasonal_naive_mw, h168.weekly_naive_mw)
+
+
+def test_eia_source_zone_aliases_resolve_to_project_codes():
+    config = json.loads(open("configs/ercot_config.json", encoding="utf-8").read())
+    mapping = source_to_zone_code_map(config["eia"]["subregions"])
+    assert {canonical_zone_code(code, mapping) for code in mapping} == {
+        "NCENT", "COAST", "SCENT", "FWEST", "SOUTH", "EAST", "WEST", "NORTH"
+    }
 
 
 def test_contract_rejects_misaligned_target():

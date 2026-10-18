@@ -44,9 +44,11 @@ for _ in range(5):
     _repo_root = _parent
 
 from configs.loader import load_platform_config
+from src.shared.ercot_zones import source_to_zone_code_map
 
 config = load_platform_config("ercot_config.json")
 REGION_TIMEZONE = config.get("region", {}).get("timezone", "America/Chicago")
+SOURCE_TO_ZONE_CODE = source_to_zone_code_map(config.get("eia", {}).get("subregions", []))
 
 ZONE_NAMES = {
     "NCENT": "North Central",
@@ -69,6 +71,12 @@ assert spark.table(SOURCE_ZONAL_TABLE).count() > 0, f"Fatal: Upstream table {SOU
 subba_col = "subba" if "subba" in spark.table(SOURCE_ZONAL_TABLE).columns else "subregion"
 subba_name_col = "subba_name" if "subba_name" in spark.table(SOURCE_ZONAL_TABLE).columns else "subregion_name"
 
+zone_code_map = F.create_map(*[
+    value
+    for source_code, canonical_code in SOURCE_TO_ZONE_CODE.items()
+    for value in (F.lit(source_code), F.lit(canonical_code))
+])
+
 df_raw = spark.table(SOURCE_ZONAL_TABLE) \
     .filter(F.col("parent") == "ERCO") \
     .filter(F.col(subba_col).isNotNull()) \
@@ -78,7 +86,9 @@ df_raw = spark.table(SOURCE_ZONAL_TABLE) \
     .withColumn("hour_local", F.hour(F.col("timestamp_local"))) \
     .withColumn("day_of_week_local", F.dayofweek(F.col("timestamp_local"))) \
     .withColumn("demand_actual_mw", F.col("value").cast(DoubleType())) \
-    .withColumn("zone_code", F.upper(F.trim(F.col(subba_col)))) \
+    .withColumn("_source_zone_code", F.upper(F.trim(F.col(subba_col)))) \
+    .withColumn("zone_code", F.coalesce(F.element_at(zone_code_map, F.col("_source_zone_code")), F.col("_source_zone_code"))) \
+    .drop("_source_zone_code") \
     .withColumn(
         "zone_name",
         F.coalesce(
