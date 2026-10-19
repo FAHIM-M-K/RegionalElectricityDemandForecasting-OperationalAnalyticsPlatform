@@ -156,18 +156,19 @@ print(
     f"from {origins[0]} onward. Each request bundles all four stations; checkpoints occur every "
     f"{CHECKPOINT_EVERY_RUNS} runs and can be resumed safely."
 )
-existing_keys = set()
+existing_origins = set()
 if spark.catalog.tableExists(TARGET_TABLE):
-    existing_keys = {
-        (pd.to_datetime(row["forecast_origin_utc"], utc=True).to_pydatetime(),
-         pd.to_datetime(row["weather_run_init_utc"], utc=True).to_pydatetime())
+    existing_origins = {
+        pd.to_datetime(row["forecast_origin_utc"], utc=True).to_pydatetime()
         for row in spark.table(TARGET_TABLE)
         .filter(F.col("forecast_origin_utc") >= F.lit(ARCHIVE_START_UTC))
-        .select("forecast_origin_utc", "weather_run_init_utc").distinct().collect()
+        .groupBy("forecast_origin_utc").count()
+        .filter(F.col("count") == HORIZON_HOURS)
+        .select("forecast_origin_utc").collect()
     }
 pending_rows = []
 processed_since_checkpoint = 0
-incomplete_origins = []
+run_temperature_cache = {}
 
 
 def checkpoint(rows_to_write: list[dict]) -> None:
@@ -186,13 +187,10 @@ def checkpoint(rows_to_write: list[dict]) -> None:
         ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
 
 
-for request_index, run_init in enumerate(run_inits, start=1):
-    run_origins = [
-        origin for origin in origins
-        if selected[origin][0] == run_init and (origin, run_init) not in existing_keys
-    ]
-    if not run_origins:
-        continue
+def temperature_map_for_run(run_init: dt.datetime) -> dict:
+    """Load aligned station-hour data once per vintage and retain nulls for diagnosis."""
+    if run_init in run_temperature_cache:
+        return run_temperature_cache[run_init]
     payloads = request_run(run_init)
     times_by_station = []
     temps_by_station = []
@@ -206,51 +204,82 @@ for request_index, run_init in enumerate(run_inits, start=1):
         temps_by_station.append(temps)
     if any(times != times_by_station[0] for times in times_by_station[1:]):
         raise RuntimeError(f"Station target timestamps differ within ECMWF run {run_init}.")
-    temperature_by_station_time = {
+    run_temperature_cache[run_init] = {
         station["station_id"]: dict(zip(times_by_station[index], temps_by_station[index]))
         for index, station in enumerate(stations)
     }
+    return run_temperature_cache[run_init]
+
+
+def build_complete_origin(origin: dt.datetime, run_init: dt.datetime) -> tuple[list[dict] | None, dict | None]:
+    """Build a full H168 weather vintage, returning a precise gap if it is incomplete."""
+    available_at = run_init + dt.timedelta(hours=CONSERVATIVE_PUBLICATION_DELAY_HOURS)
+    issue_proxy = selected[origin][2]
+    temperatures = temperature_map_for_run(run_init)
+    origin_rows = []
+    for lead in range(1, HORIZON_HOURS + 1):
+        target = origin + dt.timedelta(hours=lead)
+        station_values = {
+            station["station_id"]: temperatures[station["station_id"]].get(target)
+            for station in stations
+        }
+        missing = [
+            {"station": station_id,
+             "reason": "timestamp_absent" if target not in temperatures[station_id] else "temperature_null"}
+            for station_id, value in station_values.items() if value is None
+        ]
+        if missing:
+            return None, {"target": target, "missing": missing, "run_init": run_init}
+        station_values = {key: float(value) for key, value in station_values.items()}
+        weighted_c = sum(station_values[key] * weights[key] for key in weights)
+        weighted_f = weighted_c * 9.0 / 5.0 + 32.0
+        origin_rows.append({
+            "respondent": "ERCO",
+            "forecast_origin_utc": origin,
+            "target_timestamp_utc": target,
+            "lead_hours": lead,
+            "weather_model": MODEL,
+            "weather_run_init_utc": run_init,
+            "weather_available_at_utc": available_at,
+            "weather_issue_time_proxy_utc": issue_proxy,
+            "weighted_temperature_f": round(weighted_f, 3),
+            "cdh_65_forecast": round(max(weighted_f - 65.0, 0.0), 3),
+            "hdh_65_forecast": round(max(65.0 - weighted_f, 0.0), 3),
+            **{f"temperature_{key}_c": value for key, value in station_values.items()},
+        })
+    return origin_rows, None
+
+
+for request_index, run_init in enumerate(run_inits, start=1):
+    run_origins = [
+        origin for origin in origins
+        if selected[origin][0] == run_init and origin not in existing_origins
+    ]
+    if not run_origins:
+        continue
     for origin in run_origins:
-        _, available_at, issue_proxy = selected[origin]
-        origin_rows = []
-        missing_weather = None
-        for lead in range(1, HORIZON_HOURS + 1):
-            target = origin + dt.timedelta(hours=lead)
-            station_values = {
-                station["station_id"]: temperature_by_station_time[station["station_id"]].get(target)
-                for station in stations
-            }
-            if any(value is None for value in station_values.values()):
-                missing_weather = {
-                    "target": target,
-                    "stations": [key for key, value in station_values.items() if value is None],
-                }
-                break
-            station_values = {key: float(value) for key, value in station_values.items()}
-            weighted_c = sum(station_values[key] * weights[key] for key in weights)
-            weighted_f = weighted_c * 9.0 / 5.0 + 32.0
-            origin_rows.append({
-                "respondent": "ERCO",
-                "forecast_origin_utc": origin,
-                "target_timestamp_utc": target,
-                "lead_hours": lead,
-                "weather_model": MODEL,
-                "weather_run_init_utc": run_init,
-                "weather_available_at_utc": available_at,
-                "weather_issue_time_proxy_utc": issue_proxy,
-                "weighted_temperature_f": round(weighted_f, 3),
-                "cdh_65_forecast": round(max(weighted_f - 65.0, 0.0), 3),
-                "hdh_65_forecast": round(max(65.0 - weighted_f, 0.0), 3),
-                **{f"temperature_{key}_c": value for key, value in station_values.items()},
-            })
-        if missing_weather is not None:
-            incomplete_origins.append({
-                "origin": origin,
-                "target": missing_weather["target"],
-                "stations": missing_weather["stations"],
-                "run_init": run_init,
-            })
-            continue
+        origin_rows, gap = build_complete_origin(origin, run_init)
+        if gap is not None:
+            # Never fill with realized weather or a later forecast. Try older
+            # ECMWF cycles only when their conservative publication time still
+            # precedes the historical issue-time proxy.
+            fallback_init = run_init - dt.timedelta(hours=12)
+            while fallback_init + dt.timedelta(hours=CONSERVATIVE_PUBLICATION_DELAY_HOURS) <= selected[origin][2]:
+                fallback_rows, fallback_gap = build_complete_origin(origin, fallback_init)
+                if fallback_gap is None:
+                    print(
+                        f"Used prior eligible ECMWF vintage {fallback_init} for origin {origin}; "
+                        f"latest eligible vintage {run_init} has {gap['missing']} at {gap['target']}."
+                    )
+                    origin_rows = fallback_rows
+                    break
+                fallback_init -= dt.timedelta(hours=12)
+            else:
+                raise RuntimeError(
+                    f"No complete, issue-time-eligible ECMWF vintage covers origin {origin}. "
+                    f"Latest eligible run {run_init} is missing {gap['missing']} at {gap['target']}; "
+                    f"older eligible vintages were also incomplete. No partial origin was saved."
+                )
         if len(origin_rows) != HORIZON_HOURS:
             raise RuntimeError(f"Origin {origin} produced {len(origin_rows)} rows; expected {HORIZON_HOURS}.")
         pending_rows.extend(origin_rows)
@@ -262,7 +291,7 @@ for request_index, run_init in enumerate(run_inits, start=1):
     processed_since_checkpoint += 1
     if processed_since_checkpoint >= CHECKPOINT_EVERY_RUNS:
         checkpoint(pending_rows)
-        existing_keys.update((row["forecast_origin_utc"], row["weather_run_init_utc"]) for row in pending_rows)
+        existing_origins.update(row["forecast_origin_utc"] for row in pending_rows)
         print(f"Saved {len(pending_rows):,} rows; completed vintages can be resumed safely.")
         pending_rows = []
         processed_since_checkpoint = 0
@@ -270,19 +299,10 @@ for request_index, run_init in enumerate(run_inits, start=1):
 
 checkpoint(pending_rows)
 if pending_rows:
-    existing_keys.update((row["forecast_origin_utc"], row["weather_run_init_utc"]) for row in pending_rows)
+    existing_origins.update(row["forecast_origin_utc"] for row in pending_rows)
     print(f"Saved final batch of {len(pending_rows):,} rows.")
 if not spark.catalog.tableExists(TARGET_TABLE):
     raise RuntimeError("No weather backtest vintages were materialized.")
-if incomplete_origins:
-    examples = "; ".join(
-        f"origin {item['origin']} target {item['target']} missing {','.join(item['stations'])}"
-        for item in incomplete_origins[:5]
-    )
-    print(
-        f"Excluded {len(incomplete_origins)} origins with any missing station-hour "
-        f"(whole origins excluded from both models). Examples: {examples}"
-    )
 
 summary = spark.table(TARGET_TABLE).filter(
     F.col("forecast_origin_utc") >= F.lit(ARCHIVE_START_UTC)
