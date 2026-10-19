@@ -2,11 +2,11 @@
 # MAGIC %md
 # MAGIC # 01. EIA Electricity Load & Forecast Ingestion
 # MAGIC
-# MAGIC **Source:** U.S. Energy Information Administration (EIA) Open Data API v2 (Form EIA-930)  
-# MAGIC **Target:** `bronze.eia_hourly_raw`  
-# MAGIC **Series:** 
+# MAGIC **Source:** U.S. Energy Information Administration (EIA) Open Data API v2 (Form EIA-930)
+# MAGIC **Target:** `bronze.eia_hourly_raw`
+# MAGIC **Series:**
 # MAGIC - `D` = Actual Electricity Demand (MWh)
-# MAGIC - `DF` = Day-Ahead Demand Forecast (MWh)  
+# MAGIC - `DF` = Day-Ahead Demand Forecast (MWh)
 # MAGIC **Region:** ERCOT (`ERCO`)
 
 # COMMAND ----------
@@ -17,6 +17,7 @@ import time
 import datetime
 import urllib.request
 import urllib.parse
+import hashlib
 from pyspark.sql import functions as F
 from delta.tables import DeltaTable
 
@@ -42,6 +43,7 @@ assert EIA_API_KEY, (
 
 spark.sql(f"USE CATALOG {CATALOG}")
 spark.sql("USE SCHEMA bronze")
+spark.conf.set("spark.sql.session.timeZone", "UTC")
 
 # COMMAND ----------
 # DBTITLE 1,Load Configuration & Establish Boundaries
@@ -96,7 +98,7 @@ def fetch_eia_dataset(api_key: str, start: str, end: str, series_types: list, re
     all_records = []
     raw_responses = []
     offset = 0
-    
+
     while True:
         # Build query params including explicit series facets (e.g. facets[type][]=D & facets[type][]=DF)
         query_params = [
@@ -111,15 +113,15 @@ def fetch_eia_dataset(api_key: str, start: str, end: str, series_types: list, re
             ("offset", str(offset)),
             ("length", str(page_size))
         ]
-        
+
         # Explicitly filter only targeted series types (D: Demand, DF: Day-ahead Forecast)
         for stype in series_types:
             query_params.append(("facets[type][]", stype))
-            
+
         encoded_query = urllib.parse.urlencode(query_params)
         request_url = f"{EIA_BASE_URL}?{encoded_query}"
         req = urllib.request.Request(request_url, headers={"User-Agent": "ERCOT-Platform/1.0"})
-        
+
         payload = None
         for attempt in range(1, 4):
             try:
@@ -131,10 +133,10 @@ def fetch_eia_dataset(api_key: str, start: str, end: str, series_types: list, re
                 if attempt == 3:
                     raise RuntimeError(f"EIA API request failed at offset {offset}: {e}")
                 time.sleep(2 * attempt)
-                
+
         # Preserve sanitized query params (excluding api_key) for complete audit trail & replayability
         sanitized_params = {k: v for k, v in query_params if k != "api_key"}
-        
+
         raw_responses.append({
             "offset": offset,
             "page_size": page_size,
@@ -143,22 +145,22 @@ def fetch_eia_dataset(api_key: str, start: str, end: str, series_types: list, re
             "fetched_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "response_envelope": payload
         })
-        
+
         resp_obj = payload.get("response", {})
         batch = resp_obj.get("data", [])
         total = int(resp_obj.get("total", 0))
-        
+
         if not batch:
             break
-            
+
         all_records.extend(batch)
         offset += len(batch)
         print(f"  Retrieved {offset} / {total} records (Series: {series_types})...")
-        
+
         if offset >= total:
             break
         time.sleep(0.3)
-        
+
     return all_records, raw_responses
 
 # COMMAND ----------
@@ -218,11 +220,11 @@ distinct_types = set(row["type"] for row in source_deduped.select("type").distin
 # Assert that no unexpected types entered Bronze
 for t in distinct_types:
     assert t in EIA_SERIES_TYPES, f"Schema Leak: Found unexpected series type '{t}' not in {EIA_SERIES_TYPES}."
-    
+
 # Assert that ALL expected types are present in the batch
 for expected_type in EIA_SERIES_TYPES:
     assert expected_type in distinct_types, f"Completeness Failure: Expected series type '{expected_type}' was not returned by EIA API."
-    
+
 print(f"Quality Assertions Passed: 0 null keys. All expected series types confirmed present: {distinct_types}")
 
 # 4. Idempotent Upsert into Bronze Delta table using Null-Safe Equality (<=>)
@@ -248,6 +250,65 @@ else:
     ).whenNotMatchedInsertAll(
     ).execute()
     print(f"Idempotent MERGE completed on {TABLE_NAME} (null-safe equality enabled).")
+
+# COMMAND ----------
+# DBTITLE 2,Capture an as-observed EIA day-ahead benchmark vintage
+# Reuse the response already fetched above. This preserves what the pipeline
+# actually saw at this run time without issuing a second EIA API request.
+BENCHMARK_TABLE = f"{CATALOG}.bronze.eia_forecast_vintages"
+df_eia_forecast = df_bronze.filter(F.col("type") == F.lit("DF"))
+if df_eia_forecast.limit(1).count() == 0:
+    raise RuntimeError("Benchmark capture failed: the EIA response contained no DF day-ahead forecasts.")
+
+observed_at = datetime.datetime.now(datetime.timezone.utc)
+vintage_id = f"eia_df_{observed_at.strftime('%Y%m%dT%H%M%S%fZ')}"
+forecast_payload_for_hash = [
+    (str(row["period"]), float(row["value"]))
+    for row in df_eia_forecast.select("period", "value").orderBy("period").collect()
+    if row["value"] is not None
+]
+payload_sha256 = hashlib.sha256(
+    json.dumps(forecast_payload_for_hash, separators=(",", ":")).encode("utf-8")
+).hexdigest()
+
+benchmark_rows = (
+    df_eia_forecast
+    .filter(F.col("value").isNotNull())
+    .select(
+        F.lit("EIA").alias("benchmark_provider"),
+        F.lit("EIA-930-DF").alias("product_id"),
+        F.col("respondent"),
+        F.lit(vintage_id).alias("vintage_id"),
+        F.to_timestamp(F.col("period"), "yyyy-MM-dd'T'HH").alias("target_timestamp_utc"),
+        F.col("value").cast("double").alias("forecast_mw"),
+        F.lit(None).cast("timestamp").alias("published_at_utc"),
+        F.lit(observed_at).cast("timestamp").alias("first_observed_at_utc"),
+        F.lit(payload_sha256).alias("payload_sha256"),
+        F.lit(raw_file_path).alias("raw_payload_path"),
+    )
+)
+invalid_benchmark_rows = benchmark_rows.filter(
+    F.col("respondent").isNull() | F.col("target_timestamp_utc").isNull()
+    | F.col("forecast_mw").isNull() | (F.col("forecast_mw") <= 0)
+).limit(1).count()
+if invalid_benchmark_rows:
+    raise RuntimeError("EIA benchmark vintage contains null keys or invalid forecast values.")
+
+if not spark.catalog.tableExists(BENCHMARK_TABLE):
+    benchmark_rows.write.format("delta").mode("overwrite").saveAsTable(BENCHMARK_TABLE)
+else:
+    benchmark_delta = DeltaTable.forName(spark, BENCHMARK_TABLE)
+    benchmark_delta.alias("target").merge(
+        benchmark_rows.alias("source"),
+        "target.benchmark_provider = source.benchmark_provider "
+        "AND target.respondent = source.respondent "
+        "AND target.vintage_id = source.vintage_id "
+        "AND target.target_timestamp_utc = source.target_timestamp_utc",
+    ).whenNotMatchedInsertAll().execute()
+print(
+    f"Captured {len(forecast_payload_for_hash):,} EIA forecast vintage rows "
+    f"as observed at {observed_at.isoformat()} in {BENCHMARK_TABLE}."
+)
 
 # COMMAND ----------
 # MAGIC %sql

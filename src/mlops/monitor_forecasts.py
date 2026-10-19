@@ -29,13 +29,33 @@ def _assert_unique(df, keys, label):
 if __name__ == "__main__" and "spark" in globals():
     spark.conf.set("spark.sql.session.timeZone", "UTC")
     issued = spark.table(FORECASTS)
+    # Older stored issues may predate forecast_issue_id. Fall back to the full
+    # identity available in that schema while preserving distinct re-issues.
+    if "forecast_issue_id" in issued.columns:
+        issued = issued.withColumn(
+            "_monitor_issue_key",
+            F.coalesce(
+                F.col("forecast_issue_id"),
+                F.concat_ws(
+                    "|", F.col("model_run_id"), F.col("horizon_hours").cast("string"),
+                    F.col("forecast_origin_utc").cast("string"), F.col("issued_at_utc").cast("string"),
+                ),
+            ),
+        )
+    else:
+        issued = issued.withColumn(
+            "_monitor_issue_key",
+            F.concat_ws(
+                "|", F.col("model_run_id"), F.col("horizon_hours").cast("string"),
+                F.col("forecast_origin_utc").cast("string"), F.col("issued_at_utc").cast("string"),
+            ),
+        )
     _assert_unique(
         issued,
         [
             "respondent",
-            "model_run_id",
+            "_monitor_issue_key",
             "horizon_hours",
-            "forecast_origin_utc",
             "target_timestamp_utc",
         ],
         "forecast evaluation",
@@ -79,6 +99,8 @@ if __name__ == "__main__" and "spark" in globals():
         F.to_date("target_timestamp_utc").alias("target_date_utc"),
     ).agg(
         F.count("*").alias("evaluated_rows"),
+        F.countDistinct("target_timestamp_utc").alias("unique_targets"),
+        F.countDistinct("forecast_origin_utc").alias("issue_origins_count"),
         F.avg("absolute_error_mw").alias("mae_mw"),
         F.sqrt(
             F.avg(F.pow(F.col("predicted_demand_mw") - F.col("actual_demand_mw"), 2))
@@ -86,6 +108,7 @@ if __name__ == "__main__" and "spark" in globals():
         F.avg(F.col("predicted_demand_mw") - F.col("actual_demand_mw")).alias("bias_mw"),
     ).withColumn("computed_at_utc", F.current_timestamp())
     daily.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(METRICS)
+
     # Read counts from the small materialized metrics table; counting the source
     # DataFrames here would replay the full forecast/actual join and aggregation.
     totals = spark.table(METRICS).agg(

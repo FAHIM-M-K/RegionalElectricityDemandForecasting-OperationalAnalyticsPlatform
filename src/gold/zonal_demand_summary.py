@@ -11,8 +11,6 @@
 # DBTITLE 1,Imports & Geo Metadata Setup
 import os
 import sys
-import numpy as np
-import pandas as pd
 from pyspark.sql import functions as F
 
 _repo_root = os.getcwd()

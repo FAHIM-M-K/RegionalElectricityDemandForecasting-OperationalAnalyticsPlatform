@@ -18,9 +18,8 @@
 # COMMAND ----------
 # DBTITLE 1,Imports & Configuration
 import os
-import json
 from pyspark.sql import functions as F
-from pyspark.sql.types import DoubleType, TimestampType, StringType, BooleanType
+from pyspark.sql.types import DoubleType, StringType, BooleanType
 from delta.tables import DeltaTable
 
 CATALOG = "main"

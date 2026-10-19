@@ -16,7 +16,6 @@ spark.sql("USE SCHEMA bronze")
 # COMMAND ----------
 # DBTITLE 1,Build Full Calendar with Observed Federal Holidays
 import datetime
-from pyspark.sql import functions as F
 
 years = list(range(2021, 2029))  # Covers through 2028 for forward scoring
 calendar_records = []

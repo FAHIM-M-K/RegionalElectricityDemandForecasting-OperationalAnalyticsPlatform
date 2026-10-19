@@ -20,7 +20,7 @@ import os
 import sys
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
-from pyspark.sql.types import DoubleType, StringType, BooleanType, TimestampType
+from pyspark.sql.types import DoubleType
 from delta.tables import DeltaTable
 
 CATALOG = "main"

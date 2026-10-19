@@ -5,7 +5,7 @@ forecast origin.  H24 is day ahead and H168 is week ahead.  Training and
 scoring import this module so their feature definitions cannot drift apart.
 """
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 HORIZON_H24 = 24
@@ -23,9 +23,36 @@ EXAMPLE_GRAIN_KEYS = [
     "horizon_hours", "feature_set",
 ]
 EVALUATION_GRAIN_KEYS = [
-    "model_run_id", "horizon_hours", "forecast_origin_utc", "target_timestamp_utc",
+    "respondent", "forecast_issue_id", "horizon_hours", "target_timestamp_utc",
 ]
 SERVING_GRAIN_KEYS = ["respondent", "horizon_hours", "target_timestamp_utc"]
+BENCHMARK_GRAIN_KEYS = [
+    "benchmark_provider", "respondent", "vintage_id", "target_timestamp_utc",
+]
+
+MAX_STALE_ORIGIN_HOURS = 4.0
+MAX_FAIL_ORIGIN_HOURS = 6.0
+
+
+def generate_forecast_issue_id(
+    respondent: str, horizon_hours: int, forecast_origin_utc, issued_at_utc,
+    model_run_id: str | None = None,
+) -> str:
+    """Return a deterministic, unique issue identifier separate from model_run_id."""
+    def utc_key(value):
+        if isinstance(value, str):
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if not isinstance(value, datetime):
+            value = value.to_pydatetime()
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+
+    origin_str = utc_key(forecast_origin_utc)
+    issued_str = utc_key(issued_at_utc)
+    run_key = str(model_run_id or "unspecified")
+    return f"issue:{respondent}:H{horizon_hours}:{origin_str}:{issued_str}:{run_key}"
+
 
 OPERATIONAL_FEATURES_H24 = [
     "lead_hours", "seasonal_naive_mw", "hour_local", "day_of_week_local", "is_weekend", "is_holiday",
@@ -62,3 +89,62 @@ def validate_example_record(record: Dict[str, Any]) -> None:
     actual = record.get("actual_demand_mw")
     if actual is not None and not (DEMAND_MIN_VALID_MW <= actual <= DEMAND_MAX_VALID_MW):
         raise ValueError("Actual demand is outside configured ERCOT plausibility bounds.")
+
+
+def validate_forecast_issue_frame(df, expected_horizons: List[int] | None = None) -> None:
+    """Pre-publish validation asserting complete curves and physical bounds."""
+    if expected_horizons is None:
+        expected_horizons = HORIZONS
+    required = {
+        "respondent", "forecast_issue_id", "forecast_origin_utc", "target_timestamp_utc",
+        "issued_at_utc", "horizon_hours", "lead_hours", "predicted_demand_mw",
+    }
+    missing_columns = required - set(df.columns)
+    if missing_columns:
+        raise ValueError(f"Forecast issue is missing required columns: {sorted(missing_columns)}")
+    if df[list(required)].isna().any().any():
+        raise ValueError("Forecast issue contains null identity, time, horizon, lead, or prediction values.")
+    for horizon in expected_horizons:
+        subset = df[df["horizon_hours"] == horizon]
+        if subset.empty:
+            raise ValueError(f"Forecast issue is missing H{horizon}.")
+        if subset["respondent"].nunique() != 1 or subset["forecast_origin_utc"].nunique() != 1:
+            raise ValueError(f"H{horizon} issue mixes respondents or forecast origins.")
+        if subset["forecast_issue_id"].nunique() != 1:
+            raise ValueError(f"H{horizon} issue has more than one issue identifier.")
+        if (subset["issued_at_utc"].nunique() != 1):
+            raise ValueError(f"H{horizon} issue mixes issued-at timestamps.")
+        if (subset["target_timestamp_utc"] - subset["forecast_origin_utc"] !=
+                subset["lead_hours"].map(lambda lead: timedelta(hours=int(lead)))).any():
+            raise ValueError(f"H{horizon} contains a target timestamp inconsistent with its lead.")
+        if subset["lead_hours"].duplicated().any():
+            raise ValueError(f"H{horizon} contains duplicate lead hours.")
+    for horizon in expected_horizons:
+        subset = df[df["horizon_hours"] == horizon]
+        expected_count = len(LEAD_HOURS[horizon])
+        if len(subset) != expected_count:
+            raise ValueError(
+                f"Incomplete H{horizon} curve: expected {expected_count} leads, found {len(subset)}."
+            )
+        leads = sorted(subset["lead_hours"].tolist())
+        if leads != list(LEAD_HOURS[horizon]):
+            raise ValueError(f"H{horizon} curve has missing or non-continuous leads: {leads[:5]}...")
+        preds = subset["predicted_demand_mw"].dropna()
+        if len(preds) != expected_count:
+            raise ValueError(f"H{horizon} contains null predicted_demand_mw values.")
+        if (preds < DEMAND_MIN_VALID_MW).any() or (preds > DEMAND_MAX_VALID_MW).any():
+            raise ValueError(f"H{horizon} predictions exceed physical bounds ({DEMAND_MIN_VALID_MW}-{DEMAND_MAX_VALID_MW} MW).")
+        if not all(float(value) == float(value) and abs(float(value)) != float("inf") for value in preds):
+            raise ValueError(f"H{horizon} predictions contain non-finite values.")
+
+
+def validate_benchmark_vintage_record(record: Dict[str, Any]) -> None:
+    """Validate an append-only benchmark vintage record."""
+    for key in ("benchmark_provider", "respondent", "vintage_id", "target_timestamp_utc", "forecast_mw"):
+        if record.get(key) is None:
+            raise ValueError(f"Benchmark vintage missing required field: {key}")
+    if record.get("first_observed_at_utc") is None:
+        raise ValueError("Benchmark vintage requires first_observed_at_utc availability timestamp.")
+    val = float(record["forecast_mw"])
+    if not (DEMAND_MIN_VALID_MW <= val <= DEMAND_MAX_VALID_MW):
+        raise ValueError(f"Benchmark value {val} MW is outside ERCOT plausibility bounds.")

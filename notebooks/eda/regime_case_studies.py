@@ -15,8 +15,6 @@
 
 # COMMAND ----------
 # DBTITLE 1,Imports & Setup
-import numpy as np
-import matplotlib.pyplot as plt
 from scipy import stats
 from pyspark.sql import functions as F
 

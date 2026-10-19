@@ -342,3 +342,439 @@ def test_scoring_issues_both_products_and_uses_labeled_h168_fallback():
         assert "No active production H24" in str(exc)
     else:
         raise AssertionError("Scoring accepted a missing required H24 production model.")
+
+
+def test_forecast_issue_id_is_deterministic_and_unique():
+    from src.shared.forecast_contract import generate_forecast_issue_id
+    origin = pd.Timestamp("2024-06-01 12:00:00", tz="UTC")
+    issued = pd.Timestamp("2024-06-01 12:15:00", tz="UTC")
+    issue_id_h24 = generate_forecast_issue_id("ERCO", 24, origin, issued)
+    issue_id_h168 = generate_forecast_issue_id("ERCO", 168, origin, issued)
+    assert issue_id_h24.startswith("issue:ERCO:H24:")
+    assert issue_id_h168.startswith("issue:ERCO:H168:")
+    assert issue_id_h24 != issue_id_h168
+    # Deterministic:
+    assert issue_id_h24 == generate_forecast_issue_id("ERCO", 24, origin, issued)
+
+
+def test_validate_forecast_issue_frame_enforces_complete_curves_and_bounds():
+    from src.shared.forecast_contract import generate_forecast_issue_id, validate_forecast_issue_frame
+    origin = pd.Timestamp("2026-10-19 05:00", tz="UTC")
+    issued = pd.Timestamp("2026-10-19 06:00", tz="UTC")
+
+    def issue_rows(horizon, prediction):
+        leads = list(range(1, horizon + 1))
+        return pd.DataFrame({
+            "respondent": ["ERCO"] * horizon,
+            "forecast_issue_id": [generate_forecast_issue_id("ERCO", horizon, origin, issued)] * horizon,
+            "forecast_origin_utc": [origin] * horizon,
+            "target_timestamp_utc": [origin + pd.Timedelta(hours=lead) for lead in leads],
+            "issued_at_utc": [issued] * horizon,
+            "horizon_hours": [horizon] * horizon,
+            "lead_hours": leads,
+            "predicted_demand_mw": [prediction] * horizon,
+        })
+
+    valid_h24 = issue_rows(24, 50_000.0)
+    valid_h168 = issue_rows(168, 52_000.0)
+    both = pd.concat([valid_h24, valid_h168], ignore_index=True)
+    validate_forecast_issue_frame(both)
+
+    # Incomplete curve
+    try:
+        validate_forecast_issue_frame(valid_h24.iloc[:-1], expected_horizons=[24])
+    except ValueError as exc:
+        assert "expected 24 leads" in str(exc)
+    else:
+        raise AssertionError("Incomplete H24 curve passed validation.")
+
+    # Bound violation
+    invalid_pred = both.copy()
+    invalid_pred.loc[0, "predicted_demand_mw"] = 5_000.0
+    try:
+        validate_forecast_issue_frame(invalid_pred, expected_horizons=[24, 168])
+    except ValueError as exc:
+        assert "exceed physical bounds" in str(exc)
+    else:
+        raise AssertionError("Physical bound violation passed validation.")
+
+
+def test_validate_benchmark_vintage_record():
+    from src.shared.forecast_contract import validate_benchmark_vintage_record
+    record = {
+        "benchmark_provider": "EIA",
+        "respondent": "ERCO",
+        "vintage_id": "vintage_20240601",
+        "target_timestamp_utc": pd.Timestamp("2024-06-01 14:00", tz="UTC"),
+        "forecast_mw": 55_000.0,
+        "first_observed_at_utc": pd.Timestamp("2024-06-01 06:00", tz="UTC"),
+    }
+    validate_benchmark_vintage_record(record)
+
+    missing_field = record.copy()
+    del missing_field["vintage_id"]
+    try:
+        validate_benchmark_vintage_record(missing_field)
+    except ValueError as exc:
+        assert "missing required field" in str(exc)
+    else:
+        raise AssertionError("Record missing required field passed validation.")
+
+
+def test_forecast_issue_id_normalizes_equivalent_utc_offsets():
+    from src.shared.forecast_contract import generate_forecast_issue_id
+
+    utc_id = generate_forecast_issue_id(
+        "ERCO", 24, "2026-10-19T05:00:00Z", "2026-10-19T06:00:00Z"
+    )
+    offset_id = generate_forecast_issue_id(
+        "ERCO", 24, "2026-10-19T08:00:00+03:00", "2026-10-19T09:00:00+03:00"
+    )
+    assert utc_id == offset_id
+    assert generate_forecast_issue_id(
+        "ERCO", 24, "2026-10-19T05:00:00Z", "2026-10-19T06:00:00Z", "run-a"
+    ) != generate_forecast_issue_id(
+        "ERCO", 24, "2026-10-19T05:00:00Z", "2026-10-19T06:00:00Z", "run-b"
+    )
+
+
+def test_as_of_vintage_selection_keeps_one_complete_latest_row():
+    from src.gold.benchmark_evaluation import select_as_of_benchmark_vintages
+
+    target = pd.Timestamp("2026-10-20T12:00:00Z")
+    vintages = pd.DataFrame([
+        {"benchmark_provider": "EIA", "respondent": "ERCO", "vintage_id": "old",
+         "target_timestamp_utc": target, "forecast_mw": 50_000.0,
+         "published_at_utc": pd.NaT, "first_observed_at_utc": pd.Timestamp("2026-10-19T10:00:00Z"),
+         "payload_sha256": "old-hash"},
+        {"benchmark_provider": "EIA", "respondent": "ERCO", "vintage_id": "new",
+         "target_timestamp_utc": target, "forecast_mw": 51_000.0,
+         "published_at_utc": pd.NaT, "first_observed_at_utc": pd.Timestamp("2026-10-19T11:00:00Z"),
+         "payload_sha256": "new-hash"},
+    ])
+    selected = select_as_of_benchmark_vintages(vintages, pd.Timestamp("2026-10-19T12:00:00Z"))
+    assert len(selected) == 1
+    assert selected.iloc[0].vintage_id == "new"
+    assert selected.iloc[0].payload_sha256 == "new-hash"
+
+
+def test_ercot_benchmark_parser_keeps_only_system_total_and_requires_recognized_rows():
+    import json
+    from src.bronze.ingest_ercot_benchmark import parse_system_forecast_records
+
+    payload = json.dumps({"data": [
+        {"target_timestamp_utc": "2026-10-20T12:00:00Z", "weatherZone": "COAST", "forecastMw": 9_000},
+        {"target_timestamp_utc": "2026-10-20T12:00:00Z", "weatherZone": "ERCOT System Total", "forecastMw": 51_000},
+    ]}).encode("utf-8")
+    rows = parse_system_forecast_records(payload)
+    assert len(rows) == 1
+    assert rows[0]["product_id"] == "NP3-561-CD"
+    assert rows[0]["respondent"] == "ERCO"
+    assert rows[0]["forecast_mw"] == 51_000
+
+    unrecognized = json.dumps({"data": [
+        {"target_timestamp_utc": "2026-10-20T12:00:00Z", "weatherZone": "COAST", "forecastMw": 9_000}
+    ]}).encode("utf-8")
+    try:
+        parse_system_forecast_records(unrecognized)
+    except ValueError as exc:
+        assert "no recognizable system-total" in str(exc)
+    else:
+        raise AssertionError("Zone-only ERCOT data was incorrectly accepted as a system benchmark.")
+
+
+def test_ercot_benchmark_parser_accepts_wide_system_total_column():
+    from src.bronze.ingest_ercot_benchmark import parse_system_forecast_records
+
+    payload = (
+        "DeliveryDate,HourEnding,SystemTotal,COAST,NORTH\n"
+        "2026-10-20,HE 01,51000,9200,700\n"
+    ).encode("utf-8")
+    rows = parse_system_forecast_records(payload)
+    assert len(rows) == 1
+    assert rows[0]["forecast_mw"] == 51_000
+    assert rows[0]["target_timestamp_utc"] == pd.Timestamp("2026-10-20T05:00:00Z").to_pydatetime()
+
+
+def test_ercot_benchmark_parser_accepts_xml_row_records():
+    from src.bronze.ingest_ercot_benchmark import parse_system_forecast_records
+
+    payload = b"""<Report><Record><TargetTimestampUtc>2026-10-20T12:00:00Z</TargetTimestampUtc>
+    <ForecastType>SystemTotal</ForecastType><ForecastMw>51000</ForecastMw></Record></Report>"""
+    rows = parse_system_forecast_records(payload)
+    assert len(rows) == 1
+    assert rows[0]["forecast_mw"] == 51_000
+
+
+def test_ercot_benchmark_parser_rejects_ambiguous_repeated_local_hour():
+    import json
+    from src.bronze.ingest_ercot_benchmark import parse_system_forecast_records
+
+    payload = json.dumps({"data": [
+        {"deliveryDate": "2026-11-01", "hourEnding": 2, "systemTotal": 51_000},
+    ]}).encode("utf-8")
+    try:
+        parse_system_forecast_records(payload)
+    except ValueError as exc:
+        assert "ambiguous during the fall-back" in str(exc)
+    else:
+        raise AssertionError("Ambiguous fall-back local hour was silently accepted.")
+
+
+def test_ercot_benchmark_parser_rejects_nonexistent_spring_forward_local_hour():
+    import json
+    from src.bronze.ingest_ercot_benchmark import parse_system_forecast_records
+
+    # HE=03 starts at local 02:00, which does not exist on the spring-forward date.
+    payload = json.dumps({"data": [
+        {"deliveryDate": "2026-03-08", "hourEnding": 3, "systemTotal": 51_000},
+    ]}).encode("utf-8")
+    try:
+        parse_system_forecast_records(payload)
+    except ValueError as exc:
+        assert "does not exist during the spring-forward" in str(exc)
+    else:
+        raise AssertionError("Nonexistent spring-forward local hour was silently accepted.")
+
+
+def test_ercot_token_request_posts_credentials_as_form_data(monkeypatch):
+    import json
+    from urllib.parse import parse_qs
+    from src.bronze import ingest_ercot_benchmark
+
+    captured = {}
+
+    class FakeResponse:
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps({"id_token": "test-bearer-token"}).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        captured["request"] = request
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr(ingest_ercot_benchmark.urllib.request, "urlopen", fake_urlopen)
+    assert ingest_ercot_benchmark.get_ercot_token("user", "password") == "test-bearer-token"
+    request = captured["request"]
+    assert request.full_url == ingest_ercot_benchmark.AUTH_URL
+    assert request.get_method() == "POST"
+    posted = parse_qs(request.data.decode("utf-8"))
+    assert posted["username"] == ["user"]
+    assert posted["password"] == ["password"]
+    assert "username" not in request.full_url
+
+
+def test_benchmark_match_rejects_duplicate_actual_keys():
+    from src.gold.benchmark_evaluation import match_h24_and_eia
+
+    origin = pd.Timestamp("2024-06-01T00:00:00Z")
+    target = origin + pd.Timedelta(hours=24)
+    forecasts = pd.DataFrame([{
+        "respondent": "ERCO", "horizon_hours": 24, "lead_hours": 24,
+        "forecast_origin_utc": origin, "issued_at_utc": origin + pd.Timedelta(minutes=15),
+        "target_timestamp_utc": target, "predicted_demand_mw": 51_000.0,
+    }])
+    actuals = pd.DataFrame([
+        {"respondent": "ERCO", "timestamp_utc": target, "actual_demand_mw": 50_000.0},
+        {"respondent": "ERCO", "timestamp_utc": target, "actual_demand_mw": 50_100.0},
+    ])
+    try:
+        match_h24_and_eia(forecasts, pd.DataFrame(), actuals)
+    except ValueError as exc:
+        assert "Actual demand contains duplicate rows" in str(exc)
+    else:
+        raise AssertionError("Duplicate actuals were silently allowed to overweight benchmark metrics.")
+
+
+def test_scoring_attaches_issue_id_and_freshness_status():
+    class ConstantModel:
+        def predict(self, features):
+            return np.zeros(len(features))
+    history = _hourly(hours=500)
+    calendar_dates = set(pd.date_range("2024-01-01", periods=40, freq="D").date)
+    origin = history.timestamp_utc.max()
+
+    # Case 1: Fresh input (issued 1h after origin)
+    issued_fresh = origin + pd.Timedelta(hours=1)
+    df_fresh = generate_independent_forecasts(
+        history, {24: ConstantModel(), 168: ConstantModel()},
+        {24: "run-h24", 168: "run-h168"},
+        holiday_dates=set(), calendar_dates=calendar_dates,
+        issued_at_utc=issued_fresh,
+    )
+    assert len(df_fresh) == 192
+    assert "forecast_issue_id" in df_fresh.columns
+    assert df_fresh.freshness_status.eq("OPERATIONAL_FRESH").all()
+    assert df_fresh.source_data_age_hours.iloc[0] == 1.0
+
+    # Case 2: Stale input (issued 5h after origin)
+    issued_stale = origin + pd.Timedelta(hours=5)
+    df_stale = generate_independent_forecasts(
+        history, {24: ConstantModel(), 168: ConstantModel()},
+        {24: "run-h24", 168: "run-h168"},
+        holiday_dates=set(), calendar_dates=calendar_dates,
+        issued_at_utc=issued_stale,
+    )
+    assert df_stale.freshness_status.eq("STALE_INPUT").all()
+    assert df_stale.source_data_age_hours.iloc[0] == 5.0
+
+
+def test_dst_spring_forward_and_fall_back_continuous_utc():
+    # Test March 2024 Spring Forward and November 2024 Fall Back
+    for start_str in ["2024-03-09 00:00:00", "2024-11-02 00:00:00"]:
+        origin = pd.Timestamp(start_str, tz="UTC")
+        leads = list(range(1, 169))
+        targets_utc = [origin + pd.Timedelta(hours=lead) for lead in leads]
+        # In UTC, differences are exactly 1 hour continuous
+        diffs = pd.Series(targets_utc).diff().dropna()
+        assert (diffs == pd.Timedelta(hours=1)).all()
+        # Local timestamps are valid America/Chicago conversions
+        locals_ct = [t.tz_convert("America/Chicago") for t in targets_utc]
+        assert len(set(targets_utc)) == 168
+        assert len(locals_ct) == 168
+
+
+def test_as_of_benchmark_selection_no_lookahead():
+    from src.gold.benchmark_evaluation import select_as_of_benchmark_vintages
+
+    target_ts = pd.Timestamp("2024-06-01 18:00:00", tz="UTC")
+    vintages = pd.DataFrame([
+        {
+            "benchmark_provider": "EIA",
+            "respondent": "ERCO",
+            "vintage_id": "v1_early",
+            "target_timestamp_utc": target_ts,
+            "forecast_mw": 50_000.0,
+            "first_observed_at_utc": pd.Timestamp("2024-06-01 06:00:00", tz="UTC"),
+        },
+        {
+            "benchmark_provider": "EIA",
+            "respondent": "ERCO",
+            "vintage_id": "v2_revision",
+            "target_timestamp_utc": target_ts,
+            "forecast_mw": 52_000.0,
+            "first_observed_at_utc": pd.Timestamp("2024-06-01 10:00:00", tz="UTC"),
+        },
+        {
+            "benchmark_provider": "EIA",
+            "respondent": "ERCO",
+            "vintage_id": "v3_future",
+            "target_timestamp_utc": target_ts,
+            "forecast_mw": 55_000.0,
+            "first_observed_at_utc": pd.Timestamp("2024-06-01 14:00:00", tz="UTC"),
+        },
+    ])
+
+    # As of 08:00 UTC: only v1 is available
+    as_of_08 = select_as_of_benchmark_vintages(vintages, pd.Timestamp("2024-06-01 08:00:00", tz="UTC"))
+    assert len(as_of_08) == 1
+    assert as_of_08.iloc[0]["vintage_id"] == "v1_early"
+    assert as_of_08.iloc[0]["forecast_mw"] == 50_000.0
+
+    # As of 11:00 UTC: v2 is available and preferred over v1; v3 is excluded (no look-ahead)
+    as_of_11 = select_as_of_benchmark_vintages(vintages, pd.Timestamp("2024-06-01 11:00:00", tz="UTC"))
+    assert len(as_of_11) == 1
+    assert as_of_11.iloc[0]["vintage_id"] == "v2_revision"
+    assert as_of_11.iloc[0]["forecast_mw"] == 52_000.0
+
+
+def test_match_h24_and_eia_metrics():
+    from src.gold.benchmark_evaluation import match_h24_and_eia
+
+    origin = pd.Timestamp("2024-06-01 00:00:00", tz="UTC")
+    issued = pd.Timestamp("2024-06-01 00:15:00", tz="UTC")
+    target = origin + pd.Timedelta(hours=24)
+
+    h24 = pd.DataFrame([{
+        "respondent": "ERCO",
+        "horizon_hours": 24,
+        "lead_hours": 24,
+        "forecast_origin_utc": origin,
+        "issued_at_utc": issued,
+        "target_timestamp_utc": target,
+        "predicted_demand_mw": 51_000.0,
+    }])
+
+    vintages = pd.DataFrame([{
+        "benchmark_provider": "EIA",
+        "respondent": "ERCO",
+        "vintage_id": "eia_v1",
+        "target_timestamp_utc": target,
+        "forecast_mw": 52_000.0,
+        "first_observed_at_utc": pd.Timestamp("2024-05-31 23:00:00", tz="UTC"),
+    }])
+
+    actuals = pd.DataFrame([{
+        "respondent": "ERCO",
+        "timestamp_utc": target,
+        "actual_demand_mw": 50_000.0,
+    }])
+
+    df_matched, summary = match_h24_and_eia(h24, vintages, actuals, headline_policy="lead_24")
+    assert len(df_matched) == 1
+    assert summary["matched_rows"] == 1
+    assert summary["unique_targets"] == 1
+    assert summary["model_mae_mw"] == 1_000.0   # |51000 - 50000|
+    assert summary["eia_mae_mw"] == 2_000.0     # |52000 - 50000|
+    assert summary["model_bias_mw"] == 1_000.0  # 51000 - 50000
+    assert summary["eia_bias_mw"] == 2_000.0    # 52000 - 50000
+
+
+def test_match_h168_and_ercot_prospective_and_buckets():
+    from src.gold.benchmark_evaluation import match_h168_and_ercot
+
+    # Test Case 1: Empty vintages truthfully returns PROSPECTIVE_PENDING_MATURED_DATA
+    df_empty, summary_empty = match_h168_and_ercot(pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
+    assert summary_empty["status"] == "PROSPECTIVE_PENDING_MATURED_DATA"
+    assert summary_empty["matched_rows"] == 0
+
+    # Test Case 2: Matched curves across lead buckets
+    origin = pd.Timestamp("2024-06-01 00:00:00", tz="UTC")
+    issued = pd.Timestamp("2024-06-01 00:15:00", tz="UTC")
+
+    # Generate 168 rows
+    h168_rows = []
+    ercot_rows = []
+    actual_rows = []
+    for lead in range(1, 169):
+        target = origin + pd.Timedelta(hours=lead)
+        h168_rows.append({
+            "respondent": "ERCO", "horizon_hours": 168, "lead_hours": lead,
+            "forecast_origin_utc": origin, "issued_at_utc": issued,
+            "target_timestamp_utc": target, "predicted_demand_mw": 50_000.0 + lead * 10,
+        })
+        ercot_rows.append({
+            "benchmark_provider": "ERCOT", "respondent": "ERCO",
+            "vintage_id": "ercot_v1", "target_timestamp_utc": target,
+            "forecast_mw": 50_000.0 + lead * 5,
+            "first_observed_at_utc": origin - pd.Timedelta(hours=1),
+        })
+        actual_rows.append({
+            "respondent": "ERCO", "timestamp_utc": target, "actual_demand_mw": 50_000.0,
+        })
+
+    df_h168 = pd.DataFrame(h168_rows)
+    df_ercot = pd.DataFrame(ercot_rows)
+    df_actuals = pd.DataFrame(actual_rows)
+
+    df_matched, summary = match_h168_and_ercot(df_h168, df_ercot, df_actuals)
+    assert summary["status"] == "EVALUATED"
+    assert summary["matched_rows"] == 168
+    assert summary["unique_targets"] == 168
+    # Assert lead buckets exist
+    assert "leads_1_24" in summary["lead_bucket_metrics"]
+    assert "leads_25_48" in summary["lead_bucket_metrics"]
+    assert "leads_49_168" in summary["lead_bucket_metrics"]
+    assert summary["lead_bucket_metrics"]["leads_1_24"]["matched_rows"] == 24
+    assert summary["lead_bucket_metrics"]["leads_49_168"]["matched_rows"] == 120
+    # Assert lead 168 diagnostic exists
+    assert summary["lead_168_diagnostic"] is not None
+    assert summary["lead_168_diagnostic"]["matched_rows"] == 1

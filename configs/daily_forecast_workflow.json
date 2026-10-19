@@ -8,85 +8,85 @@
   "max_concurrent_runs": 1,
   "tasks": [
     {
-      "task_key": "ingest_eia",
-      "description": "Ingests real ERCOT demand and EIA day-ahead benchmark data.",
-      "notebook_task": {"notebook_path": "src/bronze/ingest_eia", "source": "GIT"},
-      "timeout_seconds": 1800
-    },
-    {
       "task_key": "ingest_weather",
       "description": "Ingests retrospective Open-Meteo archive observations through the available date.",
-      "notebook_task": {"notebook_path": "src/bronze/ingest_weather", "source": "GIT"},
+      "notebook_task": {
+        "notebook_path": "src/bronze/ingest_weather",
+        "source": "GIT"
+      },
       "timeout_seconds": 1800
     },
     {
       "task_key": "ingest_weather_forecast",
       "description": "Snapshots issue-time Open-Meteo forecasts for future leakage-safe weather-feature evaluation.",
-      "notebook_task": {"notebook_path": "src/bronze/ingest_weather_forecast", "source": "GIT"},
+      "notebook_task": {
+        "notebook_path": "src/bronze/ingest_weather_forecast",
+        "source": "GIT"
+      },
       "timeout_seconds": 900
     },
     {
       "task_key": "clean_weather_forecast",
       "description": "Conforms issue-time weather snapshots into regional, availability-stamped hourly features.",
-      "depends_on": [{"task_key": "ingest_weather_forecast"}],
-      "notebook_task": {"notebook_path": "src/silver/clean_weather_forecast", "source": "GIT"},
+      "depends_on": [
+        {
+          "task_key": "ingest_weather_forecast"
+        }
+      ],
+      "notebook_task": {
+        "notebook_path": "src/silver/clean_weather_forecast",
+        "source": "GIT"
+      },
       "timeout_seconds": 900
     },
     {
       "task_key": "ingest_zonal",
       "description": "Ingests observed ERCOT weather-zone demand for dashboard analytics.",
-      "notebook_task": {"notebook_path": "src/bronze/ingest_ercot_zonal", "source": "GIT"},
+      "notebook_task": {
+        "notebook_path": "src/bronze/ingest_ercot_zonal",
+        "source": "GIT"
+      },
       "timeout_seconds": 7200
     },
     {
-      "task_key": "clean_eia",
-      "depends_on": [{"task_key": "ingest_eia"}],
-      "notebook_task": {"notebook_path": "src/silver/clean_eia_demand", "source": "GIT"},
-      "timeout_seconds": 1800
-    },
-    {
       "task_key": "clean_weather",
-      "depends_on": [{"task_key": "ingest_weather"}],
-      "notebook_task": {"notebook_path": "src/silver/clean_weather", "source": "GIT"},
+      "depends_on": [
+        {
+          "task_key": "ingest_weather"
+        }
+      ],
+      "notebook_task": {
+        "notebook_path": "src/silver/clean_weather",
+        "source": "GIT"
+      },
       "timeout_seconds": 1800
     },
     {
       "task_key": "clean_zonal",
-      "depends_on": [{"task_key": "ingest_zonal"}, {"task_key": "clean_eia"}],
-      "notebook_task": {"notebook_path": "src/silver/clean_ercot_zonal", "source": "GIT"},
-      "timeout_seconds": 1800
-    },
-    {
-      "task_key": "conform_grid_weather",
-      "depends_on": [{"task_key": "clean_eia"}, {"task_key": "clean_weather"}],
-      "notebook_task": {"notebook_path": "src/silver/conformed_grid_weather", "source": "GIT"},
-      "timeout_seconds": 1800
-    },
-    {
-      "task_key": "build_demand_fact",
-      "depends_on": [{"task_key": "conform_grid_weather"}],
-      "notebook_task": {"notebook_path": "src/gold/fact_hourly_demand", "source": "GIT"},
-      "timeout_seconds": 1800
-    },
-    {
-      "task_key": "score_forecasts",
-      "description": "Requires a promoted H24 model; uses the promoted H168 model or an explicitly labeled weekly-naive fallback.",
-      "depends_on": [{"task_key": "build_demand_fact"}],
-      "notebook_task": {"notebook_path": "src/gold/score_forecast_hourly", "source": "GIT"},
-      "timeout_seconds": 1800
-    },
-    {
-      "task_key": "monitor_forecasts",
-      "description": "Calculates forecast errors only for target hours whose actual demand is now available.",
-      "depends_on": [{"task_key": "score_forecasts"}],
-      "notebook_task": {"notebook_path": "src/mlops/monitor_forecasts", "source": "GIT"},
+      "description": "Cleans newly ingested zonal demand and joins the latest available ERCOT system-demand reference.",
+      "depends_on": [
+        {
+          "task_key": "ingest_zonal"
+        }
+      ],
+      "notebook_task": {
+        "notebook_path": "src/silver/clean_ercot_zonal",
+        "source": "GIT"
+      },
       "timeout_seconds": 1800
     },
     {
       "task_key": "build_zonal_summary",
       "description": "Publishes observed zonal-demand analytics for the dashboard.",
-      "depends_on": [{"task_key": "clean_zonal"}],
-      "notebook_task": {"notebook_path": "src/gold/zonal_demand_summary", "source": "GIT"},
+      "depends_on": [
+        {
+          "task_key": "clean_zonal"
+        }
+      ],
+      "notebook_task": {
+        "notebook_path": "src/gold/zonal_demand_summary",
+        "source": "GIT"
+      },
       "timeout_seconds": 1800
     }
   ],

@@ -7,7 +7,7 @@
 # MAGIC - `main.silver.weather_hourly_conformed`
 # MAGIC - `main.bronze.calendar_reference`
 # MAGIC
-# MAGIC **Output Table:** `main.silver.grid_hourly_conformed`  
+# MAGIC **Output Table:** `main.silver.grid_hourly_conformed`
 # MAGIC
 # MAGIC ### Core Transformations:
 # MAGIC 1. **1:1 Chronological Conformance:** Full outer join on exact `timestamp_utc` grain (preserves weather-only future hours for Gold scoring).
@@ -25,9 +25,8 @@
 # COMMAND ----------
 # DBTITLE 1,Imports & Configuration
 import os
-import json
 from pyspark.sql import functions as F
-from pyspark.sql.types import DoubleType, StringType, BooleanType, IntegerType
+from pyspark.sql.types import DoubleType
 from delta.tables import DeltaTable
 
 CATALOG = "main"
@@ -60,12 +59,34 @@ BA_CODE = config.get("region", {}).get("code", "ERCO")
 
 # COMMAND ----------
 # DBTITLE 1,Verify Source Tables Exist
-for tbl in [DEMAND_TABLE, WEATHER_TABLE, CALENDAR_TABLE]:
+for tbl in [DEMAND_TABLE, CALENDAR_TABLE]:
     assert spark.catalog.tableExists(tbl), f"Required upstream table {tbl} does not exist!"
 
 df_demand = spark.table(DEMAND_TABLE)
-df_weather = spark.table(WEATHER_TABLE)
+if spark.catalog.tableExists(WEATHER_TABLE):
+    df_weather = spark.table(WEATHER_TABLE)
+else:
+    # Weather is an enrichment source, not a prerequisite for hourly demand
+    # serving. An empty, typed frame keeps the canonical conformed schema stable.
+    from pyspark.sql.types import StructType, StructField, TimestampType, DoubleType
+    weather_schema = StructType([
+        StructField("timestamp_utc", TimestampType(), True),
+        StructField("timestamp_local", TimestampType(), True),
+        *[StructField(name, DoubleType(), True) for name in [
+            "weighted_temperature_c", "weighted_temperature_f",
+            "weighted_apparent_temperature_c", "weighted_apparent_temperature_f",
+            "weighted_dew_point_c", "weighted_relative_humidity_pct",
+            "weighted_precipitation_mm", "weighted_wind_speed_ms",
+            "weighted_solar_irradiance_wm2", "cdh_65", "hdh_65",
+            "temp_houston_c", "temp_dfw_c", "temp_san_antonio_c", "temp_austin_c",
+        ]],
+    ])
+    df_weather = spark.createDataFrame([], weather_schema)
+    print(f"Weather table {WEATHER_TABLE} is absent; continuing with demand and calendar inputs only.")
 df_calendar = spark.table(CALENDAR_TABLE)
+assert df_demand.filter(F.col("actual_demand_mw").isNotNull()).limit(1).count() > 0, (
+    f"Required demand table {DEMAND_TABLE} has no usable actual demand rows."
+)
 
 # COMMAND ----------
 # DBTITLE 1,Pipeline Functions: Transformation, Validation & Upsert
@@ -85,7 +106,7 @@ def build_conformed_dataset(df_demand, df_weather, df_calendar, ba_code=BA_CODE)
         F.col("timestamp_utc"),
         F.coalesce(F.col("d.timestamp_local"), F.col("w.timestamp_local")).alias("timestamp_local"),
         F.to_date(F.coalesce(F.col("d.timestamp_local"), F.col("w.timestamp_local"))).alias("date_local"),
-        
+
         # Temporal Components (Based on Texas Local Central Time)
         F.hour(F.coalesce(F.col("d.timestamp_local"), F.col("w.timestamp_local"))).alias("hour_local"),
         F.dayofweek(F.coalesce(F.col("d.timestamp_local"), F.col("w.timestamp_local"))).alias("day_of_week_local"),
@@ -93,7 +114,7 @@ def build_conformed_dataset(df_demand, df_weather, df_calendar, ba_code=BA_CODE)
         F.month(F.coalesce(F.col("d.timestamp_local"), F.col("w.timestamp_local"))).alias("month_local"),
         F.year(F.coalesce(F.col("d.timestamp_local"), F.col("w.timestamp_local"))).alias("year_local"),
         F.dayofyear(F.coalesce(F.col("d.timestamp_local"), F.col("w.timestamp_local"))).alias("day_of_year_local"),
-        
+
         # Demand Availability State Distinction
         F.when(F.col("d.actual_demand_mw").isNotNull(), F.lit("AVAILABLE"))
          .when(F.col("timestamp_utc") >= (F.current_timestamp() - F.expr("INTERVAL 48 HOURS")), F.lit("NOT_YET_PUBLISHED"))
@@ -102,13 +123,13 @@ def build_conformed_dataset(df_demand, df_weather, df_calendar, ba_code=BA_CODE)
         # Weather Availability State Distinction
         F.when(F.col("w.weighted_temperature_c").isNotNull(), F.lit("AVAILABLE"))
          .otherwise(F.lit("UNAVAILABLE")).alias("weather_availability_status"),
-        
+
         # Electricity Metrics & Quality Flags
         F.col("d.actual_demand_mw"),
         F.col("d.day_ahead_forecast_mw"),
         F.when(F.col("d.actual_demand_mw").isNotNull(), F.col("d.is_valid_demand")).alias("is_valid_demand"),
         F.col("d.anomaly_flag"),
-        
+
         # Regional Weighted Weather Indices
         F.col("w.weighted_temperature_c"),
         F.col("w.weighted_temperature_f"),
@@ -121,14 +142,14 @@ def build_conformed_dataset(df_demand, df_weather, df_calendar, ba_code=BA_CODE)
         F.col("w.weighted_solar_irradiance_wm2"),
         F.col("w.cdh_65"),
         F.col("w.hdh_65"),
-        
+
         # Representative Metro Center Temps
         F.col("w.temp_houston_c"),
         F.col("w.temp_dfw_c"),
         F.col("w.temp_san_antonio_c"),
         F.col("w.temp_austin_c")
     )
-    
+
     # 2. Attach Calendar Reference Dimensions
     df_conformed = df_grid_weather.alias("gw").join(
         df_calendar.alias("c"),
@@ -140,7 +161,7 @@ def build_conformed_dataset(df_demand, df_weather, df_calendar, ba_code=BA_CODE)
         F.coalesce(F.col("c.is_holiday"), F.lit(False)).alias("is_holiday"),
         F.col("c.holiday_name")
     ).withColumn("_conformed_at_utc", F.current_timestamp())
-    
+
     return df_conformed
 
 
@@ -209,7 +230,7 @@ def validate_conformed_candidate(df_conformed, df_demand, df_weather, df_calenda
     # 5. Missing Data Semantics
     null_status = df_conformed.filter(F.col("demand_availability_status").isNull()).count()
     assert null_status == 0, f"Integrity Failure: Found {null_status} rows with null demand_availability_status."
-    
+
     future_misclassified = df_conformed.filter(
         (F.col("demand_availability_status") == "NOT_YET_PUBLISHED") &
         (F.col("timestamp_utc") < (F.current_timestamp() - F.expr("INTERVAL 72 HOURS")))
@@ -260,7 +281,7 @@ def upsert_conformed_table(df_conformed, target_table, spark_session):
     else:
         delta_target = DeltaTable.forName(spark_session, target_table)
         target_cols = [c.name for c in delta_target.toDF().schema]
-        
+
         # Schema Migration Check:
         # If legacy business metrics (e.g. eia_day_ahead_ape_pct, day_ahead_error_mw) exist in target,
         # overwrite schema to align with Medallion rules (business metrics moved to Gold).
@@ -278,15 +299,15 @@ def upsert_conformed_table(df_conformed, target_table, spark_session):
                 "target.respondent = source.respondent "
                 "AND target.timestamp_utc = source.timestamp_utc"
             )
-            
+
             # Exclude keys and processing timestamp from change detection to prevent unconditional file churn (H-01)
             business_cols = [c for c in df_conformed.columns if c not in ["respondent", "timestamp_utc", "_conformed_at_utc"]]
             update_condition = " OR ".join([f"NOT (target.{c} <=> source.{c})" for c in business_cols])
-            
+
             # When matched and business columns changed, update all columns including the processing timestamp
             update_set = {col: f"source.{col}" for col in df_conformed.columns if col not in ["respondent", "timestamp_utc"]}
             insert_set = {col: f"source.{col}" for col in df_conformed.columns}
-            
+
             delta_target.alias("target").merge(
                 df_conformed.alias("source"),
                 merge_condition
@@ -335,7 +356,7 @@ audit_persisted_table(TARGET_TABLE, spark)
 
 # COMMAND ----------
 # MAGIC %sql
-# MAGIC SELECT 
+# MAGIC SELECT
 # MAGIC     count(*) as total_hours,
 # MAGIC     min(timestamp_local) as min_time,
 # MAGIC     max(timestamp_local) as max_time,

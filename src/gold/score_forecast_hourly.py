@@ -27,6 +27,8 @@ for _ in range(5):
 from src.shared.forecast_contract import (
     DEMAND_MAX_VALID_MW, DEMAND_MIN_VALID_MW, FEATURE_SCHEMA_VERSION,
     FEATURE_SET_OPERATIONAL, HORIZONS, features_for_horizon,
+    generate_forecast_issue_id, validate_forecast_issue_frame,
+    MAX_STALE_ORIGIN_HOURS, MAX_FAIL_ORIGIN_HOURS,
 )
 
 try:
@@ -44,6 +46,7 @@ SOURCE_FACT_TABLE = f"{CATALOG}.gold.fact_hourly_electricity_demand"
 TARGET_LATEST_TABLE = f"{CATALOG}.gold.forecast_latest"
 TARGET_EVALUATION_TABLE = f"{CATALOG}.gold.forecast_evaluation"
 H168_BASELINE_RUN_ID = "baseline:weekly-seasonal-naive:v1"
+
 
 
 def _calendar(timestamp: pd.Timestamp, holiday_dates: set) -> dict:
@@ -79,8 +82,9 @@ def _snapshot(frame: pd.DataFrame, origin: pd.Timestamp) -> dict:
 
 def generate_independent_forecasts(df_history: pd.DataFrame, models: dict, model_runs: dict, origin_utc=None,
                                   holiday_dates: set | None = None, calendar_dates: set | None = None,
-                                  high_demand_threshold_mw: float = 75_000.0) -> pd.DataFrame:
-    """Return direct predictions for every lead in H24 and H168."""
+                                  high_demand_threshold_mw: float = 75_000.0,
+                                  issued_at_utc=None) -> pd.DataFrame:
+    """Return direct predictions for every lead in H24 and H168 with issue identity and validation."""
     frame = df_history.copy()
     frame["timestamp_utc"] = pd.to_datetime(frame["timestamp_utc"], utc=True)
     duplicated = frame.loc[
@@ -104,7 +108,12 @@ def generate_independent_forecasts(df_history: pd.DataFrame, models: dict, model
     if missing_calendar:
         raise ValueError(f"Calendar reference does not cover forecast dates: {sorted(missing_calendar)}")
     respondent = str(frame.respondent.iloc[0])
-    issued_at = datetime.now(timezone.utc)
+    issued_at = datetime.now(timezone.utc) if issued_at_utc is None else pd.to_datetime(issued_at_utc, utc=True)
+
+    # Calculate source data age and freshness status
+    source_age_hours = round((issued_at - origin).total_seconds() / 3600.0, 2)
+    freshness_status = "OPERATIONAL_FRESH" if source_age_hours <= MAX_STALE_ORIGIN_HOURS else "STALE_INPUT"
+
     rows = []
     for horizon in HORIZONS:
         model = models.get(horizon)
@@ -129,26 +138,38 @@ def generate_independent_forecasts(df_history: pd.DataFrame, models: dict, model
         residuals = (np.zeros(len(feature_rows), dtype=float) if use_weekly_baseline
                      else model.predict(pd.DataFrame(feature_rows)[expected_features]))
         predictions = np.asarray([row["seasonal_naive_mw"] for row in feature_rows], dtype=float) + residuals
+
+        issue_id = generate_forecast_issue_id(respondent, horizon, origin, issued_at, run_id)
+
         for lead, prediction, feature in zip(leads, predictions, feature_rows):
             target = origin + pd.Timedelta(hours=lead)
             predicted = float(prediction)
             if not DEMAND_MIN_VALID_MW <= predicted <= DEMAND_MAX_VALID_MW:
                 raise ValueError(f"H{horizon} prediction {predicted:.1f} MW is outside plausibility bounds.")
             local = target.tz_convert("America/Chicago")
-            rows.append({"respondent": respondent, "forecast_origin_utc": origin, "target_timestamp_utc": target,
-                         "issued_at_utc": issued_at, "horizon_hours": horizon, "lead_hours": lead,
-                         "timestamp_local": local.tz_localize(None), "date_local": local.date(),
-                         "hour_local": feature["hour_local"], "predicted_demand_mw": round(predicted, 1),
-                         "is_predicted_high_demand": bool(predicted >= high_demand_threshold_mw),
-                         "high_demand_threshold_mw": high_demand_threshold_mw,
-                         "feature_set": "weekly_seasonal_naive_baseline" if use_weekly_baseline else FEATURE_SET_OPERATIONAL,
-                         "feature_schema_version": "not_applicable_baseline" if use_weekly_baseline else FEATURE_SCHEMA_VERSION,
-                         "forecast_source": ("weekly_seasonal_naive_baseline" if use_weekly_baseline
-                                             else "seasonal_residual_lightgbm"),
-                         "model_version": ("WeeklySeasonalNaive_Baseline_H168" if use_weekly_baseline
-                                           else f"SeasonalResidual_LightGBM_H{horizon}"),
-                         "model_run_id": run_id})
-    return pd.DataFrame(rows)
+            rows.append({
+                "forecast_issue_id": issue_id,
+                "respondent": respondent, "forecast_origin_utc": origin, "target_timestamp_utc": target,
+                "issued_at_utc": issued_at, "horizon_hours": horizon, "lead_hours": lead,
+                "timestamp_local": local.tz_localize(None), "date_local": local.date(),
+                "hour_local": feature["hour_local"], "predicted_demand_mw": round(predicted, 1),
+                "is_predicted_high_demand": bool(predicted >= high_demand_threshold_mw),
+                "high_demand_threshold_mw": high_demand_threshold_mw,
+                "freshness_status": freshness_status,
+                "source_data_age_hours": source_age_hours,
+                "feature_set": "weekly_seasonal_naive_baseline" if use_weekly_baseline else FEATURE_SET_OPERATIONAL,
+                "feature_schema_version": "not_applicable_baseline" if use_weekly_baseline else FEATURE_SCHEMA_VERSION,
+                "forecast_source": ("weekly_seasonal_naive_baseline" if use_weekly_baseline
+                                    else "seasonal_residual_lightgbm"),
+                "model_version": ("WeeklySeasonalNaive_Baseline_H168" if use_weekly_baseline
+                                  else f"SeasonalResidual_LightGBM_H{horizon}"),
+                "model_run_id": run_id,
+            })
+
+    result_df = pd.DataFrame(rows)
+    validate_forecast_issue_frame(result_df)
+    return result_df
+
 
 
 def _production_models():
@@ -197,9 +218,13 @@ if __name__ == "__main__" and "spark" in globals():
                .filter((F.col("respondent") == "ERCO") & F.col("actual_demand_mw").isNotNull())
                .orderBy(F.col("timestamp_utc").desc()).limit(600).toPandas())
     latest_observation = pd.to_datetime(history["timestamp_utc"], utc=True).max()
-    age_hours = (datetime.now(timezone.utc) - latest_observation.to_pydatetime()).total_seconds() / 3600
-    if age_hours < 0 or age_hours > 6:
-        raise RuntimeError(f"Latest actual demand is {age_hours:.1f} hours old; refusing to label stale predictions operational.")
+    now_utc = datetime.now(timezone.utc)
+    age_hours = (now_utc - latest_observation.to_pydatetime()).total_seconds() / 3600
+    if age_hours < 0 or age_hours > MAX_FAIL_ORIGIN_HOURS:
+        raise RuntimeError(f"Latest actual demand is {age_hours:.1f} hours old (exceeds {MAX_FAIL_ORIGIN_HOURS}h threshold); refusing to issue predictions.")
+    if age_hours > MAX_STALE_ORIGIN_HOURS:
+        print(f"Warning: Input actual demand is {age_hours:.1f} hours old; issuing with STALE_INPUT status.")
+
     calendar = spark.table(f"{CATALOG}.bronze.calendar_reference").select("date", "is_holiday").toPandas()
     holidays = set(pd.to_datetime(calendar.loc[calendar.is_holiday.astype(bool), "date"]).dt.date)
     calendar_dates = set(pd.to_datetime(calendar["date"]).dt.date)
@@ -209,13 +234,28 @@ if __name__ == "__main__" and "spark" in globals():
         high_demand_threshold_mw=high_demand_threshold_mw,
     )
     incoming = spark.createDataFrame(forecast)
-    # Serving table is replaceable by design: it contains only the newest issue.
+    # Validate before persisting: pre-publish gate enforces complete curves (24 + 168 rows)
+    assert len(forecast) == 192, f"Expected 192 forecast rows, found {len(forecast)}"
+
+    # Serving table is atomically replaced: it contains only the newest issue.
     incoming.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(TARGET_LATEST_TABLE)
+
     # Evaluation table is append-only at issued-forecast grain.
     if spark.catalog.tableExists(TARGET_EVALUATION_TABLE):
-        DeltaTable.forName(spark, TARGET_EVALUATION_TABLE).alias("t").merge(incoming.alias("s"),
-            "t.model_run_id=s.model_run_id AND t.horizon_hours=s.horizon_hours AND t.forecast_origin_utc=s.forecast_origin_utc AND t.target_timestamp_utc=s.target_timestamp_utc"
+        # Migrate additive issue/freshness fields in place before MERGE. Without
+        # this, an older evaluation table rejects the new scorer's insert schema.
+        existing_columns = set(spark.table(TARGET_EVALUATION_TABLE).columns)
+        missing_columns = [field for field in incoming.schema.fields if field.name not in existing_columns]
+        if missing_columns:
+            ddl_columns = ", ".join(
+                f"`{field.name}` {field.dataType.simpleString()}" for field in missing_columns
+            )
+            spark.sql(f"ALTER TABLE {TARGET_EVALUATION_TABLE} ADD COLUMNS ({ddl_columns})")
+        DeltaTable.forName(spark, TARGET_EVALUATION_TABLE).alias("t").merge(
+            incoming.alias("s"),
+            "t.respondent=s.respondent AND t.forecast_issue_id=s.forecast_issue_id "
+            "AND t.horizon_hours=s.horizon_hours AND t.target_timestamp_utc=s.target_timestamp_utc"
         ).whenNotMatchedInsertAll().execute()
     else:
         incoming.write.format("delta").mode("overwrite").saveAsTable(TARGET_EVALUATION_TABLE)
-    print(f"Issued {len(forecast):,} direct forecast rows from {forecast.forecast_origin_utc.iloc[0]}.")
+    print(f"Issued {len(forecast):,} direct forecast rows from {forecast.forecast_origin_utc.iloc[0]} (Issue: {forecast.forecast_issue_id.iloc[0]}).")
