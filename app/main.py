@@ -85,7 +85,23 @@ else:
     # Drop incomplete KPI rows so pandas does not turn all-null sums into 0 MW.
     recent = recent.dropna(subset=["mae_mw", "rmse_mw", "bias_mw", "evaluated_rows"])
     recent = recent[recent["evaluated_rows"] > 0].copy()
+    first_target_utc = view["target_timestamp_utc"].min()
+    latest_actual_utc = view["latest_actual_timestamp_utc"].max()
+    current_issue_has_no_matured_targets = (
+        pd.notna(latest_actual_utc) and latest_actual_utc < first_target_utc
+    )
+    if current_issue_has_no_matured_targets:
+        actual_label = latest_actual_utc.strftime("%Y-%m-%d %H:%M UTC")
+        target_label = first_target_utc.strftime("%Y-%m-%d %H:%M UTC")
+        st.info(
+            f"Current H{horizon} forecast issue has no matured errors yet: actual demand is "
+            f"available through {actual_label}, and this issue starts at {target_label}."
+        )
     if not recent.empty:
+        st.caption(
+            "The reliability figures below summarize previously matured forecasts for this "
+            "production model; they are not error metrics for the current forecast issue."
+        )
         recent["target_date_utc"] = pd.to_datetime(recent["target_date_utc"])
         recent["absolute_error_sum"] = recent["mae_mw"] * recent["evaluated_rows"]
         recent["squared_error_sum"] = recent["rmse_mw"].pow(2) * recent["evaluated_rows"]
@@ -167,16 +183,8 @@ else:
         st.dataframe(by_lead[["lead_bucket", "evaluated_rows", "mae_mw", "rmse_mw", "bias_mw"]],
                      hide_index=True, width="stretch")
     else:
-        first_target_utc = view["target_timestamp_utc"].min()
-        latest_actual_utc = view["latest_actual_timestamp_utc"].max()
-        if pd.notna(latest_actual_utc) and latest_actual_utc < first_target_utc:
-            actual_label = latest_actual_utc.strftime("%Y-%m-%d %H:%M UTC")
-            target_label = first_target_utc.strftime("%Y-%m-%d %H:%M UTC")
-            st.info(
-                f"No forecast errors are mature for H{horizon} yet. Actual demand is available "
-                f"through {actual_label}; this forecast starts at {target_label}. "
-                "Reliability metrics will appear as actual demand arrives and monitoring processes it."
-            )
+        if current_issue_has_no_matured_targets:
+            st.caption("Historical reliability will appear after this model has matured forecast errors.")
         else:
             st.info(
                 f"No matured forecast errors are available for the selected H{horizon} model yet. "

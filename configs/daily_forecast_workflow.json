@@ -1,36 +1,21 @@
 {
   "name": "ERCOT_Daily_Forecast_and_Monitoring",
   "schedule": {
-    "quartz_cron_expression": "0 0 6 * * ?",
+    "quartz_cron_expression": "19 0 6 * * ?",
     "timezone_id": "UTC",
     "pause_status": "UNPAUSED"
   },
   "max_concurrent_runs": 1,
   "tasks": [
     {
-      "task_key": "setup_catalog",
-      "description": "Ensures the Unity Catalog medallion schemas and raw landing volume exist.",
-      "notebook_task": {"notebook_path": "src/bronze/setup_schemas", "source": "GIT"},
-      "timeout_seconds": 600
-    },
-    {
-      "task_key": "seed_calendar",
-      "description": "Refreshes the small known calendar and holiday reference table.",
-      "depends_on": [{"task_key": "setup_catalog"}],
-      "notebook_task": {"notebook_path": "src/bronze/seed_calendar", "source": "GIT"},
-      "timeout_seconds": 600
-    },
-    {
       "task_key": "ingest_eia",
       "description": "Ingests real ERCOT demand and EIA day-ahead benchmark data.",
-      "depends_on": [{"task_key": "setup_catalog"}],
       "notebook_task": {"notebook_path": "src/bronze/ingest_eia", "source": "GIT"},
       "timeout_seconds": 1800
     },
     {
       "task_key": "ingest_weather",
       "description": "Ingests retrospective Open-Meteo archive observations through the available date.",
-      "depends_on": [{"task_key": "setup_catalog"}],
       "notebook_task": {"notebook_path": "src/bronze/ingest_weather", "source": "GIT"},
       "timeout_seconds": 1800
     },
@@ -50,7 +35,6 @@
     {
       "task_key": "ingest_zonal",
       "description": "Ingests observed ERCOT weather-zone demand for dashboard analytics.",
-      "depends_on": [{"task_key": "setup_catalog"}],
       "notebook_task": {"notebook_path": "src/bronze/ingest_ercot_zonal", "source": "GIT"},
       "timeout_seconds": 7200
     },
@@ -74,7 +58,7 @@
     },
     {
       "task_key": "conform_grid_weather",
-      "depends_on": [{"task_key": "clean_eia"}, {"task_key": "clean_weather"}, {"task_key": "seed_calendar"}],
+      "depends_on": [{"task_key": "clean_eia"}, {"task_key": "clean_weather"}],
       "notebook_task": {"notebook_path": "src/silver/conformed_grid_weather", "source": "GIT"},
       "timeout_seconds": 1800
     },
@@ -101,7 +85,7 @@
     {
       "task_key": "build_zonal_summary",
       "description": "Publishes observed zonal-demand analytics for the dashboard.",
-      "depends_on": [{"task_key": "clean_zonal"}],
+      "depends_on": [{"task_key": "clean_eia"}, {"task_key": "clean_zonal"}],
       "notebook_task": {"notebook_path": "src/gold/zonal_demand_summary", "source": "GIT"},
       "timeout_seconds": 1800
     }
