@@ -1,31 +1,37 @@
 # Databricks notebook source
-"""Capture issue-time Open-Meteo forecasts for leakage-safe future evaluation.
+"""Capture one issue-time ECMWF IFS forecast snapshot for the four ERCOT sites.
 
-The archive weather table contains retrospective observations only. This
-notebook stores the forecast values returned at each run together with the
-time each station was queried. That retrieval time is the operational
-availability timestamp; Open-Meteo does not expose a model initialization
-timestamp through this endpoint.
+The four coordinates are requested together in one HTTP call. Each successful
+hourly run is retained as an immutable Bronze snapshot with a conservative
+availability timestamp taken after the provider response is received.
 """
 
+import datetime as dt
 import json
 import os
 import sys
 import time
-import uuid
-import datetime as dt
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
+from pyspark.sql.types import (
+    DoubleType,
+    StringType,
+    StructField,
+    StructType,
+    TimestampType,
+)
 from delta.tables import DeltaTable
 from pyspark.sql import functions as F
 
 CATALOG = "main"
 TARGET_TABLE = f"{CATALOG}.bronze.weather_forecast_snapshots"
 RAW_DIR = f"/Volumes/{CATALOG}/bronze/raw_landing/weather_forecasts"
-HORIZON_HOURS = 168
+SNAPSHOT_HOURS = 168
 FORECAST_DAYS = 8
+MAX_ATTEMPTS = 2  # Retry a transient transport/server failure once; never retry 429.
 
 spark.conf.set("spark.sql.session.timeZone", "UTC")
 
@@ -46,82 +52,106 @@ config = load_platform_config("ercot_config.json")
 weather_cfg = config["weather"]
 stations = weather_cfg["stations"]
 variables = weather_cfg["hourly_variables"]
-forecast_url = weather_cfg.get("forecast_base_url", "https://api.open-meteo.com/v1/forecast")
+forecast_url = weather_cfg.get(
+    "forecast_base_url", "https://api.open-meteo.com/v1/ecmwf"
+)
+if len(stations) != 4 or len({station["station_id"] for station in stations}) != 4:
+    raise ValueError("Expected four uniquely named representative weather stations.")
+if not variables or len(variables) > 10:
+    raise ValueError("Request a non-empty set of at most 10 weather variables.")
+
 snapshot_batch_id = str(uuid.uuid4())
+station_ids = [station["station_id"] for station in stations]
 
 
-def fetch_forecast(params: dict, station_id: str) -> dict:
-    """Fetch a station forecast, retrying transient API/server errors only."""
+def request_weather_forecast(params: dict) -> tuple[list[dict], dict, dt.datetime, dt.datetime]:
+    """Make one batched request; only retry transient failures, never quota errors."""
     request_url = f"{forecast_url}?{urllib.parse.urlencode(params)}"
-    request = urllib.request.Request(request_url, headers={"User-Agent": "ERCOT-Platform/1.0"})
-    for attempt in range(1, 4):
+    request = urllib.request.Request(
+        request_url,
+        headers={"User-Agent": "ERCOT-OperationalAnalytics/1.0 (weather snapshot)"},
+    )
+    requested_at = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             with urllib.request.urlopen(request, timeout=45) as response:
                 payload = json.loads(response.read().decode("utf-8"))
-            if payload.get("error"):
+            if isinstance(payload, dict) and payload.get("error"):
                 raise RuntimeError(
-                    f"Open-Meteo rejected {station_id}: {payload.get('reason', 'unknown API error')}"
+                    f"Open-Meteo rejected the forecast request: "
+                    f"{payload.get('reason', 'unknown API error')}"
                 )
-            return payload
+            locations = payload if isinstance(payload, list) else [payload]
+            if len(locations) != len(stations):
+                raise RuntimeError(
+                    f"Open-Meteo returned {len(locations)} location payloads; "
+                    f"expected {len(stations)}."
+                )
+            available_at = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+            return locations, payload, requested_at, available_at
         except urllib.error.HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")[:1000]
-            if error.code < 500 and error.code != 429:
+            # Especially do not retry 429: that would spend more quota while limited.
+            if error.code == 429 or error.code < 500 or attempt == MAX_ATTEMPTS:
                 raise RuntimeError(
-                    f"Open-Meteo rejected {station_id} (HTTP {error.code}): {detail}"
-                ) from error
-            if attempt == 3:
-                raise RuntimeError(
-                    f"Open-Meteo failed for {station_id} after {attempt} attempts (HTTP {error.code})."
+                    f"Open-Meteo forecast request failed (HTTP {error.code}): {detail}"
                 ) from error
         except RuntimeError:
             raise
-        except Exception as error:
-            if attempt == 3:
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            if attempt == MAX_ATTEMPTS:
                 raise RuntimeError(
-                    f"Open-Meteo failed for {station_id} after {attempt} attempts: {error}"
+                    f"Open-Meteo forecast request failed after {attempt} attempts: {error}"
                 ) from error
-        wait_seconds = 2 * attempt
-        print(f"Transient weather forecast request error for {station_id}; retrying in {wait_seconds}s.")
+        wait_seconds = 2
+        print(f"Transient weather API failure; retrying the single batched call once in {wait_seconds}s.")
         time.sleep(wait_seconds)
 
 
+params = {
+    "latitude": ",".join(str(station["latitude"]) for station in stations),
+    "longitude": ",".join(str(station["longitude"]) for station in stations),
+    "hourly": ",".join(variables),
+    "timezone": "UTC",
+    "forecast_days": FORECAST_DAYS,
+}
+location_payloads, raw_payload, requested_at, available_at = request_weather_forecast(params)
+
+# Keep exactly the next 168 complete target hours after this snapshot became
+# available. This preserves the forecast vintage and excludes already-started hours.
+first_target = available_at.replace(minute=0, second=0, microsecond=0) + dt.timedelta(hours=1)
+last_target = available_at + dt.timedelta(hours=SNAPSHOT_HOURS)
 batch_rows = []
-raw_payloads = {}
-for station in stations:
+target_sets = {}
+
+for station, location in zip(stations, location_payloads):
     station_id = station["station_id"]
-    params = {
-        "latitude": station["latitude"],
-        "longitude": station["longitude"],
-        "hourly": ",".join(variables),
-        "timezone": "UTC",
-        "forecast_days": FORECAST_DAYS,
-    }
-    queried_at = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
-    payload = fetch_forecast(params, station_id)
-    retrieved_at = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
-    raw_payloads[station_id] = {
-        "request_params": params,
-        "queried_at_utc": queried_at.isoformat(),
-        "retrieved_at_utc": retrieved_at.isoformat(),
-        "response_envelope": payload,
-    }
-    hourly = payload.get("hourly", {})
+    hourly = location.get("hourly", {})
     target_times = hourly.get("time", [])
-    if not target_times:
-        raise RuntimeError(f"Open-Meteo returned no hourly forecast times for {station_id}.")
     arrays = {name: hourly.get(name, []) for name in variables}
     malformed = [name for name, values in arrays.items() if len(values) != len(target_times)]
-    if malformed:
-        raise RuntimeError(f"Forecast arrays for {station_id} do not align: {malformed}.")
+    if not target_times or malformed:
+        raise RuntimeError(
+            f"Malformed Open-Meteo hourly response for {station_id}; "
+            f"missing times or misaligned variables: {malformed}. No snapshot written."
+        )
 
-    station_rows = 0
+    station_targets = set()
     for index, target_text in enumerate(target_times):
-        target = dt.datetime.fromisoformat(target_text).replace(tzinfo=dt.timezone.utc)
+        target = dt.datetime.fromisoformat(target_text)
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=dt.timezone.utc)
+        else:
+            target = target.astimezone(dt.timezone.utc)
+        if not first_target <= target <= last_target:
+            continue
+        station_targets.add(target)
         row = {
             "snapshot_batch_id": snapshot_batch_id,
             "station_id": station_id,
-            "snapshot_requested_at_utc": queried_at,
-            "snapshot_available_at_utc": retrieved_at,
+            "snapshot_requested_at_utc": requested_at,
+            "snapshot_available_at_utc": available_at,
             "target_timestamp_utc": target,
             "latitude": float(station["latitude"]),
             "longitude": float(station["longitude"]),
@@ -129,64 +159,59 @@ for station in stations:
         for name, values in arrays.items():
             row[name] = None if values[index] is None else float(values[index])
         batch_rows.append(row)
-        station_rows += 1
-    if station_rows < HORIZON_HOURS - 2:
-        raise RuntimeError(
-            f"Only {station_rows} future hourly values were returned for {station_id}; "
-            f"expected at least {HORIZON_HOURS - 2}. No snapshot batch was written."
-        )
-    print(f"Captured {station_rows} future hourly forecast rows for {station_id}.")
+    target_sets[station_id] = station_targets
 
-# Use one conservative availability cutoff for the full multi-station snapshot.
-# This avoids claiming the first station's forecasts were available before the
-# last station response had arrived, and keeps all stations aligned by target.
-snapshot_available_at = max(row["snapshot_available_at_utc"] for row in batch_rows)
-first_valid_target = snapshot_available_at.replace(minute=0, second=0, microsecond=0) + dt.timedelta(hours=1)
-last_valid_target = snapshot_available_at + dt.timedelta(hours=HORIZON_HOURS)
-batch_rows = [
-    row for row in batch_rows
-    if first_valid_target <= row["target_timestamp_utc"] <= last_valid_target
-]
-for row in batch_rows:
-    row["snapshot_available_at_utc"] = snapshot_available_at
-
-expected_stations = {station["station_id"] for station in stations}
-captured_stations = {row["station_id"] for row in batch_rows}
-if captured_stations != expected_stations:
+expected_targets = set.intersection(*(target_sets[sid] for sid in station_ids)) if target_sets else set()
+if len(expected_targets) != SNAPSHOT_HOURS or any(
+    target_sets[sid] != expected_targets for sid in station_ids
+):
+    counts = {station_id: len(targets) for station_id, targets in target_sets.items()}
     raise RuntimeError(
-        f"Incomplete station forecast batch: expected {sorted(expected_stations)}, "
-        f"received {sorted(captured_stations)}. No snapshot batch was written."
+        f"Expected the same {SNAPSHOT_HOURS} future hours for all stations; got {counts}. "
+        "No partial snapshot was written."
     )
-station_counts = {}
-for row in batch_rows:
-    station_counts[row["station_id"]] = station_counts.get(row["station_id"], 0) + 1
-short_stations = {name: count for name, count in station_counts.items() if count < HORIZON_HOURS - 2}
-if short_stations:
-    raise RuntimeError(
-        f"Common aligned snapshot contains too few future hours by station: {short_stations}. "
-        "No snapshot batch was written."
-    )
+if any(row["temperature_2m"] is None for row in batch_rows):
+    raise RuntimeError("ECMWF returned a missing temperature value; no snapshot was written.")
 
-# Preserve original provider payloads for audit/replay before materializing rows.
 os.makedirs(RAW_DIR, exist_ok=True)
-raw_path = f"{RAW_DIR}/open_meteo_forecast_{snapshot_batch_id}.json"
+raw_path = f"{RAW_DIR}/open_meteo_ecmwf_{snapshot_batch_id}.json"
 with open(raw_path, "w", encoding="utf-8") as raw_file:
-    json.dump(raw_payloads, raw_file)
+    json.dump(
+        {
+            "provider": "Open-Meteo",
+            "weather_model": "ECMWF IFS HRES",
+            "request_params": params,
+            "requested_at_utc": requested_at.isoformat(),
+            "available_at_utc": available_at.isoformat(),
+            "response": raw_payload,
+        },
+        raw_file,
+    )
 
-incoming = spark.createDataFrame(batch_rows)
+schema_fields = [
+    StructField("snapshot_batch_id", StringType(), False),
+    StructField("station_id", StringType(), False),
+    StructField("snapshot_requested_at_utc", TimestampType(), False),
+    StructField("snapshot_available_at_utc", TimestampType(), False),
+    StructField("target_timestamp_utc", TimestampType(), False),
+    StructField("latitude", DoubleType(), False),
+    StructField("longitude", DoubleType(), False),
+]
+schema_fields.extend(StructField(name, DoubleType(), True) for name in variables)
+schema = StructType(schema_fields)
+incoming = spark.createDataFrame(batch_rows, schema=schema)
 incoming = (
-    incoming
-    .withColumn("_source", F.lit("Open-Meteo-Forecast"))
+    incoming.withColumn("_source", F.lit("Open-Meteo-ECMWF-IFS-HRES"))
     .withColumn("_raw_payload_path", F.lit(raw_path))
     .withColumn("_ingested_at_utc", F.current_timestamp())
 )
 
 duplicate_count = (
     incoming.groupBy("snapshot_batch_id", "station_id", "target_timestamp_utc")
-    .count().filter(F.col("count") > 1).count()
+    .count().filter(F.col("count") > 1).limit(1).count()
 )
 if duplicate_count:
-    raise RuntimeError(f"Snapshot batch contains {duplicate_count} duplicate station/target keys.")
+    raise RuntimeError("Batched forecast snapshot has duplicate station/target keys.")
 
 if not spark.catalog.tableExists(TARGET_TABLE):
     incoming.write.format("delta").mode("overwrite").saveAsTable(TARGET_TABLE)
@@ -198,15 +223,10 @@ else:
         "AND target.target_timestamp_utc = source.target_timestamp_utc",
     ).whenNotMatchedInsertAll().execute()
 
-summary = incoming.agg(
-    F.count("*").alias("rows"),
-    F.countDistinct("target_timestamp_utc").alias("target_hours"),
-    F.min("target_timestamp_utc").alias("first_target_utc"),
-    F.max("target_timestamp_utc").alias("last_target_utc"),
-).first()
 print(
-    f"Stored weather snapshot {snapshot_batch_id}: {summary['rows']:,} station-hours, "
-    f"{summary['target_hours']:,} target hours, {summary['first_target_utc']} to "
-    f"{summary['last_target_utc']} in {TARGET_TABLE}. Availability time is the as-of time; "
-    "the provider's internal model initialization time is not exposed by this endpoint."
+    f"Stored ECMWF IFS forecast snapshot {snapshot_batch_id}: "
+    f"{len(batch_rows):,} station-hours, {len(expected_targets)} target hours, "
+    f"{min(expected_targets)} to {max(expected_targets)} UTC. "
+    "All four sites were retrieved in one API request; availability is stamped "
+    "after the response because the provider does not expose its model-run issue time."
 )

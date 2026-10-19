@@ -8,6 +8,31 @@
   "max_concurrent_runs": 1,
   "tasks": [
     {
+      "task_key": "ingest_weather_forecast",
+      "description": "Captures one batched ECMWF IFS hourly forecast vintage for all four ERCOT sites; 429 quota errors are not retried.",
+      "notebook_task": {
+        "notebook_path": "src/bronze/ingest_weather_forecast",
+        "source": "GIT"
+      },
+      "timeout_seconds": 300,
+      "max_retries": 0
+    },
+    {
+      "task_key": "clean_weather_forecast",
+      "description": "Conforms issue-time forecast snapshots into availability-stamped regional weather features.",
+      "depends_on": [
+        {
+          "task_key": "ingest_weather_forecast"
+        }
+      ],
+      "notebook_task": {
+        "notebook_path": "src/silver/clean_weather_forecast",
+        "source": "GIT"
+      },
+      "timeout_seconds": 600,
+      "max_retries": 1
+    },
+    {
       "task_key": "ingest_eia",
       "description": "Incremental EIA demand and day-ahead forecast ingestion with restatement buffer.",
       "notebook_task": {
@@ -115,24 +140,11 @@
       "max_retries": 1
     },
     {
-      "task_key": "capture_ercot_benchmark",
-      "description": "Captures ERCOT NP3-561-CD seven-day system-total forecast vintages when API credentials are configured; independent from the forecast serving chain.",
-      "notebook_task": {
-        "source": "GIT",
-        "notebook_path": "src/bronze/ingest_ercot_benchmark"
-      },
-      "timeout_seconds": 600,
-      "max_retries": 0
-    },
-    {
       "task_key": "evaluate_benchmarks",
       "description": "Materializes fair as-of H24 versus EIA and H168 versus ERCOT comparison metrics; reports pending until matched vintages mature.",
       "depends_on": [
         {
           "task_key": "monitor_forecasts"
-        },
-        {
-          "task_key": "capture_ercot_benchmark"
         }
       ],
       "notebook_task": {

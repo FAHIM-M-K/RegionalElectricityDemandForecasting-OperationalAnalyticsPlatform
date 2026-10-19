@@ -17,29 +17,6 @@
       "timeout_seconds": 1800
     },
     {
-      "task_key": "ingest_weather_forecast",
-      "description": "Snapshots issue-time Open-Meteo forecasts for future leakage-safe weather-feature evaluation.",
-      "notebook_task": {
-        "notebook_path": "src/bronze/ingest_weather_forecast",
-        "source": "GIT"
-      },
-      "timeout_seconds": 900
-    },
-    {
-      "task_key": "clean_weather_forecast",
-      "description": "Conforms issue-time weather snapshots into regional, availability-stamped hourly features.",
-      "depends_on": [
-        {
-          "task_key": "ingest_weather_forecast"
-        }
-      ],
-      "notebook_task": {
-        "notebook_path": "src/silver/clean_weather_forecast",
-        "source": "GIT"
-      },
-      "timeout_seconds": 900
-    },
-    {
       "task_key": "ingest_zonal",
       "description": "Ingests observed ERCOT weather-zone demand for dashboard analytics.",
       "notebook_task": {
