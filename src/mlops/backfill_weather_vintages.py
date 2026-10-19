@@ -167,6 +167,7 @@ if spark.catalog.tableExists(TARGET_TABLE):
     }
 pending_rows = []
 processed_since_checkpoint = 0
+incomplete_origins = []
 
 
 def checkpoint(rows_to_write: list[dict]) -> None:
@@ -211,6 +212,8 @@ for request_index, run_init in enumerate(run_inits, start=1):
     }
     for origin in run_origins:
         _, available_at, issue_proxy = selected[origin]
+        origin_rows = []
+        missing_weather = None
         for lead in range(1, HORIZON_HOURS + 1):
             target = origin + dt.timedelta(hours=lead)
             station_values = {
@@ -218,14 +221,15 @@ for request_index, run_init in enumerate(run_inits, start=1):
                 for station in stations
             }
             if any(value is None for value in station_values.values()):
-                raise RuntimeError(
-                    f"Incomplete four-station weather at {target} for origin {origin}; "
-                    "refusing a partial backtest horizon."
-                )
+                missing_weather = {
+                    "target": target,
+                    "stations": [key for key, value in station_values.items() if value is None],
+                }
+                break
             station_values = {key: float(value) for key, value in station_values.items()}
             weighted_c = sum(station_values[key] * weights[key] for key in weights)
             weighted_f = weighted_c * 9.0 / 5.0 + 32.0
-            pending_rows.append({
+            origin_rows.append({
                 "respondent": "ERCO",
                 "forecast_origin_utc": origin,
                 "target_timestamp_utc": target,
@@ -239,6 +243,17 @@ for request_index, run_init in enumerate(run_inits, start=1):
                 "hdh_65_forecast": round(max(65.0 - weighted_f, 0.0), 3),
                 **{f"temperature_{key}_c": value for key, value in station_values.items()},
             })
+        if missing_weather is not None:
+            incomplete_origins.append({
+                "origin": origin,
+                "target": missing_weather["target"],
+                "stations": missing_weather["stations"],
+                "run_init": run_init,
+            })
+            continue
+        if len(origin_rows) != HORIZON_HOURS:
+            raise RuntimeError(f"Origin {origin} produced {len(origin_rows)} rows; expected {HORIZON_HOURS}.")
+        pending_rows.extend(origin_rows)
     if request_index % 50 == 0 or request_index == len(run_inits):
         print(
             f"Processed {request_index:,}/{len(run_inits):,} unique runs; "
@@ -259,6 +274,15 @@ if pending_rows:
     print(f"Saved final batch of {len(pending_rows):,} rows.")
 if not spark.catalog.tableExists(TARGET_TABLE):
     raise RuntimeError("No weather backtest vintages were materialized.")
+if incomplete_origins:
+    examples = "; ".join(
+        f"origin {item['origin']} target {item['target']} missing {','.join(item['stations'])}"
+        for item in incomplete_origins[:5]
+    )
+    print(
+        f"Excluded {len(incomplete_origins)} origins with any missing station-hour "
+        f"(whole origins excluded from both models). Examples: {examples}"
+    )
 
 summary = spark.table(TARGET_TABLE).filter(
     F.col("forecast_origin_utc") >= F.lit(ARCHIVE_START_UTC)
