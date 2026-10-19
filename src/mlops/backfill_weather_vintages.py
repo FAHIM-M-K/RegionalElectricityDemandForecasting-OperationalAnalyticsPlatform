@@ -9,7 +9,9 @@ conservative historical issue cutoff (forecast origin + 65 minutes), selects
 the latest 00Z/12Z ECMWF IFS run available by that cutoff (init + 6 hours),
 and stores weighted four-station temperature for each H168 example target.
 The issue-time offset is an explicit proxy based on the observed daily run;
-the later comparison must report that assumption.
+the later comparison must report that assumption. If the selected archived
+run has a gap, only the immediately previous eligible cycle is considered as
+a fallback; older runs are not chased because they are less representative.
 """
 
 import datetime as dt
@@ -35,9 +37,13 @@ ARCHIVE_START_UTC = dt.datetime(2025, 1, 15, tzinfo=dt.timezone.utc)
 ISSUE_DELAY_MINUTES = 65
 CONSERVATIVE_PUBLICATION_DELAY_HOURS = 6
 HORIZON_HOURS = 168
-FORECAST_DAYS = 8
+FORECAST_DAYS = 9
 REQUEST_PAUSE_SECONDS = 0.15
 CHECKPOINT_EVERY_RUNS = 20
+
+
+class DailyApiQuotaExceeded(RuntimeError):
+    """Open-Meteo's daily request quota is exhausted; retrying cannot help today."""
 
 spark.conf.set("spark.sql.session.timeZone", "UTC")
 
@@ -102,6 +108,11 @@ def request_run(run_init: dt.datetime) -> list[dict]:
             break
         except urllib.error.HTTPError as error:
             body = error.read().decode("utf-8", errors="replace")[:1500]
+            if error.code == 429 and "daily api request limit exceeded" in body.lower():
+                raise DailyApiQuotaExceeded(
+                    f"Open-Meteo daily request quota is exhausted at ECMWF run "
+                    f"{run_init:%Y-%m-%dT%H:%M}."
+                ) from error
             if error.code < 500 and error.code != 429:
                 raise RuntimeError(
                     f"Single Runs API rejected ECMWF vintage {run_init:%Y-%m-%dT%H:%M} "
@@ -189,9 +200,26 @@ def checkpoint(rows_to_write: list[dict]) -> None:
 
 def temperature_map_for_run(run_init: dt.datetime) -> dict:
     """Load aligned station-hour data once per vintage and retain nulls for diagnosis."""
+    global pending_rows
     if run_init in run_temperature_cache:
         return run_temperature_cache[run_init]
-    payloads = request_run(run_init)
+    try:
+        payloads = request_run(run_init)
+    except DailyApiQuotaExceeded as error:
+        # Save only fully built origins. An incomplete origin is still local to
+        # build_complete_origin and is never appended to this checkpoint batch.
+        checkpoint(pending_rows)
+        if pending_rows:
+            existing_origins.update(row["forecast_origin_utc"] for row in pending_rows)
+            print(
+                f"Quota stop: checkpointed {len(pending_rows):,} complete weather rows "
+                f"({len(existing_origins):,} complete origins are now resumable)."
+            )
+            pending_rows = []
+        raise RuntimeError(
+            f"{error} The completed work has been saved. Stop this notebook and rerun it "
+            "after the provider quota resets; it will resume from completed 168-hour origins."
+        ) from error
     times_by_station = []
     temps_by_station = []
     for station, payload in zip(stations, payloads):
@@ -264,7 +292,7 @@ for request_index, run_init in enumerate(run_inits, start=1):
             # ECMWF cycles only when their conservative publication time still
             # precedes the historical issue-time proxy.
             fallback_init = run_init - dt.timedelta(hours=12)
-            while fallback_init + dt.timedelta(hours=CONSERVATIVE_PUBLICATION_DELAY_HOURS) <= selected[origin][2]:
+            if fallback_init + dt.timedelta(hours=CONSERVATIVE_PUBLICATION_DELAY_HOURS) <= selected[origin][2]:
                 fallback_rows, fallback_gap = build_complete_origin(origin, fallback_init)
                 if fallback_gap is None:
                     print(
@@ -272,13 +300,18 @@ for request_index, run_init in enumerate(run_inits, start=1):
                         f"latest eligible vintage {run_init} has {gap['missing']} at {gap['target']}."
                     )
                     origin_rows = fallback_rows
-                    break
-                fallback_init -= dt.timedelta(hours=12)
+                else:
+                    raise RuntimeError(
+                        f"Selected ECMWF run {run_init} has a gap ({gap['missing']} at {gap['target']}) "
+                        f"and the immediately previous eligible run {fallback_init} also has a gap "
+                        f"({fallback_gap['missing']} at {fallback_gap['target']}). "
+                        "No partial origin was saved; inspect these two API responses before retrying."
+                    )
             else:
                 raise RuntimeError(
-                    f"No complete, issue-time-eligible ECMWF vintage covers origin {origin}. "
-                    f"Latest eligible run {run_init} is missing {gap['missing']} at {gap['target']}; "
-                    f"older eligible vintages were also incomplete. No partial origin was saved."
+                    f"Selected ECMWF run {run_init} has a gap ({gap['missing']} at {gap['target']}) "
+                    f"for origin {origin}, and no previous cycle is available by the issue-time proxy. "
+                    "No partial origin was saved."
                 )
         if len(origin_rows) != HORIZON_HOURS:
             raise RuntimeError(f"Origin {origin} produced {len(origin_rows)} rows; expected {HORIZON_HOURS}.")
