@@ -52,11 +52,20 @@ fix_plan.md
 project_10_of_10_plan.md
 notebooks/eda/findings.md
 plan.md
-
+MODEL_CARD.md
+MODEL_SCORECARD.md
+OPERATIONS_RUNBOOK.md
+progress_phase1.md
+progress_phase2.md
+project.md
+powerBI_2.md
+project_phase2.md
 docs/
 
-ERCOTGridBI.pbix
+ERCOTGridBI.pbip
 powerBI.md 
+ERCOTGridBI.Report
+ERCOTGridBI.SemanticModel
 
 # tests
 # notebooks
