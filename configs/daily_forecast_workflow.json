@@ -85,7 +85,7 @@
     {
       "task_key": "build_zonal_summary",
       "description": "Publishes observed zonal-demand analytics for the dashboard.",
-      "depends_on": [{"task_key": "clean_eia"}, {"task_key": "clean_zonal"}],
+      "depends_on": [{"task_key": "clean_zonal"}],
       "notebook_task": {"notebook_path": "src/gold/zonal_demand_summary", "source": "GIT"},
       "timeout_seconds": 1800
     }

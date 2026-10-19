@@ -71,6 +71,23 @@ def validate_and_promote_horizon(horizon: int, candidate_run_id: str | None = No
         raise RuntimeError(f"No H{horizon} candidate run was produced.")
 
     candidate = client.get_run(candidate_run_id)
+    candidate_tags = candidate.data.tags
+    candidate_role = candidate_tags.get("pipeline_role")
+    if candidate_role != "CHAMPION_CANDIDATE":
+        raise ValueError(
+            f"Run {candidate_run_id} has role {candidate_role!r}; "
+            "only a CHAMPION_CANDIDATE run can be validated for promotion."
+        )
+    expected_horizon = f"H{horizon}"
+    candidate_horizon = candidate_tags.get("target_horizon")
+    candidate_horizon_param = candidate.data.params.get("horizon_hours")
+    if candidate_horizon != expected_horizon or str(candidate_horizon_param) != str(horizon):
+        client.set_tag(candidate_run_id, "pipeline_role", "REJECTED_CANDIDATE")
+        raise ValueError(
+            f"Run {candidate_run_id} is not an H{horizon} candidate "
+            f"(tag={candidate_horizon!r}, parameter={candidate_horizon_param!r}); "
+            "candidate horizon must match the validation task."
+        )
     candidate_schema = candidate.data.params.get("feature_schema_version")
     if candidate_schema != FEATURE_SCHEMA_VERSION:
         client.set_tag(candidate_run_id, "pipeline_role", "REJECTED_CANDIDATE")

@@ -1,4 +1,7 @@
 import json
+import importlib.util
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -200,6 +203,95 @@ def test_promotion_gate_rejects_insufficient_or_incomplete_windows():
     incomplete = evaluate_promotion_gate(incomplete_windows)
     assert not incomplete["accepted"]
     assert incomplete["reason"] == "selection window metrics are incomplete"
+
+
+def test_promoted_candidate_keeps_schema_and_policy_metadata_in_mlflow(monkeypatch):
+    from src.mlops.backtest_multihorizon import PROMOTION_POLICY_VERSION
+    from src.shared.forecast_contract import FEATURE_SCHEMA_VERSION
+
+    class FakeClient:
+        def __init__(self):
+            self.tags = {}
+            self.candidate = SimpleNamespace(
+                info=SimpleNamespace(run_id="candidate-run"),
+                data=SimpleNamespace(
+                    params={
+                        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+                        "promotion_policy_version": PROMOTION_POLICY_VERSION,
+                        "horizon_hours": "168",
+                        "selection_windows": "4",
+                    },
+                    tags={
+                        "pipeline_role": "CHAMPION_CANDIDATE",
+                        "target_horizon": "H168",
+                    },
+                    metrics={
+                        "selection_mae": 1_800.0,
+                        "selection_baseline_mae": 2_000.0,
+                        "selection_peak_mae": 1_000.0,
+                        **{
+                            key: value
+                            for index in range(1, 5)
+                            for key, value in (
+                                (f"selection_window_{index}_model_mae", 1_800.0),
+                                (f"selection_window_{index}_baseline_mae", 2_000.0),
+                                (f"selection_window_{index}_model_peak_mae", 1_000.0),
+                                (f"selection_window_{index}_baseline_peak_mae", 1_000.0),
+                            )
+                        },
+                    },
+                ),
+            )
+
+        def get_experiment_by_name(self, _name):
+            return SimpleNamespace(experiment_id="experiment-id")
+
+        def get_run(self, _run_id):
+            return self.candidate
+
+        def search_runs(self, *_args, **_kwargs):
+            return []
+
+        def set_tag(self, run_id, key, value):
+            self.tags[(run_id, key)] = value
+
+    fake_client = FakeClient()
+    fake_mlflow = SimpleNamespace(tracking=SimpleNamespace(MlflowClient=lambda: fake_client))
+    monkeypatch.setitem(__import__("sys").modules, "mlflow", fake_mlflow)
+    module_path = Path("src/mlops/validate_model.py")
+    spec = importlib.util.spec_from_file_location("validate_model_test_module", module_path)
+    validator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(validator)
+    validator.client = fake_client
+
+    assert validator.validate_and_promote_horizon(168, "candidate-run")
+    assert fake_client.tags[("candidate-run", "pipeline_role")] == "PRODUCTION"
+    assert fake_client.tags[("candidate-run", "target_horizon")] == "H168"
+    assert fake_client.tags[("candidate-run", "feature_schema_version")] == FEATURE_SCHEMA_VERSION
+    assert fake_client.tags[("candidate-run", "promotion_policy_version")] == PROMOTION_POLICY_VERSION
+
+    fake_client.tags.clear()
+    fake_client.candidate.data.tags["target_horizon"] = "H24"
+    fake_client.candidate.data.params["horizon_hours"] = "24"
+    try:
+        validator.validate_and_promote_horizon(168, "candidate-run")
+    except ValueError as exc:
+        assert "candidate horizon must match" in str(exc)
+    else:
+        raise AssertionError("The validator promoted an H24 run as an H168 candidate.")
+    assert fake_client.tags[("candidate-run", "pipeline_role")] == "REJECTED_CANDIDATE"
+
+    fake_client.tags.clear()
+    fake_client.candidate.data.tags["pipeline_role"] = "PRODUCTION"
+    fake_client.candidate.data.tags["target_horizon"] = "H168"
+    fake_client.candidate.data.params["horizon_hours"] = "168"
+    try:
+        validator.validate_and_promote_horizon(168, "candidate-run")
+    except ValueError as exc:
+        assert "only a CHAMPION_CANDIDATE" in str(exc)
+    else:
+        raise AssertionError("The validator accepted a production run as a candidate.")
+    assert fake_client.tags == {}
 
 
 def test_scoring_issues_both_products_and_uses_labeled_h168_fallback():
