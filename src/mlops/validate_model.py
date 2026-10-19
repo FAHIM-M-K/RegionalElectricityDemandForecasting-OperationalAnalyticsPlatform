@@ -85,6 +85,10 @@ def validate_and_promote_horizon(horizon: int, candidate_run_id: str | None = No
             f"H{horizon} candidate was trained under promotion policy {candidate_policy!r}; "
             f"expected {PROMOTION_POLICY_VERSION!r}. Re-run retraining from the current code."
         )
+    # Keep the validated contract discoverable in MLflow's tag filters as well
+    # as in its parameter history, including for candidates logged by older code.
+    client.set_tag(candidate_run_id, "feature_schema_version", candidate_schema)
+    client.set_tag(candidate_run_id, "promotion_policy_version", candidate_policy)
     metrics = candidate.data.metrics
     score, baseline, peak_score = (metrics.get(key) for key in
         ("selection_mae", "selection_baseline_mae", "selection_peak_mae"))

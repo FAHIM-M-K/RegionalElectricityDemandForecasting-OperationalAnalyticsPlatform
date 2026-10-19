@@ -332,6 +332,33 @@ for window_index, (window_start, window_end) in enumerate(date_ranges, start=1):
 print(f"Total authentic subregion records extracted: {len(records)} across {len(raw_payloads)} API pages.")
 
 if records:
+    # Report source publication freshness separately from ingestion success.
+    # EIA can publish zonal observations later than system-wide demand; that
+    # upstream lag is informative but must not cause valid ingestion to fail.
+    latest_period_by_zone = {}
+    for record in records:
+        raw_zone = record.get("subba") or record.get("subregion") or ""
+        zone = canonical_zone_code(raw_zone, SOURCE_TO_ZONE_CODE)
+        period = record.get("period")
+        if zone and period:
+            latest_period_by_zone[zone] = max(period, latest_period_by_zone.get(zone, period))
+
+    checked_at_utc = datetime.datetime.now(datetime.timezone.utc)
+    for zone in sorted(EXPECTED_SUBREGIONS):
+        latest_period = latest_period_by_zone.get(zone)
+        if latest_period is None:
+            print(f"Source freshness by zone: {zone} has no returned period in this run.")
+            continue
+        latest_period_utc = datetime.datetime.strptime(
+            latest_period[:13], "%Y-%m-%dT%H"
+        ).replace(tzinfo=datetime.timezone.utc)
+        age_hours = max(0.0, (checked_at_utc - latest_period_utc).total_seconds() / 3600)
+        print(
+            f"Source freshness by zone: {zone} latest returned period={latest_period} UTC; "
+            f"age at fetch completion={age_hours:.1f} hours; requested through={end_param} UTC."
+        )
+
+if records:
     # 1. Raw Archival: Persist response envelopes into Volume
     raw_landing_dir = f"/Volumes/{CATALOG}/bronze/raw_landing/ercot_zonal"
     os.makedirs(raw_landing_dir, exist_ok=True)

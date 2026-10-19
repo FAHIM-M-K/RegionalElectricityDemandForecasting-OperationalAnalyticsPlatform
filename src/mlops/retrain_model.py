@@ -178,6 +178,21 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
               "selection_baseline_peak_mae": selection_peak_baseline,
               "selection_window_wins": selection_window_wins,
               "selection_windows": len(selection_results), "final": final_result, "run_id": None}
+    holdout_period = {
+        "final_holdout_rows": len(final_holdout),
+        "final_holdout_origin_start_utc": str(final_holdout["forecast_origin_utc"].min()),
+        "final_holdout_origin_end_utc": str(final_holdout["forecast_origin_utc"].max()),
+        "final_holdout_target_start_utc": str(final_holdout["target_timestamp_utc"].min()),
+        "final_holdout_target_end_utc": str(final_holdout["target_timestamp_utc"].max()),
+        "final_holdout_test_start_utc": str(final["test_start"]),
+        "final_holdout_test_end_utc": str(final["test_end"]),
+    }
+    print(
+        f"H{horizon} untouched holdout: {len(final_holdout):,} rows; "
+        f"origin interval [{final['test_start']}, {final['test_end']}) UTC; "
+        f"targets {holdout_period['final_holdout_target_start_utc']} through "
+        f"{holdout_period['final_holdout_target_end_utc']} UTC."
+    )
     if MLFLOW_AVAILABLE:
         mlflow.set_experiment(EXPERIMENT_NAME)
         with mlflow.start_run(run_name=f"SeasonalResidual_LightGBM_H{horizon}") as run:
@@ -185,7 +200,8 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
             mlflow.log_params({**MODEL_PARAMS, "horizon_hours": horizon, "feature_schema_version": FEATURE_SCHEMA_VERSION,
                                "feature_count": len(features), "selection_windows": len(selection_results),
                                "training_rows": len(pre_holdout), "training_origin_start": str(pre_holdout.forecast_origin_utc.min()),
-                               "training_origin_end": str(pre_holdout.forecast_origin_utc.max())})
+                               "training_origin_end": str(pre_holdout.forecast_origin_utc.max()),
+                               **holdout_period})
             logged_metrics = {"selection_mae": selection_mae, "selection_peak_mae": result["selection_peak_mae"],
                               "selection_baseline_mae": selection_baseline,
                               "final_holdout_mae": final_result["model"]["mae"],
@@ -282,7 +298,9 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
                                           for name, value in zip(booster.feature_name(), booster.feature_importance("gain"))]},
                             "feature_importance.json")
             mlflow.set_tags({"pipeline_role": "CHAMPION_CANDIDATE", "target_horizon": f"H{horizon}",
-                             "model_type": "seasonal_naive_residual_lightgbm", "weather_assumption": "no_weather"})
+                             "model_type": "seasonal_naive_residual_lightgbm", "weather_assumption": "no_weather",
+                             "feature_schema_version": FEATURE_SCHEMA_VERSION,
+                             "promotion_policy_version": PROMOTION_POLICY_VERSION})
             # Keep the model's input contract in MLflow so registry consumers
             # can validate the feature columns and types at load time.
             mlflow.lightgbm.log_model(
