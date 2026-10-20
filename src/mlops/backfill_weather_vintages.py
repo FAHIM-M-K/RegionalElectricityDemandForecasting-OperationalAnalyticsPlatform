@@ -82,6 +82,7 @@ if "dbutils" in globals():
     except Exception:
         dbutils.widgets.text("run_api_backfill", "false", "Issue weather API requests")
     RUN_API_BACKFILL = dbutils.widgets.get("run_api_backfill").strip().lower() in {"1", "true", "yes"}
+print(f"Effective run_api_backfill setting: {RUN_API_BACKFILL}")
 
 config = load_platform_config("ercot_config.json")
 stations = config["weather"]["stations"]
