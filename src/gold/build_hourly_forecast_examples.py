@@ -9,10 +9,8 @@ future label halo needed to build each chunk's hourly H24/H168 examples.
 
 import os
 import sys
-from datetime import timedelta
 
 import pandas as pd
-from delta.tables import DeltaTable
 from pyspark.sql import functions as F
 
 CATALOG = "main"
@@ -33,7 +31,7 @@ for _ in range(5):
     _root = os.path.dirname(_root)
 
 from src.gold.forecast_example_features import generate_forecast_examples_df
-from src.shared.forecast_contract import EXAMPLE_GRAIN_KEYS
+from src.shared.forecast_contract import FEATURE_SET_DEMAND_FOUNDATION
 
 
 def _as_utc(value) -> pd.Timestamp:
@@ -67,7 +65,6 @@ if first_origin > last_origin:
     )
 
 source_columns = sorted(required_columns)
-grain_condition = " AND ".join(f"t.`{key}` = s.`{key}`" for key in EXAMPLE_GRAIN_KEYS)
 chunk_start = first_origin
 total_written = 0
 chunk_number = 0
@@ -91,19 +88,32 @@ while chunk_start <= last_origin:
     if not examples.empty:
         origins = pd.to_datetime(examples["forecast_origin_utc"], utc=True)
         examples = examples.loc[(origins >= chunk_start) & (origins < chunk_end)].copy()
-    if not examples.empty:
-        incoming = spark.createDataFrame(examples)
+    if not examples.empty or table_exists:
+        incoming = (
+            spark.createDataFrame(examples)
+            if not examples.empty
+            else spark.table(TARGET_TABLE).limit(0)
+        )
         if not table_exists:
             incoming.write.format("delta").mode("overwrite").partitionBy("horizon_hours").saveAsTable(TARGET_TABLE)
             table_exists = True
         else:
-            DeltaTable.forName(spark, TARGET_TABLE).alias("t").merge(
-                incoming.alias("s"), grain_condition
-            ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+            # Origin ranges are disjoint across chunks. Replacing only this
+            # chunk's respondent/feature/time slice is idempotent on reruns and
+            # avoids a growing full-table MERGE scan for every 30-day batch.
+            replace_predicate = (
+                f"respondent = '{RESPONDENT}' "
+                f"AND feature_set = '{FEATURE_SET_DEMAND_FOUNDATION}' "
+                f"AND forecast_origin_utc >= TIMESTAMP '{chunk_start:%Y-%m-%d %H:%M:%S}' "
+                f"AND forecast_origin_utc < TIMESTAMP '{chunk_end:%Y-%m-%d %H:%M:%S}'"
+            )
+            incoming.write.format("delta").mode("overwrite").option(
+                "replaceWhere", replace_predicate
+            ).saveAsTable(TARGET_TABLE)
         total_written += len(examples)
     print(
         f"Hourly example chunk {chunk_number}: origins {chunk_start} to "
-        f"{chunk_end - pd.Timedelta(hours=1)}; {len(examples):,} rows merged."
+        f"{chunk_end - pd.Timedelta(hours=1)}; {len(examples):,} rows materialized."
     )
     chunk_start = chunk_end
 
@@ -122,5 +132,5 @@ print(
     f"{summary['rows']:,} rows, {summary['origins']:,} hourly origins, "
     f"{summary['valid_rows']:,} valid training rows, "
     f"{summary['first_origin']} through {summary['last_origin']}. "
-    f"Rows merged in this run: {total_written:,}."
+    f"Rows rewritten in this run: {total_written:,}."
 )
