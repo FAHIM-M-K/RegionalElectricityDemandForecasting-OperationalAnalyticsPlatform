@@ -145,7 +145,7 @@
     },
     {
       "task_key": "evaluate_benchmarks",
-      "description": "Materializes fair as-of H24 versus EIA and H168 versus ERCOT comparison metrics; reports pending until matched vintages mature.",
+      "description": "Materializes fair as-of H24 versus EIA and H168 versus the weekly seasonal-naive baseline; adds ERCOT only when authorized issue-vintage data is available. Reports pending until matched targets mature.",
       "depends_on": [
         {
           "task_key": "monitor_forecasts"
