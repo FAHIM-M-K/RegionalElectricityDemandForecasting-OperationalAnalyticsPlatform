@@ -801,10 +801,20 @@ def test_match_h24_and_eia_metrics():
 def test_match_h168_and_ercot_prospective_and_buckets():
     from src.gold.benchmark_evaluation import match_h168_and_ercot
 
-    # Test Case 1: Empty vintages truthfully returns PROSPECTIVE_PENDING_MATURED_DATA
+    # Test Case 1: Missing ERCOT vintages are unavailable, not falsely called prospective capture.
     df_empty, summary_empty = match_h168_and_ercot(pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
-    assert summary_empty["status"] == "PROSPECTIVE_PENDING_MATURED_DATA"
+    assert summary_empty["status"] == "NO_H168_FORECASTS"
     assert summary_empty["matched_rows"] == 0
+
+    h168_without_ercot = pd.DataFrame([{
+        "respondent": "ERCO", "horizon_hours": 168, "lead_hours": 168,
+        "forecast_origin_utc": pd.Timestamp("2024-06-01 00:00:00", tz="UTC"),
+        "issued_at_utc": pd.Timestamp("2024-06-01 00:15:00", tz="UTC"),
+        "target_timestamp_utc": pd.Timestamp("2024-06-08 00:00:00", tz="UTC"),
+        "predicted_demand_mw": 50_000.0,
+    }])
+    _, unavailable = match_h168_and_ercot(h168_without_ercot, pd.DataFrame(), pd.DataFrame())
+    assert unavailable["status"] == "EXTERNAL_BENCHMARK_UNAVAILABLE"
 
     # Test Case 2: Matched curves across lead buckets
     origin = pd.Timestamp("2024-06-01 00:00:00", tz="UTC")

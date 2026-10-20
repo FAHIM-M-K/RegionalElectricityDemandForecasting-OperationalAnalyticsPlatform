@@ -172,22 +172,38 @@ def match_h168_and_ercot(
     """Match rolling H168 forecasts to official ERCOT 7-day benchmark vintages.
 
     Reports overall metrics, lead-bucket metrics (1-24, 25-48, 49-168), and lead-168 diagnostic.
-    If no vintages exist, returns truthful PROSPECTIVE_PENDING_MATURED_DATA status without fabricating scores.
+    Missing ERCOT vintages are reported as EXTERNAL_BENCHMARK_UNAVAILABLE;
+    present but not-yet-matched vintages remain prospectively pending.
     """
     if lead_buckets is None:
         lead_buckets = [(1, 24), (25, 48), (49, 168)]
 
-    if df_ercot_vintages.empty or df_h168_forecasts.empty:
+    if df_h168_forecasts.empty:
+        return pd.DataFrame(), {
+            "status": "NO_H168_FORECASTS",
+            "matched_rows": 0,
+            "unique_targets": 0,
+            "lead_bucket_metrics": {},
+            "lead_168_diagnostic": None,
+            "notice": "No H168 forecast rows are available for the external comparison.",
+        }
+    if df_ercot_vintages.empty:
+        return pd.DataFrame(), {
+            "status": "EXTERNAL_BENCHMARK_UNAVAILABLE",
+            "matched_rows": 0,
+            "unique_targets": 0,
+            "lead_bucket_metrics": {},
+            "lead_168_diagnostic": None,
+            "notice": "No authorized ERCOT issue-vintage data is available; H168 is evaluated against the weekly seasonal-naive baseline.",
+        }
+    if df_actuals.empty:
         return pd.DataFrame(), {
             "status": "PROSPECTIVE_PENDING_MATURED_DATA",
             "matched_rows": 0,
             "unique_targets": 0,
             "lead_bucket_metrics": {},
             "lead_168_diagnostic": None,
-            "notice": (
-                "ERCOT seven-day historical issue vintages are unavailable retrospectively. "
-                "Matched evaluation requires prospective snapshot collection."
-            ),
+            "notice": "ERCOT vintages are present, but no matched target actuals have matured yet.",
         }
 
     h168 = df_h168_forecasts[df_h168_forecasts["horizon_hours"] == 168].copy()
