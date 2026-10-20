@@ -52,6 +52,10 @@ MAX_API_REQUEST_ATTEMPTS_PER_EXECUTION = 9_000
 class DailyApiQuotaExceeded(RuntimeError):
     """Open-Meteo's daily request quota is exhausted; retrying cannot help today."""
 
+
+class WeatherRunUnavailable(RuntimeError):
+    """The selected historical ECMWF cycle is absent from the Single Runs API."""
+
 spark.conf.set("spark.sql.session.timeZone", "UTC")
 
 _root = os.getcwd()
@@ -124,6 +128,10 @@ def request_run(run_init: dt.datetime) -> list[dict]:
                 raise DailyApiQuotaExceeded(
                     f"Open-Meteo daily request quota is exhausted at ECMWF run "
                     f"{run_init:%Y-%m-%dT%H:%M}."
+                ) from error
+            if error.code == 400 and "requested model run is not available" in body.lower():
+                raise WeatherRunUnavailable(
+                    f"ECMWF cycle {run_init:%Y-%m-%dT%H:%M} is unavailable from the Single Runs API."
                 ) from error
             if error.code < 500 and error.code != 429:
                 raise RuntimeError(
@@ -221,7 +229,7 @@ if len(pending_run_inits) > len(selected_run_inits):
     )
 pending_rows = []
 processed_since_checkpoint = 0
-run_temperature_cache = {}
+run_temperature_cache: dict[dt.datetime, dict | None] = {}
 
 
 def checkpoint(rows_to_write: list[dict]) -> None:
@@ -240,13 +248,19 @@ def checkpoint(rows_to_write: list[dict]) -> None:
         ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
 
 
-def temperature_map_for_run(run_init: dt.datetime) -> dict:
+def temperature_map_for_run(run_init: dt.datetime) -> dict | None:
     """Load aligned station-hour data once per vintage and retain nulls for diagnosis."""
     global pending_rows
     if run_init in run_temperature_cache:
         return run_temperature_cache[run_init]
     try:
         payloads = request_run(run_init)
+    except WeatherRunUnavailable as error:
+        # Cache missing cycles too: every hourly origin mapped to this cycle
+        # should fall back without repeatedly querying the same unavailable run.
+        print(f"Selected ECMWF cycle unavailable; eligible-cycle fallback will be tried: {error}")
+        run_temperature_cache[run_init] = None
+        return None
     except (DailyApiQuotaExceeded, ApiRequestBudgetExceeded) as error:
         # Save only fully built origins. An incomplete origin is still local to
         # build_complete_origin and is never appended to this checkpoint batch.
@@ -295,6 +309,12 @@ def build_complete_origin(origin: dt.datetime, run_init: dt.datetime) -> tuple[l
     available_at = run_init + dt.timedelta(hours=CONSERVATIVE_PUBLICATION_DELAY_HOURS)
     issue_proxy = selected[origin][2]
     temperatures = temperature_map_for_run(run_init)
+    if temperatures is None:
+        return None, {
+            "target": origin + dt.timedelta(hours=1),
+            "missing": [{"station": "all", "reason": "ecmwf_run_unavailable"}],
+            "run_init": run_init,
+        }
     origin_rows = []
     for lead in range(1, HORIZON_HOURS + 1):
         target = origin + dt.timedelta(hours=lead)
