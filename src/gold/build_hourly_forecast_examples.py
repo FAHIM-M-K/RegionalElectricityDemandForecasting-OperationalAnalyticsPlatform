@@ -32,7 +32,7 @@ for _ in range(5):
         break
     _root = os.path.dirname(_root)
 
-from src.gold.build_forecast_examples import generate_forecast_examples_df
+from src.gold.forecast_example_features import generate_forecast_examples_df
 from src.shared.forecast_contract import EXAMPLE_GRAIN_KEYS
 
 

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 
-from src.gold.build_forecast_examples import generate_forecast_examples_df
+from src.gold.forecast_example_features import generate_forecast_examples_df
 from src.mlops.backtest_multihorizon import (
     compute_naive_baselines,
     compute_lead_bucket_metrics,
