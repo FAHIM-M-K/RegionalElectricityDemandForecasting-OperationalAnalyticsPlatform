@@ -39,9 +39,6 @@ HORIZON_HOURS = 168
 FORECAST_DAYS = 9
 REQUEST_PAUSE_SECONDS = 1.0
 CHECKPOINT_EVERY_RUNS = 20
-# Preview is the default; a manual Databricks run must explicitly set the widget
-# to true before any external API requests are made.
-RUN_API_BACKFILL = False
 # The Open-Meteo free tier allows 10,000 calls/day. Keep 1,000 calls in reserve
 # for hourly production ingestion and other diagnostics. This is a daily safety
 # ceiling, not a small per-batch throttle. One batched request covers all four
@@ -76,13 +73,10 @@ from src.mlops.weather_api_budget import ApiRequestBudget, ApiRequestBudgetExcee
 
 api_request_budget = ApiRequestBudget(MAX_API_REQUEST_ATTEMPTS_PER_EXECUTION)
 
-if "dbutils" in globals():
-    try:
-        dbutils.widgets.get("run_api_backfill")
-    except Exception:
-        dbutils.widgets.text("run_api_backfill", "false", "Issue weather API requests")
-    RUN_API_BACKFILL = dbutils.widgets.get("run_api_backfill").strip().lower() in {"1", "true", "yes"}
-print(f"Effective run_api_backfill setting: {RUN_API_BACKFILL}")
+print(
+    "Backfill mode: automatically request only unresolved weather vintages. "
+    "This notebook is manually run and is not part of the scheduled production workflow."
+)
 
 config = load_platform_config("ercot_config.json")
 stations = config["weather"]["stations"]
@@ -194,7 +188,7 @@ print(
     f"from {origins[0]} onward. Each request bundles all four stations; checkpoints occur every "
     f"{CHECKPOINT_EVERY_RUNS} runs and can be resumed safely."
 )
-existing_origins = set()
+complete_archive_origins = set()
 if spark.catalog.tableExists(TARGET_TABLE):
     # A raw row count of 168 is not sufficient: duplicates can conceal a
     # missing target hour, null weather features, or rows for another
@@ -220,12 +214,13 @@ if spark.catalog.tableExists(TARGET_TABLE):
         & (F.col("first_target_utc") == F.col("forecast_origin_utc") + F.expr("INTERVAL 1 HOUR"))
         & (F.col("last_target_utc") == F.col("forecast_origin_utc") + F.expr("INTERVAL 168 HOURS"))
     )
-    existing_origins = {
+    complete_archive_origins = {
         pd.to_datetime(row["forecast_origin_utc"], utc=True).to_pydatetime()
         for row in complete_weather_origins.select("forecast_origin_utc").collect()
     }
+explicitly_excluded_origins = set()
 if spark.catalog.tableExists(EXCLUSIONS_TABLE):
-    existing_origins.update(
+    explicitly_excluded_origins = {
         pd.to_datetime(value, utc=True).to_pydatetime()
         for value in spark.table(EXCLUSIONS_TABLE)
         .filter(
@@ -234,26 +229,28 @@ if spark.catalog.tableExists(EXCLUSIONS_TABLE):
             & (F.col("forecast_origin_utc") >= F.lit(ARCHIVE_START_UTC))
         )
         .select("forecast_origin_utc").distinct().toPandas()["forecast_origin_utc"]
-    )
-pending_origins = {origin for origin in origins if origin not in existing_origins}
+    }
+resolved_origins = complete_archive_origins | explicitly_excluded_origins
+# Keep a mutable resolved set for checkpoint updates as runs complete.
+existing_origins = set(resolved_origins)
+pending_origins = {origin for origin in origins if origin not in resolved_origins}
 pending_run_inits = [run_init for run_init in run_inits if any(
     origin in pending_origins for origin in origins_by_run[run_init]
 )]
 print(
-    f"Weather archive preview: {len(origins):,} hourly issue origins, "
+    f"Weather archive status: {len(origins):,} eligible hourly issue origins; "
+    f"{len(complete_archive_origins & set(origins)):,} have complete archived weather; "
+    f"{len(explicitly_excluded_origins & set(origins)):,} are explicitly excluded; "
     f"{len(pending_run_inits):,} unique ECMWF run vintages pending, "
     f"at most {MAX_NEW_RUNS_PER_EXECUTION:,} distinct runs selected, with a hard cap of "
     f"{MAX_API_REQUEST_ATTEMPTS_PER_EXECUTION:,} actual HTTP attempts in one execution "
     "including retries and fallback cycles. Each request bundles all four configured stations."
 )
-if not RUN_API_BACKFILL:
+if not pending_origins:
     dbutils.notebook.exit(
-        f"Preview complete; no Open-Meteo request was made. "
-        f"Eligible H168 origins: {len(origins):,} ({origins[0]} to {origins[-1]}). "
-        f"Pending ECMWF run vintages: {len(pending_run_inits):,}. "
-        f"Per execution: at most {MAX_NEW_RUNS_PER_EXECUTION:,} run vintages and "
-        f"{MAX_API_REQUEST_ATTEMPTS_PER_EXECUTION:,} HTTP attempts including retries/fallbacks. "
-        "To start the resumable backfill, set the run_api_backfill widget to true."
+        f"No Open-Meteo request was needed: all {len(origins):,} eligible H{HORIZON_HOURS} "
+        "origins are either complete in the weather archive or explicitly classified as excluded. "
+        "The backfill is complete; proceed to monthly retraining."
     )
 
 selected_run_inits = pending_run_inits[:MAX_NEW_RUNS_PER_EXECUTION]
