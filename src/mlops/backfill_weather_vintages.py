@@ -205,8 +205,12 @@ print(
 )
 if not RUN_API_BACKFILL:
     dbutils.notebook.exit(
-        "Preview complete. No Open-Meteo request was made. Review the count, then set "
-        "RUN_API_BACKFILL=True to begin a resumable batch."
+        f"Preview complete; no Open-Meteo request was made. "
+        f"Eligible H168 origins: {len(origins):,} ({origins[0]} to {origins[-1]}). "
+        f"Pending ECMWF run vintages: {len(pending_run_inits):,}. "
+        f"Per execution: at most {MAX_NEW_RUNS_PER_EXECUTION:,} run vintages and "
+        f"{MAX_API_REQUEST_ATTEMPTS_PER_EXECUTION:,} HTTP attempts including retries/fallbacks. "
+        "To start the resumable backfill later, set RUN_API_BACKFILL=True."
     )
 
 selected_run_inits = pending_run_inits[:MAX_NEW_RUNS_PER_EXECUTION]
