@@ -813,7 +813,10 @@ def test_match_h24_and_eia_empty_overlap_has_pending_status_and_null_metrics():
     }])
 
     matched, summary = match_h24_and_eia(
-        h24, pd.DataFrame(), pd.DataFrame(), headline_policy="lead_24"
+        h24,
+        pd.DataFrame(columns=["target_timestamp_utc", "forecast_mw", "first_observed_at_utc"]),
+        pd.DataFrame(columns=["respondent", "timestamp_utc", "actual_demand_mw"]),
+        headline_policy="lead_24",
     )
 
     assert matched.empty
