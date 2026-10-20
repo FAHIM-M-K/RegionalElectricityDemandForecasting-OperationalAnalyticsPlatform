@@ -34,7 +34,7 @@ from src.shared.forecast_contract import FEATURE_SCHEMA_VERSION, HORIZONS, featu
 from src.shared.forecast_contract import EXAMPLE_GRAIN_KEYS
 from src.mlops.training_data_contract import (
     DEFAULT_EXAMPLES_TABLE,
-    ROLLING_EXAMPLES_TABLE,
+    WEATHER_ROLLING_EXAMPLES_TABLE,
     clean_training_examples,
     training_origin_stride_hours,
     validate_examples_table,
@@ -121,10 +121,12 @@ def _mean_metric(results: list[Dict[str, Dict[str, float]]], model_name: str, me
 
 def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: int = 4,
                                high_demand_threshold_mw: float = 75_000.0,
-                               examples_table: str = DEFAULT_EXAMPLES_TABLE,
+                               examples_table: str = WEATHER_ROLLING_EXAMPLES_TABLE,
                                origin_stride_hours: int = 1) -> dict:
     """Fit and score one direct horizon model without random splitting."""
-    features, data = features_for_horizon(horizon), _clean_examples(examples, horizon)
+    features = features_for_horizon(horizon)
+    control_features = features_for_horizon(horizon, include_weather=False)
+    data = _clean_examples(examples, horizon)
     splits = generate_chronological_splits(data["forecast_origin_utc"], n_test_windows=n_windows)
     selection_results = []
     for split in (item for item in splits if item["kind"] == "selection"):
@@ -136,10 +138,17 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
         test = data[(data.forecast_origin_utc >= split["test_start"]) & (data.forecast_origin_utc < split["test_end"])]
         if fit_train.empty or validation.empty or test.empty:
             continue
+        weather_model = _fit(fit_train, validation, features)
+        control_model = _fit(fit_train, validation, control_features)
         window_result = _score(
-            _fit(fit_train, validation, features), test, horizon, include_eia=(horizon == 24),
+            weather_model, test, horizon, include_eia=(horizon == 24),
             high_demand_threshold_mw=high_demand_threshold_mw,
         )
+        control_result = _score(
+            control_model, test, horizon, include_eia=(horizon == 24),
+            high_demand_threshold_mw=high_demand_threshold_mw,
+        )
+        window_result["no_weather_control"] = control_result["model"]
         window_result["test_start_utc"] = split["test_start"].isoformat()
         window_result["test_end_utc"] = split["test_end"].isoformat()
         selection_results.append(window_result)
@@ -161,10 +170,18 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
     if production_train.empty or validation.empty or final_holdout.empty:
         raise ValueError(f"H{horizon} does not have sufficient pre-holdout training or final test data.")
     selected_model = _fit(production_train, validation, features)
+    selected_control_model = _fit(production_train, validation, control_features)
     booster = lgb.train(MODEL_PARAMS, lgb.Dataset(pre_holdout[features], label=pre_holdout["residual_target_mw"]),
                         num_boost_round=selected_model.best_iteration)
+    control_booster = lgb.train(
+        MODEL_PARAMS, lgb.Dataset(pre_holdout[control_features], label=pre_holdout["residual_target_mw"]),
+        num_boost_round=selected_control_model.best_iteration,
+    )
     final_result = _score(booster, final_holdout, horizon, include_eia=(horizon == 24),
                           high_demand_threshold_mw=high_demand_threshold_mw)
+    control_final = _score(control_booster, final_holdout, horizon, include_eia=(horizon == 24),
+                           high_demand_threshold_mw=high_demand_threshold_mw)
+    final_result["no_weather_control"] = control_final["model"]
     selection_mae = _mean_metric(selection_results, "model", "mae")
     baseline_name = "daily" if horizon == 24 else "weekly"
     selection_baseline = _mean_metric(selection_results, baseline_name, "mae")
@@ -173,12 +190,19 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
         window["model"]["mae"] < window[baseline_name]["mae"]
         for window in selection_results
     )
+    selection_weather_control_wins = sum(
+        window["model"]["mae"] < window["no_weather_control"]["mae"]
+        for window in selection_results
+    )
 
     result = {"horizon": horizon, "booster": booster, "features": features, "selection_mae": selection_mae,
               "selection_baseline_mae": selection_baseline,
               "selection_peak_mae": _mean_metric(selection_results, "model", "peak_mae"),
               "selection_baseline_peak_mae": selection_peak_baseline,
               "selection_window_wins": selection_window_wins,
+              "selection_no_weather_control_mae": _mean_metric(selection_results, "no_weather_control", "mae"),
+              "selection_no_weather_control_peak_mae": _mean_metric(selection_results, "no_weather_control", "peak_mae"),
+              "selection_weather_control_wins": selection_weather_control_wins,
               "selection_windows": len(selection_results), "final": final_result, "run_id": None}
     holdout_period = {
         "final_holdout_rows": len(final_holdout),
@@ -195,6 +219,14 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
         f"targets {holdout_period['final_holdout_target_start_utc']} through "
         f"{holdout_period['final_holdout_target_end_utc']} UTC."
     )
+    print(
+        f"H{horizon} matched weather ablation: selection MAE "
+        f"{selection_mae:,.1f} MW with weather vs "
+        f"{result['selection_no_weather_control_mae']:,.1f} MW without weather "
+        f"({selection_weather_control_wins}/{len(selection_results)} windows won); "
+        f"untouched holdout {final_result['model']['mae']:,.1f} vs "
+        f"{final_result['no_weather_control']['mae']:,.1f} MW."
+    )
     if MLFLOW_AVAILABLE:
         mlflow.set_experiment(EXPERIMENT_NAME)
         with mlflow.start_run(run_name=f"SeasonalResidual_LightGBM_H{horizon}") as run:
@@ -208,8 +240,14 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
                                **holdout_period})
             logged_metrics = {"selection_mae": selection_mae, "selection_peak_mae": result["selection_peak_mae"],
                               "selection_baseline_mae": selection_baseline,
+                              "selection_weather_control_wins": selection_weather_control_wins,
+                              "selection_weather_control_win_rate": selection_weather_control_wins / len(selection_results),
+                              "selection_no_weather_control_mae": result["selection_no_weather_control_mae"],
+                              "selection_no_weather_control_peak_mae": result["selection_no_weather_control_peak_mae"],
                               "final_holdout_mae": final_result["model"]["mae"],
                               "final_holdout_peak_mae": final_result["model"]["peak_mae"],
+                              "final_holdout_no_weather_control_mae": final_result["no_weather_control"]["mae"],
+                              "final_holdout_no_weather_control_peak_mae": final_result["no_weather_control"]["peak_mae"],
                               "final_holdout_daily_naive_mae": final_result["daily"]["mae"],
                               "final_holdout_weekly_naive_mae": final_result["weekly"]["mae"]}
             baseline_name = "daily" if horizon == 24 else "weekly"
@@ -258,6 +296,8 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
                     f"selection_window_{window_index}_baseline_mae": window_result[baseline_name]["mae"],
                     f"selection_window_{window_index}_model_peak_mae": window_result["model"]["peak_mae"],
                     f"selection_window_{window_index}_baseline_peak_mae": window_result[baseline_name]["peak_mae"],
+                    f"selection_window_{window_index}_no_weather_control_mae": window_result["no_weather_control"]["mae"],
+                    f"selection_window_{window_index}_no_weather_control_peak_mae": window_result["no_weather_control"]["peak_mae"],
                 })
                 for label, model_key in (("model", "model"), ("baseline", baseline_name)):
                     peak = window_result["peak_event_metrics"][model_key]
@@ -296,14 +336,16 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
                                "minimum_selection_windows": MIN_SELECTION_WINDOWS,
                                "minimum_window_win_rate": MIN_WINDOW_WIN_RATE,
                                "maximum_peak_mae_regression": MAX_PEAK_MAE_REGRESSION,
-                               "high_demand_threshold_mw": high_demand_threshold_mw})
+                               "high_demand_threshold_mw": high_demand_threshold_mw,
+                               "weather_control_policy": "same_rows_same_folds_no_weather_ablation",
+                               "minimum_weather_control_win_rate": MIN_WINDOW_WIN_RATE})
             mlflow.log_dict({"horizon_hours": horizon, "importance_type": "gain",
                              "features": [{"feature_name": name, "gain_importance": float(value)}
                                           for name, value in zip(booster.feature_name(), booster.feature_importance("gain"))]},
                             "feature_importance.json")
             mlflow.set_tags({"pipeline_role": "CHAMPION_CANDIDATE", "target_horizon": f"H{horizon}",
-                             "model_type": "seasonal_naive_residual_lightgbm", "weather_assumption": "no_weather",
-                             "training_origin_cadence": "hourly" if examples_table == ROLLING_EXAMPLES_TABLE else "daily",
+                             "model_type": "seasonal_naive_residual_lightgbm", "weather_assumption": "point_in_time_ecmwf_forecast",
+                             "training_origin_cadence": "hourly" if examples_table != DEFAULT_EXAMPLES_TABLE else "daily",
                              "training_origin_stride_hours": str(origin_stride_hours),
                              "feature_schema_version": FEATURE_SCHEMA_VERSION,
                              "promotion_policy_version": PROMOTION_POLICY_VERSION})
@@ -324,10 +366,10 @@ if __name__ == "__main__" and "spark" in globals():
         try:
             dbutils.widgets.get("examples_table")
         except Exception:
-            dbutils.widgets.text("examples_table", DEFAULT_EXAMPLES_TABLE, "Training examples table")
+            dbutils.widgets.text("examples_table", WEATHER_ROLLING_EXAMPLES_TABLE, "Training examples table")
         examples_table = dbutils.widgets.get("examples_table")
     else:
-        examples_table = DEFAULT_EXAMPLES_TABLE
+        examples_table = WEATHER_ROLLING_EXAMPLES_TABLE
     examples_table = validate_examples_table(examples_table)
 
     if "dbutils" in globals():

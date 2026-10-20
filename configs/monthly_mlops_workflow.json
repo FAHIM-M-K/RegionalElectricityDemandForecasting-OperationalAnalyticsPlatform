@@ -11,17 +11,31 @@
       "task_key": "build_forecast_examples",
       "description": "Builds the canonical H24/H168 point-in-time examples from the demand fact table.",
       "notebook_task": {
-        "notebook_path": "src/gold/build_forecast_examples",
+        "notebook_path": "src/gold/build_hourly_forecast_examples",
+        "source": "GIT"
+      },
+      "timeout_seconds": 1800
+    },
+    {
+      "task_key": "build_weather_training_examples",
+      "description": "Joins complete archived ECMWF forecasts to rolling demand examples using only weather available by the simulated hourly issue cutoff.",
+      "depends_on": [
+        {
+          "task_key": "build_forecast_examples"
+        }
+      ],
+      "notebook_task": {
+        "notebook_path": "src/gold/build_weather_training_examples",
         "source": "GIT"
       },
       "timeout_seconds": 1800
     },
     {
       "task_key": "retrain_model",
-      "description": "Retrains independent direct LightGBM models for H24 (Day-Ahead) and H168 (Week-Ahead) over dynamic rolling window.",
+      "description": "Retrains independent direct LightGBM models with demand history and issue-time ECMWF weather on matched rolling origins.",
       "depends_on": [
         {
-          "task_key": "build_forecast_examples"
+          "task_key": "build_weather_training_examples"
         }
       ],
       "notebook_task": {

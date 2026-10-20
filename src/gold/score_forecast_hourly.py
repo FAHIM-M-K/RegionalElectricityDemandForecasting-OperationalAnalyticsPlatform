@@ -26,7 +26,8 @@ for _ in range(5):
 
 from src.shared.forecast_contract import (
     DEMAND_MAX_VALID_MW, DEMAND_MIN_VALID_MW, FEATURE_SCHEMA_VERSION,
-    FEATURE_SET_OPERATIONAL, HORIZONS, features_for_horizon,
+    LEGACY_FEATURE_SCHEMA_VERSION, FEATURE_SET_OPERATIONAL, HORIZONS,
+    features_for_horizon, features_for_schema,
     generate_forecast_issue_id, validate_forecast_issue_frame,
     MAX_STALE_ORIGIN_HOURS, MAX_FAIL_ORIGIN_HOURS,
 )
@@ -45,6 +46,7 @@ EXPERIMENT_NAME = "/Shared/ERCOT_MultiHorizon_Forecast_Platform"
 SOURCE_FACT_TABLE = f"{CATALOG}.gold.fact_hourly_electricity_demand"
 TARGET_LATEST_TABLE = f"{CATALOG}.gold.forecast_latest"
 TARGET_EVALUATION_TABLE = f"{CATALOG}.gold.forecast_evaluation"
+SOURCE_WEATHER_TABLE = f"{CATALOG}.silver.weather_forecast_conformed"
 H168_BASELINE_RUN_ID = "baseline:weekly-seasonal-naive:v1"
 
 
@@ -83,7 +85,8 @@ def _snapshot(frame: pd.DataFrame, origin: pd.Timestamp) -> dict:
 def generate_independent_forecasts(df_history: pd.DataFrame, models: dict, model_runs: dict, origin_utc=None,
                                   holiday_dates: set | None = None, calendar_dates: set | None = None,
                                   high_demand_threshold_mw: float = 75_000.0,
-                                  issued_at_utc=None) -> pd.DataFrame:
+                                  issued_at_utc=None, weather_forecast: pd.DataFrame | None = None,
+                                  model_schemas: dict | None = None) -> pd.DataFrame:
     """Return direct predictions for every lead in H24 and H168 with issue identity and validation."""
     frame = df_history.copy()
     frame["timestamp_utc"] = pd.to_datetime(frame["timestamp_utc"], utc=True)
@@ -109,6 +112,25 @@ def generate_independent_forecasts(df_history: pd.DataFrame, models: dict, model
         raise ValueError(f"Calendar reference does not cover forecast dates: {sorted(missing_calendar)}")
     respondent = str(frame.respondent.iloc[0])
     issued_at = datetime.now(timezone.utc) if issued_at_utc is None else pd.to_datetime(issued_at_utc, utc=True)
+    weather_by_target = {}
+    if weather_forecast is not None and not weather_forecast.empty:
+        weather = weather_forecast.copy()
+        weather["target_timestamp_utc"] = pd.to_datetime(weather["target_timestamp_utc"], utc=True)
+        if "snapshot_available_at_utc" in weather:
+            weather["snapshot_available_at_utc"] = pd.to_datetime(weather["snapshot_available_at_utc"], utc=True)
+            if (weather["snapshot_available_at_utc"] > issued_at).any():
+                raise ValueError("Scoring weather includes a forecast snapshot published after the issue time.")
+        if weather["target_timestamp_utc"].duplicated().any():
+            raise ValueError("Scoring weather has duplicate target-hour rows.")
+        weather_by_target = weather.set_index("target_timestamp_utc").to_dict(orient="index")
+    weather_lineage = {}
+    if weather_by_target:
+        first_weather = next(iter(weather_by_target.values()))
+        weather_lineage = {
+            "weather_snapshot_batch_id": first_weather.get("snapshot_batch_id"),
+            "weather_snapshot_available_at_utc": first_weather.get("snapshot_available_at_utc"),
+            "weather_run_init_utc": None,
+        }
 
     # Calculate source data age and freshness status
     source_age_hours = round((issued_at - origin).total_seconds() / 3600.0, 2)
@@ -121,9 +143,15 @@ def generate_independent_forecasts(df_history: pd.DataFrame, models: dict, model
         use_weekly_baseline = horizon == 168 and model is None and run_id == H168_BASELINE_RUN_ID
         if (model is None and not use_weekly_baseline) or not run_id:
             raise ValueError(f"No active production H{horizon} model is available; scoring stopped.")
-        expected_features = features_for_horizon(horizon)
+        schema = (model_schemas or {}).get(horizon)
+        if use_weekly_baseline:
+            schema = LEGACY_FEATURE_SCHEMA_VERSION
+        if schema is None:
+            schema = FEATURE_SCHEMA_VERSION if model is not None and hasattr(model, "feature_name") \
+                and model.feature_name() == features_for_horizon(horizon) else LEGACY_FEATURE_SCHEMA_VERSION
+        expected_features = features_for_schema(horizon, schema)
         if model is not None and hasattr(model, "feature_name") and model.feature_name() != expected_features:
-            raise ValueError(f"Production H{horizon} model feature schema does not match {FEATURE_SCHEMA_VERSION}.")
+            raise ValueError(f"Production H{horizon} model feature names do not match its recorded schema {schema}.")
         leads = list(range(1, horizon + 1))
         seasonal_lag_hours = 24 if horizon == 24 else 168
         feature_rows = []
@@ -133,8 +161,21 @@ def generate_independent_forecasts(df_history: pd.DataFrame, models: dict, model
             seasonal_value = demand_values.get(seasonal_timestamp, np.nan)
             if pd.isna(seasonal_value):
                 raise ValueError(f"H{horizon} seasonal baseline is unavailable at lead {lead}; required history is missing.")
-            feature_rows.append({"lead_hours": lead, "seasonal_naive_mw": float(seasonal_value),
-                                 **_calendar(target, holiday_dates), **snapshot})
+            feature = {"lead_hours": lead, "seasonal_naive_mw": float(seasonal_value),
+                       **_calendar(target, holiday_dates), **snapshot}
+            if schema == FEATURE_SCHEMA_VERSION:
+                weather_row = weather_by_target.get(target)
+                if weather_row is None:
+                    raise ValueError(
+                        f"Point-in-time weather is unavailable for H{horizon} target {target}; "
+                        "refusing to issue a weather-model forecast with missing inputs."
+                    )
+                for column in features_for_horizon(horizon)[-3:]:
+                    value = weather_row.get(column)
+                    if pd.isna(value):
+                        raise ValueError(f"Weather feature {column} is null for target {target}.")
+                    feature[column] = float(value)
+            feature_rows.append(feature)
         residuals = (np.zeros(len(feature_rows), dtype=float) if use_weekly_baseline
                      else model.predict(pd.DataFrame(feature_rows)[expected_features]))
         predictions = np.asarray([row["seasonal_naive_mw"] for row in feature_rows], dtype=float) + residuals
@@ -157,13 +198,20 @@ def generate_independent_forecasts(df_history: pd.DataFrame, models: dict, model
                 "high_demand_threshold_mw": high_demand_threshold_mw,
                 "freshness_status": freshness_status,
                 "source_data_age_hours": source_age_hours,
-                "feature_set": "weekly_seasonal_naive_baseline" if use_weekly_baseline else FEATURE_SET_OPERATIONAL,
-                "feature_schema_version": "not_applicable_baseline" if use_weekly_baseline else FEATURE_SCHEMA_VERSION,
+                "feature_set": "weekly_seasonal_naive_baseline" if use_weekly_baseline else (
+                    FEATURE_SET_OPERATIONAL if schema == FEATURE_SCHEMA_VERSION else "operational_no_weather"
+                ),
+                "feature_schema_version": "not_applicable_baseline" if use_weekly_baseline else schema,
                 "forecast_source": ("weekly_seasonal_naive_baseline" if use_weekly_baseline
                                     else "seasonal_residual_lightgbm"),
                 "model_version": ("WeeklySeasonalNaive_Baseline_H168" if use_weekly_baseline
                                   else f"SeasonalResidual_LightGBM_H{horizon}"),
                 "model_run_id": run_id,
+                **(weather_lineage if schema == FEATURE_SCHEMA_VERSION else {
+                    "weather_snapshot_batch_id": None,
+                    "weather_snapshot_available_at_utc": None,
+                    "weather_run_init_utc": None,
+                }),
             })
 
     result_df = pd.DataFrame(rows)
@@ -182,7 +230,7 @@ def _production_models():
             "Run the monthly model workflow (build_forecast_examples → retrain_model → validate_model) "
             "once before the daily scorer. Validation must promote production models for both H24 and H168."
         )
-    models, runs = {}, {}
+    models, runs, schemas = {}, {}, {}
     for horizon in HORIZONS:
         found = client.search_runs([experiment.experiment_id],
                                    filter_string=f"tags.pipeline_role = 'PRODUCTION' AND tags.target_horizon = 'H{horizon}'",
@@ -191,6 +239,7 @@ def _production_models():
             if horizon == 168:
                 models[horizon] = None
                 runs[horizon] = H168_BASELINE_RUN_ID
+                schemas[horizon] = "not_applicable_baseline"
                 print("No promoted H168 ML model is available; issuing the explicitly labeled weekly seasonal-naive baseline.")
                 continue
             raise RuntimeError(
@@ -199,14 +248,16 @@ def _production_models():
             )
         runs[horizon] = found[0].info.run_id
         trained_schema = found[0].data.params.get("feature_schema_version")
-        if trained_schema != FEATURE_SCHEMA_VERSION:
+        if trained_schema not in {FEATURE_SCHEMA_VERSION, LEGACY_FEATURE_SCHEMA_VERSION}:
             raise RuntimeError(
-                f"Production H{horizon} model uses feature schema {trained_schema!r}, "
-                f"but this scorer requires {FEATURE_SCHEMA_VERSION!r}. Run monthly retraining "
-                "and promote a model trained with the current schema before daily scoring."
+                f"Production H{horizon} model uses unsupported feature schema {trained_schema!r}."
             )
+        schemas[horizon] = trained_schema
         models[horizon] = mlflow.lightgbm.load_model(f"runs:/{runs[horizon]}/model_seasonal_residual_h{horizon}")
-    return models, runs
+        expected_features = features_for_schema(horizon, trained_schema)
+        if models[horizon].feature_name() != expected_features:
+            raise RuntimeError(f"Production H{horizon} model feature names do not match recorded schema {trained_schema!r}.")
+    return models, runs, schemas
 
 
 if __name__ == "__main__" and "spark" in globals():
@@ -228,10 +279,34 @@ if __name__ == "__main__" and "spark" in globals():
     calendar = spark.table(f"{CATALOG}.bronze.calendar_reference").select("date", "is_holiday").toPandas()
     holidays = set(pd.to_datetime(calendar.loc[calendar.is_holiday.astype(bool), "date"]).dt.date)
     calendar_dates = set(pd.to_datetime(calendar["date"]).dt.date)
-    models, run_ids = _production_models()
+    models, run_ids, model_schemas = _production_models()
+    issue_time = datetime.now(timezone.utc)
+    weather_forecast = None
+    if FEATURE_SCHEMA_VERSION in model_schemas.values():
+        if not spark.catalog.tableExists(SOURCE_WEATHER_TABLE):
+            raise RuntimeError(
+                f"Weather-enabled production model requires {SOURCE_WEATHER_TABLE}; "
+                "the weather snapshot must be ingested and conformed before scoring."
+            )
+        weather_source = spark.table(SOURCE_WEATHER_TABLE).filter(
+            (F.col("snapshot_available_at_utc") <= F.lit(issue_time))
+            & F.col("is_complete_weather_forecast")
+            & (F.col("temperature_reporting_stations_count") == 4)
+        )
+        latest = (weather_source.groupBy("snapshot_batch_id")
+                  .agg(F.max("snapshot_available_at_utc").alias("available_at"))
+                  .orderBy(F.col("available_at").desc()).limit(1).first())
+        if latest is None:
+            raise RuntimeError("No complete, issue-time-available regional weather forecast snapshot exists.")
+        weather_forecast = (weather_source.filter(F.col("snapshot_batch_id") == latest["snapshot_batch_id"])
+                            .select("target_timestamp_utc", "snapshot_available_at_utc",
+                                    "snapshot_batch_id",
+                                    "weighted_temperature_f", "cdh_65_forecast", "hdh_65_forecast")
+                            .orderBy("target_timestamp_utc").toPandas())
     forecast = generate_independent_forecasts(
         history, models, run_ids, holiday_dates=holidays, calendar_dates=calendar_dates,
         high_demand_threshold_mw=high_demand_threshold_mw,
+        issued_at_utc=issue_time, weather_forecast=weather_forecast, model_schemas=model_schemas,
     )
     incoming = spark.createDataFrame(forecast)
     # Validate before persisting: pre-publish gate enforces complete curves (24 + 168 rows)

@@ -109,9 +109,13 @@
     {
       "task_key": "score_forecast_hourly",
       "description": "Issues rolling H24 and H168 forecast curves from the latest valid demand origin; atomic latest publish and append-only history.",
+      "run_if": "AT_LEAST_ONE_SUCCESS",
       "depends_on": [
         {
           "task_key": "build_demand_fact"
+        },
+        {
+          "task_key": "clean_weather_forecast"
         },
         {
           "task_key": "preflight_health_check"

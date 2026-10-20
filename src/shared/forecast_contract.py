@@ -13,8 +13,10 @@ HORIZON_H168 = 168
 HORIZONS: List[int] = [HORIZON_H24, HORIZON_H168]
 LEAD_HOURS = {HORIZON_H24: range(1, 25), HORIZON_H168: range(1, 169)}
 
-FEATURE_SET_OPERATIONAL = "operational_no_weather"
-FEATURE_SCHEMA_VERSION = "v4.0_seasonal_residual_correction"
+FEATURE_SET_OPERATIONAL = "operational_point_in_time_weather"
+FEATURE_SET_DEMAND_FOUNDATION = "rolling_demand_foundation"
+FEATURE_SCHEMA_VERSION = "v5.0_point_in_time_weather"
+LEGACY_FEATURE_SCHEMA_VERSION = "v4.0_seasonal_residual_correction"
 DEMAND_MIN_VALID_MW = 10_000.0
 DEMAND_MAX_VALID_MW = 110_000.0
 
@@ -54,13 +56,16 @@ def generate_forecast_issue_id(
     return f"issue:{respondent}:H{horizon_hours}:{origin_str}:{issued_str}:{run_key}"
 
 
-OPERATIONAL_FEATURES_H24 = [
+WEATHER_FORECAST_FEATURES = [
+    "weighted_temperature_f", "cdh_65_forecast", "hdh_65_forecast",
+]
+OPERATIONAL_FEATURES_H24_BASE = [
     "lead_hours", "seasonal_naive_mw", "hour_local", "day_of_week_local", "is_weekend", "is_holiday",
     "sin_hour", "cos_hour", "sin_dow", "cos_dow", "demand_origin",
     "demand_lag_24h_origin", "demand_lag_48h_origin", "demand_lag_168h_origin",
     "demand_rolling_avg_24h_origin", "demand_rolling_std_24h_origin",
 ]
-OPERATIONAL_FEATURES_H168 = [
+OPERATIONAL_FEATURES_H168_BASE = [
     "lead_hours", "seasonal_naive_mw", "hour_local", "day_of_week_local", "is_weekend", "is_holiday",
     "sin_hour", "cos_hour", "sin_dow", "cos_dow", "demand_origin",
     "demand_lag_24h_origin", "demand_lag_168h_origin", "demand_lag_336h_origin",
@@ -68,12 +73,22 @@ OPERATIONAL_FEATURES_H168 = [
 ]
 
 
-def features_for_horizon(horizon: int) -> List[str]:
+def features_for_horizon(horizon: int, include_weather: bool = True) -> List[str]:
     if horizon == HORIZON_H24:
-        return OPERATIONAL_FEATURES_H24
-    if horizon == HORIZON_H168:
-        return OPERATIONAL_FEATURES_H168
-    raise ValueError(f"Unsupported horizon: {horizon}")
+        base = OPERATIONAL_FEATURES_H24_BASE
+    elif horizon == HORIZON_H168:
+        base = OPERATIONAL_FEATURES_H168_BASE
+    else:
+        raise ValueError(f"Unsupported horizon: {horizon}")
+    return list(base) + (list(WEATHER_FORECAST_FEATURES) if include_weather else [])
+
+
+def features_for_schema(horizon: int, schema_version: str) -> List[str]:
+    if schema_version == FEATURE_SCHEMA_VERSION:
+        return features_for_horizon(horizon, include_weather=True)
+    if schema_version == LEGACY_FEATURE_SCHEMA_VERSION:
+        return features_for_horizon(horizon, include_weather=False)
+    raise ValueError(f"Unsupported H{horizon} feature schema: {schema_version!r}")
 
 
 def validate_example_record(record: Dict[str, Any]) -> None:

@@ -12,7 +12,7 @@ import pandas as pd
 
 from src.shared.forecast_contract import (
     DEMAND_MAX_VALID_MW, DEMAND_MIN_VALID_MW, EXAMPLE_GRAIN_KEYS,
-    FEATURE_SCHEMA_VERSION, FEATURE_SET_OPERATIONAL, HORIZONS, LEAD_HOURS,
+    FEATURE_SCHEMA_VERSION, FEATURE_SET_DEMAND_FOUNDATION, HORIZONS, LEAD_HOURS,
     features_for_horizon,
 )
 
@@ -104,8 +104,8 @@ def _examples_for_respondent(df: pd.DataFrame, horizons: Iterable[int], step_hou
                     "target_timestamp_utc": target,
                     "horizon_hours": horizon,
                     "lead_hours": lead,
-                    "feature_set": FEATURE_SET_OPERATIONAL,
-                    "feature_schema_version": FEATURE_SCHEMA_VERSION,
+                    "feature_set": FEATURE_SET_DEMAND_FOUNDATION,
+                    "feature_schema_version": "demand_foundation_v1",
                     "source_max_observation_utc": origin,
                     "actual_demand_mw": actual,
                     "daily_naive_mw": values.get(target - pd.Timedelta(hours=24), np.nan) if lead <= 24 else np.nan,
@@ -115,7 +115,10 @@ def _examples_for_respondent(df: pd.DataFrame, horizons: Iterable[int], step_hou
                     **snapshot,
                 }
                 row["seasonal_naive_mw"] = row["daily_naive_mw"] if horizon == 24 else row["weekly_naive_mw"]
-                required = features_for_horizon(horizon)
+                # This table is the demand-only rolling example foundation.
+                # Weather is attached from archived issue-time vintages by the
+                # dedicated training-table builder, never from realized weather.
+                required = features_for_horizon(horizon, include_weather=False)
                 row["is_valid_training_example"] = bool(
                     pd.notna(actual)
                     and DEMAND_MIN_VALID_MW <= actual <= DEMAND_MAX_VALID_MW

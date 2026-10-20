@@ -205,7 +205,7 @@ def test_promotion_gate_rejects_insufficient_or_incomplete_windows():
     assert incomplete["reason"] == "selection window metrics are incomplete"
 
 
-def test_promoted_candidate_keeps_schema_and_policy_metadata_in_mlflow(monkeypatch):
+def test_weather_candidate_keeps_production_until_explicit_owner_review(monkeypatch):
     from src.mlops.backtest_multihorizon import PROMOTION_POLICY_VERSION
     from src.shared.forecast_contract import FEATURE_SCHEMA_VERSION
 
@@ -237,6 +237,8 @@ def test_promoted_candidate_keeps_schema_and_policy_metadata_in_mlflow(monkeypat
                                 (f"selection_window_{index}_baseline_mae", 2_000.0),
                                 (f"selection_window_{index}_model_peak_mae", 1_000.0),
                                 (f"selection_window_{index}_baseline_peak_mae", 1_000.0),
+                                (f"selection_window_{index}_no_weather_control_mae", 2_000.0),
+                                (f"selection_window_{index}_no_weather_control_peak_mae", 1_000.0),
                             )
                         },
                     },
@@ -264,9 +266,8 @@ def test_promoted_candidate_keeps_schema_and_policy_metadata_in_mlflow(monkeypat
     spec.loader.exec_module(validator)
     validator.client = fake_client
 
-    assert validator.validate_and_promote_horizon(168, "candidate-run")
-    assert fake_client.tags[("candidate-run", "pipeline_role")] == "PRODUCTION"
-    assert fake_client.tags[("candidate-run", "target_horizon")] == "H168"
+    assert not validator.validate_and_promote_horizon(168, "candidate-run")
+    assert fake_client.tags[("candidate-run", "pipeline_role")] == "WEATHER_CANDIDATE_REQUIRES_REVIEW"
     assert fake_client.tags[("candidate-run", "feature_schema_version")] == FEATURE_SCHEMA_VERSION
     assert fake_client.tags[("candidate-run", "promotion_policy_version")] == PROMOTION_POLICY_VERSION
 
@@ -342,6 +343,75 @@ def test_scoring_issues_both_products_and_uses_labeled_h168_fallback():
         assert "No active production H24" in str(exc)
     else:
         raise AssertionError("Scoring accepted a missing required H24 production model.")
+
+
+def test_weather_schema_scoring_uses_issue_available_weather_features():
+    from src.shared.forecast_contract import FEATURE_SCHEMA_VERSION, features_for_horizon
+
+    class WeatherModel:
+        def __init__(self, columns):
+            self.columns = columns
+            self.seen = None
+        def feature_name(self):
+            return self.columns
+        def predict(self, frame):
+            self.seen = frame.copy()
+            return np.zeros(len(frame))
+
+    history = _hourly(hours=500)
+    origin = history.timestamp_utc.max()
+    issued = origin + pd.Timedelta(minutes=65)
+    calendar_dates = set(pd.date_range("2024-01-01", periods=40, freq="D").date)
+    weather = pd.DataFrame({
+        "target_timestamp_utc": [origin + pd.Timedelta(hours=lead) for lead in range(1, 169)],
+        "snapshot_available_at_utc": [issued - pd.Timedelta(minutes=1)] * 168,
+        "snapshot_batch_id": ["batch-1"] * 168,
+        "weighted_temperature_f": [80.0] * 168,
+        "cdh_65_forecast": [15.0] * 168,
+        "hdh_65_forecast": [0.0] * 168,
+    })
+    weather_model = WeatherModel(features_for_horizon(24))
+    legacy_h168 = type("LegacyModel", (), {"feature_name": lambda self: features_for_horizon(168, False),
+                                           "predict": lambda self, frame: np.zeros(len(frame))})()
+    forecast = generate_independent_forecasts(
+        history, {24: weather_model, 168: legacy_h168}, {24: "weather-h24", 168: "legacy-h168"},
+        holiday_dates=set(), calendar_dates=calendar_dates, issued_at_utc=issued,
+        weather_forecast=weather, model_schemas={24: FEATURE_SCHEMA_VERSION},
+    )
+    assert weather_model.seen["weighted_temperature_f"].eq(80.0).all()
+    assert forecast.loc[forecast.horizon_hours == 24, "weather_snapshot_batch_id"].eq("batch-1").all()
+    assert forecast.loc[forecast.horizon_hours == 168, "weather_snapshot_batch_id"].isna().all()
+
+
+def test_weather_schema_scoring_rejects_weather_published_after_issue_time():
+    from src.shared.forecast_contract import FEATURE_SCHEMA_VERSION, features_for_horizon
+
+    class Model:
+        def feature_name(self):
+            return features_for_horizon(24)
+        def predict(self, frame):
+            return np.zeros(len(frame))
+
+    history = _hourly(hours=500)
+    origin = history.timestamp_utc.max()
+    issued = origin + pd.Timedelta(minutes=65)
+    calendar_dates = set(pd.date_range("2024-01-01", periods=40, freq="D").date)
+    weather = pd.DataFrame({
+        "target_timestamp_utc": [origin + pd.Timedelta(hours=lead) for lead in range(1, 169)],
+        "snapshot_available_at_utc": [issued + pd.Timedelta(minutes=1)] * 168,
+        "weighted_temperature_f": [80.0] * 168, "cdh_65_forecast": [15.0] * 168,
+        "hdh_65_forecast": [0.0] * 168,
+    })
+    try:
+        generate_independent_forecasts(
+            history, {24: Model(), 168: None}, {24: "weather-h24", 168: "baseline:weekly-seasonal-naive:v1"},
+            holiday_dates=set(), calendar_dates=calendar_dates, issued_at_utc=issued,
+            weather_forecast=weather, model_schemas={24: FEATURE_SCHEMA_VERSION},
+        )
+    except ValueError as exc:
+        assert "published after the issue time" in str(exc)
+    else:
+        raise AssertionError("Scoring accepted weather published after the simulated issue time.")
 
 
 def test_forecast_issue_id_is_deterministic_and_unique():

@@ -9,7 +9,9 @@ import numpy as np
 import mlflow
 
 from src.mlops.backtest_multihorizon import PROMOTION_POLICY_VERSION, evaluate_promotion_gate
-from src.shared.forecast_contract import FEATURE_SCHEMA_VERSION, HORIZONS
+from src.shared.forecast_contract import (
+    FEATURE_SCHEMA_VERSION, LEGACY_FEATURE_SCHEMA_VERSION, HORIZONS,
+)
 
 EXPERIMENT_NAME = "/Shared/ERCOT_MultiHorizon_Forecast_Platform"
 client = mlflow.tracking.MlflowClient()
@@ -23,8 +25,9 @@ def _compatible_production_runs(experiment_id: str, horizon: int):
         order_by=["start_time DESC"],
         max_results=10,
     )
+    supported_schemas = {FEATURE_SCHEMA_VERSION, LEGACY_FEATURE_SCHEMA_VERSION}
     return [run for run in production
-            if run.data.params.get("feature_schema_version") == FEATURE_SCHEMA_VERSION]
+            if run.data.params.get("feature_schema_version") in supported_schemas]
 
 
 def _report_retained_production(experiment_id: str, horizon: int) -> bool:
@@ -123,6 +126,28 @@ def validate_and_promote_horizon(horizon: int, candidate_run_id: str | None = No
             "baseline_peak_mae": metrics.get(f"selection_window_{window_index}_baseline_peak_mae", np.nan),
         })
     decision = evaluate_promotion_gate(window_metrics)
+    weather_control_decision = None
+    if candidate_schema == FEATURE_SCHEMA_VERSION:
+        weather_control_metrics = []
+        for window_index in range(1, window_count + 1):
+            weather_control_metrics.append({
+                "candidate_mae": metrics.get(f"selection_window_{window_index}_model_mae", np.nan),
+                "baseline_mae": metrics.get(f"selection_window_{window_index}_no_weather_control_mae", np.nan),
+                "candidate_peak_mae": metrics.get(f"selection_window_{window_index}_model_peak_mae", np.nan),
+                "baseline_peak_mae": metrics.get(f"selection_window_{window_index}_no_weather_control_peak_mae", np.nan),
+            })
+        weather_control_decision = evaluate_promotion_gate(weather_control_metrics)
+        if not weather_control_decision["accepted"]:
+            client.set_tag(candidate_run_id, "pipeline_role", "REJECTED_CANDIDATE")
+            print(
+                f"H{horizon} weather candidate {candidate_run_id} rejected against its matched "
+                f"no-weather control: {weather_control_decision['reason']}. "
+                f"Weather MAE {weather_control_decision['candidate_mae']:,.1f} vs "
+                f"no-weather MAE {weather_control_decision['baseline_mae']:,.1f} MW; "
+                f"window win rate {weather_control_decision['win_rate']:.0%}."
+            )
+            _report_retained_production(experiment.experiment_id, horizon)
+            return False
     if not decision["accepted"]:
         client.set_tag(candidate_run_id, "pipeline_role", "REJECTED_CANDIDATE")
         print(
@@ -131,6 +156,20 @@ def validate_and_promote_horizon(horizon: int, candidate_run_id: str | None = No
             f"peak MAE {decision['candidate_peak_mae']:,.1f} vs "
             f"{decision['baseline_peak_mae']:,.1f} MW; "
             f"window win rate {decision['win_rate']:.0%}."
+        )
+        _report_retained_production(experiment.experiment_id, horizon)
+        return False
+
+    if candidate_schema == FEATURE_SCHEMA_VERSION:
+        # Weather is a new serving-input dependency. Keep the existing
+        # production model active until the owner reviews candidate and
+        # coverage evidence; a passing statistical gate alone never switches
+        # the hourly service to a new external-feature dependency.
+        client.set_tag(candidate_run_id, "pipeline_role", "WEATHER_CANDIDATE_REQUIRES_REVIEW")
+        print(
+            f"H{horizon} weather candidate {candidate_run_id} passed baseline and matched "
+            f"no-weather gates (weather-control win rate {weather_control_decision['win_rate']:.0%}), "
+            "but was not promoted. Existing production is retained pending explicit owner review."
         )
         _report_retained_production(experiment.experiment_id, horizon)
         return False
@@ -146,7 +185,8 @@ def validate_and_promote_horizon(horizon: int, candidate_run_id: str | None = No
         f"H{horizon} candidate {candidate_run_id} promoted: rolling MAE {score:,.1f} vs {baseline:,.1f} MW; "
         f"peak MAE {decision['candidate_peak_mae']:,.1f} vs "
         f"{decision['baseline_peak_mae']:,.1f} MW; "
-        f"window win rate {decision['win_rate']:.0%}."
+        f"window win rate {decision['win_rate']:.0%}; weather-control win rate "
+        f"{weather_control_decision['win_rate']:.0%}."
     )
     return True
 

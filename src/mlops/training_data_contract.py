@@ -12,7 +12,8 @@ from src.shared.forecast_contract import EXAMPLE_GRAIN_KEYS, features_for_horizo
 
 DEFAULT_EXAMPLES_TABLE = "main.gold.forecast_examples"
 ROLLING_EXAMPLES_TABLE = "main.gold.forecast_examples_hourly"
-ALLOWED_EXAMPLES_TABLES = {DEFAULT_EXAMPLES_TABLE, ROLLING_EXAMPLES_TABLE}
+WEATHER_ROLLING_EXAMPLES_TABLE = "main.gold.forecast_examples_hourly_weather"
+ALLOWED_EXAMPLES_TABLES = {DEFAULT_EXAMPLES_TABLE, ROLLING_EXAMPLES_TABLE, WEATHER_ROLLING_EXAMPLES_TABLE}
 
 
 def validate_examples_table(table_name: str) -> str:
@@ -35,7 +36,7 @@ def training_origin_stride_hours(horizon: int, table_name: str) -> int:
     """
     validate_examples_table(table_name)
     features_for_horizon(horizon)  # Validate the horizon against the shared contract.
-    return 6 if table_name == ROLLING_EXAMPLES_TABLE and horizon == 168 else 1
+    return 6 if table_name in {ROLLING_EXAMPLES_TABLE, WEATHER_ROLLING_EXAMPLES_TABLE} and horizon == 168 else 1
 
 
 def clean_training_examples(examples: pd.DataFrame, horizon: int) -> pd.DataFrame:

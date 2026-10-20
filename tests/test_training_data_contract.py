@@ -33,7 +33,11 @@ def _examples():
         "actual_demand_mw": 50_000 + np.arange(len(timestamps), dtype=float),
         "is_holiday": False,
     })
-    return generate_forecast_examples_df(demand, step_hours=24)
+    examples = generate_forecast_examples_df(demand, step_hours=24)
+    examples["weighted_temperature_f"] = 70.0
+    examples["cdh_65_forecast"] = 5.0
+    examples["hdh_65_forecast"] = 0.0
+    return examples
 
 
 def test_training_contract_keeps_valid_examples_and_builds_residual_target():

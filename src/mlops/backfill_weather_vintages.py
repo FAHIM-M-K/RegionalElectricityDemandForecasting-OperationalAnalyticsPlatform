@@ -1,8 +1,6 @@
 # Databricks notebook source
 # COMMAND ----------
-# MAGIC %pip install lightgbm==4.7.0
-# COMMAND ----------
-"""One-time, isolated backfill of issue-time ECMWF weather for model research.
+"""Bounded, resumable backfill of issue-time ECMWF weather vintages.
 
 This is deliberately not part of the daily production job. It reconstructs a
 conservative historical issue cutoff (forecast origin + 65 minutes), selects
@@ -24,7 +22,6 @@ import urllib.parse
 import urllib.request
 
 import pandas as pd
-import lightgbm as lgb
 from delta.tables import DeltaTable
 from pyspark.sql import functions as F
 
@@ -41,9 +38,8 @@ HORIZON_HOURS = 168
 FORECAST_DAYS = 9
 REQUEST_PAUSE_SECONDS = 0.15
 CHECKPOINT_EVERY_RUNS = 20
-# Preview is the default. After reviewing the pending vintage count in Databricks,
-# set RUN_API_BACKFILL=True to process this many candidate cycles at most; the
-# separate attempt budget below includes retries and fallback-cycle HTTP calls.
+# Preview is the default; a manual Databricks run must explicitly set the widget
+# to true before any external API requests are made.
 RUN_API_BACKFILL = False
 MAX_NEW_RUNS_PER_EXECUTION = 100
 MAX_API_REQUEST_ATTEMPTS_PER_EXECUTION = 100
@@ -66,16 +62,16 @@ for _ in range(5):
     _root = _parent
 
 from configs.loader import load_platform_config
-from src.mlops.backtest_multihorizon import (
-    compute_metrics,
-    evaluate_promotion_gate,
-    generate_chronological_splits,
-)
-from src.mlops.weather_training_data import attach_weather_asof_issue
 from src.mlops.weather_api_budget import ApiRequestBudget, ApiRequestBudgetExceeded
-from src.shared.forecast_contract import features_for_horizon
 
 api_request_budget = ApiRequestBudget(MAX_API_REQUEST_ATTEMPTS_PER_EXECUTION)
+
+if "dbutils" in globals():
+    try:
+        dbutils.widgets.get("run_api_backfill")
+    except Exception:
+        dbutils.widgets.text("run_api_backfill", "false", "Issue weather API requests")
+    RUN_API_BACKFILL = dbutils.widgets.get("run_api_backfill").strip().lower() in {"1", "true", "yes"}
 
 config = load_platform_config("ercot_config.json")
 stations = config["weather"]["stations"]
@@ -210,7 +206,7 @@ if not RUN_API_BACKFILL:
         f"Pending ECMWF run vintages: {len(pending_run_inits):,}. "
         f"Per execution: at most {MAX_NEW_RUNS_PER_EXECUTION:,} run vintages and "
         f"{MAX_API_REQUEST_ATTEMPTS_PER_EXECUTION:,} HTTP attempts including retries/fallbacks. "
-        "To start the resumable backfill later, set RUN_API_BACKFILL=True."
+        "To start the resumable backfill, set the run_api_backfill widget to true."
     )
 
 selected_run_inits = pending_run_inits[:MAX_NEW_RUNS_PER_EXECUTION]
@@ -411,228 +407,11 @@ print(
     f"Materialized {summary['weather_rows']:,} experimental rows for {summary['origins']:,} origins "
     f"in {TARGET_TABLE}, {summary['first_origin']} through {summary['last_origin']}. "
     f"Rows available by the conservative issue-time proxy: {summary['available_by_issue_proxy']:,}. "
-    "This is a research table only; it does not modify production features or model registration."
+    "The training workflow consumes these rows to build point-in-time weather candidates; "
+    "this backfill does not change the currently deployed production models."
 )
-
-# Compare on the same origin/target rows and chronological folds. Rows without
-# a complete archived weather vintage are excluded from BOTH control and
-# candidate, preventing a coverage-driven sample difference from masquerading
-# as a weather skill change.
-example_columns = sorted(set(
-    [
-        "respondent", "forecast_origin_utc", "target_timestamp_utc", "horizon_hours",
-        "actual_demand_mw", "seasonal_naive_mw", "is_valid_training_example",
-    ]
-    + features_for_horizon(24) + features_for_horizon(168)
-))
-examples_pdf = (
-    spark.table(EXAMPLES_TABLE)
-    .filter(F.col("respondent") == "ERCO")
-    .filter(F.col("horizon_hours").isin(24, 168))
-    .filter(F.col("forecast_origin_utc") >= F.lit(ARCHIVE_START_UTC))
-    .select(*example_columns)
-    .toPandas()
+dbutils.notebook.exit(
+    "Historical weather backfill is complete. Next run the monthly model workflow: "
+    "it builds the point-in-time weather training table, fits weather and no-weather "
+    "models on identical chronological folds, and validates candidates without automatic promotion."
 )
-weather_pdf = (
-    spark.table(TARGET_TABLE)
-    .filter(F.col("forecast_origin_utc") >= F.lit(ARCHIVE_START_UTC))
-    .select(
-        "respondent", "forecast_origin_utc", "target_timestamp_utc", "weather_run_init_utc",
-        "weather_available_at_utc", "weighted_temperature_f", "cdh_65_forecast", "hdh_65_forecast",
-    )
-    .toPandas()
-)
-origin_counts = weather_pdf.groupby("forecast_origin_utc").size()
-incomplete_origins = origin_counts[origin_counts != HORIZON_HOURS]
-if not incomplete_origins.empty or weather_pdf[[
-    "weighted_temperature_f", "cdh_65_forecast", "hdh_65_forecast"
-]].isna().any().any():
-    raise RuntimeError(
-        "The experimental weather table has incomplete 168-hour origins or null weather features; "
-        "resume the backfill before comparing models."
-    )
-for frame in (examples_pdf, weather_pdf):
-    frame["forecast_origin_utc"] = pd.to_datetime(frame["forecast_origin_utc"], utc=True)
-    frame["target_timestamp_utc"] = pd.to_datetime(frame["target_timestamp_utc"], utc=True)
-
-matched_pdf, weather_coverage_pdf = attach_weather_asof_issue(
-    examples_pdf,
-    weather_pdf,
-    issue_delay_minutes=ISSUE_DELAY_MINUTES,
-)
-complete_issue_keys = weather_coverage_pdf.loc[
-    weather_coverage_pdf["complete_weather_horizon"],
-    ["respondent", "forecast_origin_utc", "horizon_hours"],
-]
-matched_pdf = matched_pdf.merge(
-    complete_issue_keys,
-    on=["respondent", "forecast_origin_utc", "horizon_hours"],
-    how="inner",
-    validate="many_to_one",
-)
-if matched_pdf.empty:
-    raise RuntimeError(
-        "No complete issue-time weather curves are available for a matched comparison. "
-        "The as-of selector excludes later vintages and partial horizons."
-    )
-print(
-    "As-of weather matching retained "
-    f"{complete_issue_keys['forecast_origin_utc'].nunique():,} complete issue/horizon groups "
-    f"across {matched_pdf['forecast_origin_utc'].nunique():,} origins; later/unavailable vintages "
-    "and incomplete curves were excluded."
-)
-weather_features = ["weighted_temperature_f", "cdh_65_forecast", "hdh_65_forecast"]
-model_params = {
-    "objective": "regression_l1", "metric": "l1", "learning_rate": 0.05,
-    "num_leaves": 31, "min_child_samples": 40, "feature_fraction": 0.85,
-    "bagging_fraction": 0.85, "bagging_freq": 1, "seed": 42, "verbose": -1,
-}
-
-
-def fit_model(train: pd.DataFrame, validation: pd.DataFrame, feature_columns: list[str]):
-    train_data = lgb.Dataset(train[feature_columns], label=train["residual_target_mw"])
-    validation_data = lgb.Dataset(validation[feature_columns], label=validation["residual_target_mw"])
-    return lgb.train(
-        model_params, train_data, num_boost_round=1200, valid_sets=[validation_data],
-        callbacks=[lgb.early_stopping(50, verbose=False)],
-    )
-
-
-def predict_demand(model, frame: pd.DataFrame, feature_columns: list[str]) -> pd.Series:
-    return frame["seasonal_naive_mw"] + model.predict(frame[feature_columns])
-
-
-def report_pair(horizon: int) -> None:
-    base_features = features_for_horizon(horizon)
-    needed = list(dict.fromkeys(base_features + weather_features + [
-        "actual_demand_mw", "seasonal_naive_mw", "is_valid_training_example",
-        "forecast_origin_utc", "target_timestamp_utc", "hour_local", "lead_hours",
-    ]))
-    data = matched_pdf.loc[
-        (matched_pdf["horizon_hours"] == horizon)
-        & (matched_pdf["is_valid_training_example"] == True)
-    ].copy()
-    data = data.dropna(subset=needed).sort_values(
-        ["forecast_origin_utc", "target_timestamp_utc"]
-    )
-    if data.empty:
-        raise RuntimeError(f"No matched H{horizon} examples have complete weather and demand features.")
-    data["residual_target_mw"] = data["actual_demand_mw"] - data["seasonal_naive_mw"]
-    splits = generate_chronological_splits(data["forecast_origin_utc"], n_test_windows=4)
-    selection_splits = [item for item in splits if item["kind"] == "selection"]
-    if len(selection_splits) < 4:
-        raise RuntimeError(
-            f"H{horizon} has only {len(selection_splits)} usable chronological windows; "
-            "the experiment requires all four selection windows."
-        )
-
-    selection_rows = []
-    for index, split in enumerate(selection_splits, start=1):
-        validation_start = split["test_start"] - pd.Timedelta(days=30)
-        train = data[
-            (data.forecast_origin_utc < validation_start)
-            & (data.target_timestamp_utc < validation_start)
-        ]
-        validation = data[
-            (data.forecast_origin_utc >= validation_start)
-            & (data.forecast_origin_utc < split["test_start"])
-            & (data.target_timestamp_utc < split["test_start"])
-        ]
-        test = data[
-            (data.forecast_origin_utc >= split["test_start"])
-            & (data.forecast_origin_utc < split["test_end"])
-        ].copy()
-        if train.empty or validation.empty or test.empty:
-            raise RuntimeError(f"H{horizon} selection window {index} has an empty train/validation/test slice.")
-        no_weather_model = fit_model(train, validation, base_features)
-        weather_model = fit_model(train, validation, base_features + weather_features)
-        peak = test["hour_local"].between(14, 18).to_numpy()
-        no_weather_prediction = predict_demand(no_weather_model, test, base_features)
-        weather_prediction = predict_demand(weather_model, test, base_features + weather_features)
-        no_weather_metrics = compute_metrics(test["actual_demand_mw"], no_weather_prediction, peak)
-        weather_metrics = compute_metrics(test["actual_demand_mw"], weather_prediction, peak)
-        selection_rows.append({
-            "candidate_mae": weather_metrics["mae"],
-            "baseline_mae": no_weather_metrics["mae"],
-            "candidate_peak_mae": weather_metrics["peak_mae"],
-            "baseline_peak_mae": no_weather_metrics["peak_mae"],
-        })
-        print(
-            f"H{horizon} selection {index}: same rows={len(test):,}; "
-            f"no-weather MAE={no_weather_metrics['mae']:,.1f} MW, "
-            f"weather MAE={weather_metrics['mae']:,.1f} MW; "
-            f"peak MAE {no_weather_metrics['peak_mae']:,.1f} vs "
-            f"{weather_metrics['peak_mae']:,.1f} MW."
-        )
-
-    gate = evaluate_promotion_gate(selection_rows)
-    final = next(item for item in splits if item["kind"] == "final_holdout")
-    validation_start = final["test_start"] - pd.Timedelta(days=30)
-    train = data[
-        (data.forecast_origin_utc < validation_start)
-        & (data.target_timestamp_utc < validation_start)
-    ]
-    validation = data[
-        (data.forecast_origin_utc >= validation_start)
-        & (data.forecast_origin_utc < final["test_start"])
-        & (data.target_timestamp_utc < final["test_start"])
-    ]
-    pre_holdout = data[
-        (data.forecast_origin_utc < final["test_start"])
-        & (data.target_timestamp_utc < final["test_start"])
-    ]
-    holdout = data[
-        (data.forecast_origin_utc >= final["test_start"])
-        & (data.forecast_origin_utc < final["test_end"])
-    ].copy()
-    if train.empty or validation.empty or pre_holdout.empty or holdout.empty:
-        raise RuntimeError(f"H{horizon} final holdout has an empty train/validation/test slice.")
-    control_selection_model = fit_model(train, validation, base_features)
-    weather_selection_model = fit_model(train, validation, base_features + weather_features)
-    control_rounds = control_selection_model.best_iteration
-    weather_rounds = weather_selection_model.best_iteration
-    no_weather_model = lgb.train(
-        model_params, lgb.Dataset(pre_holdout[base_features], label=pre_holdout.residual_target_mw),
-        num_boost_round=control_rounds,
-    )
-    weather_model = lgb.train(
-        model_params,
-        lgb.Dataset(pre_holdout[base_features + weather_features], label=pre_holdout.residual_target_mw),
-        num_boost_round=weather_rounds,
-    )
-    peak = holdout["hour_local"].between(14, 18).to_numpy()
-    control_prediction = predict_demand(no_weather_model, holdout, base_features)
-    weather_prediction = predict_demand(weather_model, holdout, base_features + weather_features)
-    control_metrics = compute_metrics(holdout.actual_demand_mw, control_prediction, peak)
-    weather_metrics = compute_metrics(holdout.actual_demand_mw, weather_prediction, peak)
-    print(
-        f"H{horizon} selection summary: weather vs no-weather promotion-gate diagnostic "
-        f"accepted={gate['accepted']} ({gate['reason']}); "
-        f"selection MAE {gate['candidate_mae']:,.1f} vs {gate['baseline_mae']:,.1f} MW; "
-        f"window win rate={gate['win_rate']:.0%}; "
-        f"selection peak MAE {gate['candidate_peak_mae']:,.1f} vs "
-        f"{gate['baseline_peak_mae']:,.1f} MW."
-    )
-    print(
-        f"H{horizon} untouched final holdout: same rows={len(holdout):,}; "
-        f"no-weather MAE={control_metrics['mae']:,.1f} MW, "
-        f"weather MAE={weather_metrics['mae']:,.1f} MW; "
-        f"peak MAE {control_metrics['peak_mae']:,.1f} vs "
-        f"{weather_metrics['peak_mae']:,.1f} MW."
-    )
-    for label, lower, upper in (
-        ("lead 1-24", 1, 24), ("lead 25-48", 25, 48), ("lead 49-168", 49, 168),
-    ):
-        bucket = holdout[holdout["lead_hours"].between(lower, upper)]
-        if bucket.empty:
-            continue
-        print(
-            f"  {label}: control MAE={compute_metrics(bucket.actual_demand_mw, control_prediction.loc[bucket.index])['mae']:,.1f} MW, "
-            f"weather MAE={compute_metrics(bucket.actual_demand_mw, weather_prediction.loc[bucket.index])['mae']:,.1f} MW; "
-            f"rows={len(bucket):,}."
-        )
-    print("Research-only result: do not promote or alter production models from this notebook.")
-
-
-for horizon in (24, 168):
-    report_pair(horizon)
