@@ -6,7 +6,6 @@ than the simulated issue cutoff are eligible. This produces a separate model
 training source and leaves the demand-only foundation untouched.
 """
 
-from delta.tables import DeltaTable
 from pyspark.sql import functions as F
 
 from src.shared.forecast_contract import (
@@ -17,6 +16,7 @@ CATALOG = "main"
 EXAMPLES_TABLE = f"{CATALOG}.gold.forecast_examples_hourly"
 WEATHER_TABLE = f"{CATALOG}.silver.weather_backtest_features"
 TARGET_TABLE = f"{CATALOG}.gold.forecast_examples_hourly_weather"
+EXCLUSIONS_TABLE = f"{CATALOG}.silver.weather_backtest_exclusions"
 HORIZONS = (24, 168)
 ARCHIVE_START_UTC = "2025-01-15 00:00:00"
 
@@ -72,17 +72,42 @@ expected_origins = (examples.filter(F.col("horizon_hours") == 168)
 covered_origins = weather.select("respondent", "forecast_origin_utc").distinct()
 missing_origins = expected_origins.join(covered_origins, ["respondent", "forecast_origin_utc"], "left_anti")
 missing_origin_count = missing_origins.count()
-if missing_origin_count:
+excluded_origin_count = 0
+if missing_origin_count and not spark.catalog.tableExists(EXCLUSIONS_TABLE):
     first_missing = missing_origins.orderBy("forecast_origin_utc").first()["forecast_origin_utc"]
     raise RuntimeError(
-        f"Archived ECMWF weather backfill is incomplete: {missing_origin_count:,} of "
-        f"{expected_origins.count():,} expected rolling origins are missing; "
-        f"first missing origin is {first_missing}. Resume the bounded API backfill; "
-        "partial chronological coverage is not accepted for model training."
+        f"{missing_origin_count:,} rolling origins have no weather and are not explained by "
+        f"{EXCLUSIONS_TABLE}; first missing origin is {first_missing}. Resume the backfill."
     )
+if spark.catalog.tableExists(EXCLUSIONS_TABLE):
+    excluded = spark.table(EXCLUSIONS_TABLE).select(
+        "respondent", "forecast_origin_utc", "exclusion_reason"
+    ).distinct()
+    unclassified_missing = missing_origins.join(
+        excluded.select("respondent", "forecast_origin_utc"),
+        ["respondent", "forecast_origin_utc"], "left_anti"
+    )
+    if unclassified_missing.limit(1).count():
+        first_missing = unclassified_missing.orderBy("forecast_origin_utc").first()["forecast_origin_utc"]
+        raise RuntimeError(
+            f"Missing weather origin {first_missing} is not classified in {EXCLUSIONS_TABLE}; "
+            "the backfill must resolve or explicitly record every origin."
+        )
+    excluded_origin_count = missing_origins.count()
+    unexpected_exclusions = excluded.join(expected_origins, ["respondent", "forecast_origin_utc"], "left_anti")
+    if unexpected_exclusions.limit(1).count():
+        first_extra = unexpected_exclusions.orderBy("forecast_origin_utc").first()["forecast_origin_utc"]
+        print(f"Ignoring {first_extra} archived exclusion record outside the current example range.")
 
-joined = examples.join(weather, on=weather_keys, how="inner")
-expected_row_counts = examples.groupBy("respondent", "forecast_origin_utc", "horizon_hours").agg(
+print(
+    f"Weather coverage: {covered_origins.count():,}/{expected_origins.count():,} origins complete; "
+    f"{excluded_origin_count:,} origins explicitly excluded for unavailable/incomplete issue-time weather. "
+    "Weather candidates and no-weather controls will use this same matched origin set."
+)
+
+eligible_examples = examples.join(covered_origins, ["respondent", "forecast_origin_utc"], "inner")
+joined = eligible_examples.join(weather, on=weather_keys, how="inner")
+expected_row_counts = eligible_examples.groupBy("respondent", "forecast_origin_utc", "horizon_hours").agg(
     F.countDistinct("target_timestamp_utc").alias("expected_example_rows")
 )
 matched_row_counts = joined.groupBy("respondent", "forecast_origin_utc", "horizon_hours").agg(
@@ -122,17 +147,11 @@ if not target.limit(1).count():
         "No complete point-in-time weather training examples exist. Resume the archived "
         "weather backfill; no no-weather training fallback is allowed."
     )
-if spark.catalog.tableExists(TARGET_TABLE):
-    DeltaTable.forName(spark, TARGET_TABLE).alias("target").merge(
-        target.alias("source"),
-        "target.respondent=source.respondent "
-        "AND target.forecast_origin_utc=source.forecast_origin_utc "
-        "AND target.target_timestamp_utc=source.target_timestamp_utc "
-        "AND target.horizon_hours=source.horizon_hours "
-        "AND target.feature_set=source.feature_set",
-    ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
-else:
-    target.write.format("delta").mode("overwrite").partitionBy("horizon_hours").saveAsTable(TARGET_TABLE)
+# This is a deterministic training snapshot. Replace it atomically so origins
+# newly classified as weather-incomplete cannot linger from an earlier build.
+target.write.format("delta").mode("overwrite").option(
+    "overwriteSchema", "true"
+).partitionBy("horizon_hours").saveAsTable(TARGET_TABLE)
 
 summary = spark.table(TARGET_TABLE).groupBy("horizon_hours").agg(
     F.count("*").alias("rows"), F.countDistinct("forecast_origin_utc").alias("complete_origins"),

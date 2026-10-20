@@ -29,6 +29,7 @@ CATALOG = "main"
 # This historical backfill now follows the hourly issue cadence used in service.
 EXAMPLES_TABLE = f"{CATALOG}.gold.forecast_examples_hourly"
 TARGET_TABLE = f"{CATALOG}.silver.weather_backtest_features"
+EXCLUSIONS_TABLE = f"{CATALOG}.silver.weather_backtest_exclusions"
 API_URL = "https://single-runs-api.open-meteo.com/v1/forecast"
 MODEL = "ecmwf_ifs"
 ARCHIVE_START_UTC = dt.datetime(2025, 1, 15, tzinfo=dt.timezone.utc)
@@ -200,6 +201,13 @@ if spark.catalog.tableExists(TARGET_TABLE):
         .filter(F.col("count") == HORIZON_HOURS)
         .select("forecast_origin_utc").collect()
     }
+if spark.catalog.tableExists(EXCLUSIONS_TABLE):
+    existing_origins.update(
+        pd.to_datetime(value, utc=True).to_pydatetime()
+        for value in spark.table(EXCLUSIONS_TABLE)
+        .filter(F.col("forecast_origin_utc") >= F.lit(ARCHIVE_START_UTC))
+        .select("forecast_origin_utc").distinct().toPandas()["forecast_origin_utc"]
+    )
 pending_origins = {origin for origin in origins if origin not in existing_origins}
 pending_run_inits = [run_init for run_init in run_inits if any(
     origin in pending_origins for origin in origins_by_run[run_init]
@@ -228,6 +236,7 @@ if len(pending_run_inits) > len(selected_run_inits):
         f"{len(pending_run_inits) - len(selected_run_inits):,} requests remain for later resumable batches."
     )
 pending_rows = []
+pending_exclusions = []
 processed_since_checkpoint = 0
 run_temperature_cache: dict[dt.datetime, dict | None] = {}
 
@@ -248,6 +257,21 @@ def checkpoint(rows_to_write: list[dict]) -> None:
         ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
 
 
+def checkpoint_exclusions(rows_to_write: list[dict]) -> None:
+    """Persist origins without a complete issue-time weather path, explicitly."""
+    if not rows_to_write:
+        return
+    incoming = spark.createDataFrame(pd.DataFrame(rows_to_write))
+    if not spark.catalog.tableExists(EXCLUSIONS_TABLE):
+        incoming.write.format("delta").mode("overwrite").saveAsTable(EXCLUSIONS_TABLE)
+    else:
+        DeltaTable.forName(spark, EXCLUSIONS_TABLE).alias("target").merge(
+            incoming.alias("source"),
+            "target.respondent = source.respondent "
+            "AND target.forecast_origin_utc = source.forecast_origin_utc",
+        ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+
+
 def temperature_map_for_run(run_init: dt.datetime) -> dict | None:
     """Load aligned station-hour data once per vintage and retain nulls for diagnosis."""
     global pending_rows
@@ -265,6 +289,7 @@ def temperature_map_for_run(run_init: dt.datetime) -> dict | None:
         # Save only fully built origins. An incomplete origin is still local to
         # build_complete_origin and is never appended to this checkpoint batch.
         checkpoint(pending_rows)
+        checkpoint_exclusions(pending_exclusions)
         if pending_rows:
             existing_origins.update(row["forecast_origin_utc"] for row in pending_rows)
             print(
@@ -272,6 +297,10 @@ def temperature_map_for_run(run_init: dt.datetime) -> dict | None:
                 f"({len(existing_origins):,} complete origins are now resumable)."
             )
             pending_rows = []
+        if pending_exclusions:
+            existing_origins.update(row["forecast_origin_utc"] for row in pending_exclusions)
+            print(f"Quota stop: checkpointed {len(pending_exclusions):,} weather-incomplete origins.")
+            pending_exclusions = []
         print(
             f"Weather API request attempts used: {api_request_budget.used}/"
             f"{api_request_budget.limit}."
@@ -369,18 +398,33 @@ for request_index, run_init in enumerate(selected_run_inits, start=1):
                     )
                     origin_rows = fallback_rows
                 else:
-                    raise RuntimeError(
-                        f"Selected ECMWF run {run_init} has a gap ({gap['missing']} at {gap['target']}) "
-                        f"and the immediately previous eligible run {fallback_init} also has a gap "
-                        f"({fallback_gap['missing']} at {fallback_gap['target']}). "
-                        "No partial origin was saved; inspect these two API responses before retrying."
-                    )
+                    pending_exclusions.append({
+                        "respondent": "ERCO",
+                        "forecast_origin_utc": origin,
+                        "weather_issue_time_proxy_utc": selected[origin][2],
+                        "selected_weather_run_init_utc": run_init,
+                        "selected_gap_target_utc": gap["target"],
+                        "selected_gap_detail": json.dumps(gap["missing"], sort_keys=True),
+                        "fallback_weather_run_init_utc": fallback_init,
+                        "fallback_gap_target_utc": fallback_gap["target"],
+                        "fallback_gap_detail": json.dumps(fallback_gap["missing"], sort_keys=True),
+                        "exclusion_reason": "no_complete_issue_time_weather_path",
+                    })
+                    continue
             else:
-                raise RuntimeError(
-                    f"Selected ECMWF run {run_init} has a gap ({gap['missing']} at {gap['target']}) "
-                    f"for origin {origin}, and no previous cycle is available by the issue-time proxy. "
-                    "No partial origin was saved."
-                )
+                pending_exclusions.append({
+                    "respondent": "ERCO",
+                    "forecast_origin_utc": origin,
+                    "weather_issue_time_proxy_utc": selected[origin][2],
+                    "selected_weather_run_init_utc": run_init,
+                    "selected_gap_target_utc": gap["target"],
+                    "selected_gap_detail": json.dumps(gap["missing"], sort_keys=True),
+                    "fallback_weather_run_init_utc": None,
+                    "fallback_gap_target_utc": None,
+                    "fallback_gap_detail": None,
+                    "exclusion_reason": "no_complete_issue_time_weather_path",
+                })
+                continue
         if len(origin_rows) != HORIZON_HOURS:
             raise RuntimeError(f"Origin {origin} produced {len(origin_rows)} rows; expected {HORIZON_HOURS}.")
         pending_rows.extend(origin_rows)
@@ -392,13 +436,20 @@ for request_index, run_init in enumerate(selected_run_inits, start=1):
     processed_since_checkpoint += 1
     if processed_since_checkpoint >= CHECKPOINT_EVERY_RUNS:
         checkpoint(pending_rows)
+        checkpoint_exclusions(pending_exclusions)
         existing_origins.update(row["forecast_origin_utc"] for row in pending_rows)
-        print(f"Saved {len(pending_rows):,} rows; completed vintages can be resumed safely.")
+        existing_origins.update(row["forecast_origin_utc"] for row in pending_exclusions)
+        print(
+            f"Saved {len(pending_rows):,} complete weather rows and recorded "
+            f"{len(pending_exclusions):,} origins without complete weather; both outcomes are resumable."
+        )
         pending_rows = []
+        pending_exclusions = []
         processed_since_checkpoint = 0
     time.sleep(REQUEST_PAUSE_SECONDS)
 
 checkpoint(pending_rows)
+checkpoint_exclusions(pending_exclusions)
 print(
     f"Weather API request attempts used: {api_request_budget.used}/"
     f"{api_request_budget.limit}."
@@ -406,15 +457,29 @@ print(
 if pending_rows:
     existing_origins.update(row["forecast_origin_utc"] for row in pending_rows)
     print(f"Saved final batch of {len(pending_rows):,} rows.")
+if pending_exclusions:
+    existing_origins.update(row["forecast_origin_utc"] for row in pending_exclusions)
+    print(f"Recorded {len(pending_exclusions):,} final weather-incomplete origins.")
 remaining_origins = [origin for origin in origins if origin not in existing_origins]
 if remaining_origins:
     dbutils.notebook.exit(
         f"Weather backfill batch completed. {len(remaining_origins):,} hourly origins remain; "
-        "rerun after reviewing the next preview to resume. Candidate evaluation is deferred "
-        "until all requested origins have complete weather paths."
+        "rerun after reviewing the next preview to resume. Origins with no complete issue-time "
+        "weather path are recorded separately and excluded from the matched weather/no-weather comparison."
     )
 if not spark.catalog.tableExists(TARGET_TABLE):
     raise RuntimeError("No weather backtest vintages were materialized.")
+excluded_origin_total = 0
+if spark.catalog.tableExists(EXCLUSIONS_TABLE):
+    excluded_origin_total = spark.table(EXCLUSIONS_TABLE).filter(
+        (F.col("forecast_origin_utc") >= F.lit(ARCHIVE_START_UTC))
+        & (F.col("forecast_origin_utc") <= F.lit(origins[-1]))
+    ).select("forecast_origin_utc").distinct().count()
+print(
+    f"Issue-time weather coverage resolved for {len(origins):,} origins: "
+    f"{len(origins) - excluded_origin_total:,} have complete weather; "
+    f"{excluded_origin_total:,} are explicitly excluded because no eligible complete path exists."
+)
 
 summary = spark.table(TARGET_TABLE).filter(
     F.col("forecast_origin_utc") >= F.lit(ARCHIVE_START_UTC)
@@ -431,11 +496,14 @@ print(
     f"Materialized {summary['weather_rows']:,} experimental rows for {summary['origins']:,} origins "
     f"in {TARGET_TABLE}, {summary['first_origin']} through {summary['last_origin']}. "
     f"Rows available by the conservative issue-time proxy: {summary['available_by_issue_proxy']:,}. "
-    "The training workflow consumes these rows to build point-in-time weather candidates; "
+    "Origins without a complete as-of weather path are recorded separately and excluded from both "
+    "weather and matched no-weather model training. The training workflow consumes these rows to "
+    "build point-in-time weather candidates; "
     "this backfill does not change the currently deployed production models."
 )
 dbutils.notebook.exit(
-    "Historical weather backfill is complete. Next run the monthly model workflow: "
+    f"Historical weather backfill is complete with {excluded_origin_total:,} explicit weather exclusions. "
+    "Next run the monthly model workflow: "
     "it builds the point-in-time weather training table, fits weather and no-weather "
     "models on identical chronological folds, and validates candidates without automatic promotion."
 )
