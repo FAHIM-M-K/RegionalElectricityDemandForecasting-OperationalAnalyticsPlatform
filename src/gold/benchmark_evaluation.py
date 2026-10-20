@@ -127,7 +127,18 @@ def match_h24_and_eia(
         matched_records.append(joined)
 
     if not matched_records:
-        return pd.DataFrame(), {"matched_rows": 0, "unique_targets": 0}
+        return pd.DataFrame(), {
+            "status": "PROSPECTIVE_PENDING_MATURED_DATA",
+            "matched_rows": 0,
+            "unique_targets": 0,
+            "model_mae_mw": None,
+            "eia_mae_mw": None,
+            "model_rmse_mw": None,
+            "eia_rmse_mw": None,
+            "model_bias_mw": None,
+            "eia_bias_mw": None,
+            "notice": "No H24 forecast targets have both an issue-time-available EIA vintage and a matured actual; metrics are pending, not zero.",
+        }
 
     df_matched = pd.concat(matched_records, ignore_index=True)
     df_matched["model_error_mw"] = df_matched["predicted_demand_mw"] - df_matched["actual_demand_mw"]
@@ -149,15 +160,30 @@ def match_h24_and_eia(
     else:
         raise ValueError("headline_policy must be 'lead_24' or 'all_leads'.")
 
+    if headline_df.empty:
+        return df_matched, {
+            "status": "PENDING_LEAD_24_MATCHES",
+            "matched_rows": 0,
+            "unique_targets": 0,
+            "model_mae_mw": None,
+            "eia_mae_mw": None,
+            "model_rmse_mw": None,
+            "eia_rmse_mw": None,
+            "model_bias_mw": None,
+            "eia_bias_mw": None,
+            "notice": "Matched non-headline leads exist, but no matured lead-24 rows are available for the declared H24 headline.",
+        }
+
     summary_metrics = {
+        "status": "EVALUATED",
         "matched_rows": int(len(headline_df)),
         "unique_targets": int(headline_df["target_timestamp_utc"].nunique()),
-        "model_mae_mw": round(float(headline_df["model_abs_error_mw"].mean()), 2) if not headline_df.empty else 0.0,
-        "eia_mae_mw": round(float(headline_df["eia_abs_error_mw"].mean()), 2) if not headline_df.empty else 0.0,
-        "model_rmse_mw": round(float(np.sqrt((headline_df["model_error_mw"] ** 2).mean())), 2) if not headline_df.empty else 0.0,
-        "eia_rmse_mw": round(float(np.sqrt((headline_df["eia_error_mw"] ** 2).mean())), 2) if not headline_df.empty else 0.0,
-        "model_bias_mw": round(float(headline_df["model_error_mw"].mean()), 2) if not headline_df.empty else 0.0,
-        "eia_bias_mw": round(float(headline_df["eia_error_mw"].mean()), 2) if not headline_df.empty else 0.0,
+        "model_mae_mw": round(float(headline_df["model_abs_error_mw"].mean()), 2),
+        "eia_mae_mw": round(float(headline_df["eia_abs_error_mw"].mean()), 2),
+        "model_rmse_mw": round(float(np.sqrt((headline_df["model_error_mw"] ** 2).mean())), 2),
+        "eia_rmse_mw": round(float(np.sqrt((headline_df["eia_error_mw"] ** 2).mean())), 2),
+        "model_bias_mw": round(float(headline_df["model_error_mw"].mean()), 2),
+        "eia_bias_mw": round(float(headline_df["eia_error_mw"].mean()), 2),
     }
 
     return df_matched, summary_metrics

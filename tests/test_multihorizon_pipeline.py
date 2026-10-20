@@ -798,6 +798,36 @@ def test_match_h24_and_eia_metrics():
     assert summary["eia_bias_mw"] == 2_000.0    # 52000 - 50000
 
 
+def test_match_h24_and_eia_empty_overlap_has_pending_status_and_null_metrics():
+    from src.gold.benchmark_evaluation import match_h24_and_eia
+
+    origin = pd.Timestamp("2024-06-01 00:00:00", tz="UTC")
+    h24 = pd.DataFrame([{
+        "respondent": "ERCO",
+        "horizon_hours": 24,
+        "lead_hours": 24,
+        "forecast_origin_utc": origin,
+        "issued_at_utc": origin + pd.Timedelta(minutes=15),
+        "target_timestamp_utc": origin + pd.Timedelta(hours=24),
+        "predicted_demand_mw": 51_000.0,
+    }])
+
+    matched, summary = match_h24_and_eia(
+        h24, pd.DataFrame(), pd.DataFrame(), headline_policy="lead_24"
+    )
+
+    assert matched.empty
+    assert summary["status"] == "PROSPECTIVE_PENDING_MATURED_DATA"
+    assert summary["matched_rows"] == 0
+    assert summary["unique_targets"] == 0
+    assert summary["model_mae_mw"] is None
+    assert summary["eia_mae_mw"] is None
+    assert summary["model_rmse_mw"] is None
+    assert summary["eia_rmse_mw"] is None
+    assert summary["model_bias_mw"] is None
+    assert summary["eia_bias_mw"] is None
+
+
 def test_match_h168_and_ercot_prospective_and_buckets():
     from src.gold.benchmark_evaluation import match_h168_and_ercot
 
