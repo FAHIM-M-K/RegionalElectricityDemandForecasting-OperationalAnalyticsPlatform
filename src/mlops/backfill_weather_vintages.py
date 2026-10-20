@@ -41,10 +41,12 @@ HORIZON_HOURS = 168
 FORECAST_DAYS = 9
 REQUEST_PAUSE_SECONDS = 0.15
 CHECKPOINT_EVERY_RUNS = 20
-# Preview is the default. After reviewing the exact request count in Databricks,
-# set RUN_API_BACKFILL=True to fetch at most this many distinct ECMWF vintages.
+# Preview is the default. After reviewing the pending vintage count in Databricks,
+# set RUN_API_BACKFILL=True to process this many candidate cycles at most; the
+# separate attempt budget below includes retries and fallback-cycle HTTP calls.
 RUN_API_BACKFILL = False
-MAX_NEW_RUNS_PER_EXECUTION = 250
+MAX_NEW_RUNS_PER_EXECUTION = 100
+MAX_API_REQUEST_ATTEMPTS_PER_EXECUTION = 100
 
 
 class DailyApiQuotaExceeded(RuntimeError):
@@ -70,7 +72,10 @@ from src.mlops.backtest_multihorizon import (
     generate_chronological_splits,
 )
 from src.mlops.weather_training_data import attach_weather_asof_issue
+from src.mlops.weather_api_budget import ApiRequestBudget, ApiRequestBudgetExceeded
 from src.shared.forecast_contract import features_for_horizon
+
+api_request_budget = ApiRequestBudget(MAX_API_REQUEST_ATTEMPTS_PER_EXECUTION)
 
 config = load_platform_config("ercot_config.json")
 stations = config["weather"]["stations"]
@@ -109,6 +114,7 @@ def request_run(run_init: dt.datetime) -> list[dict]:
     request = urllib.request.Request(url, headers={"User-Agent": "ERCOT-weather-backtest/1.0"})
     for attempt in range(1, 4):
         try:
+            api_request_budget.consume()
             with urllib.request.urlopen(request, timeout=60) as response:
                 payload = json.loads(response.read().decode("utf-8"))
             break
@@ -192,9 +198,10 @@ pending_run_inits = [run_init for run_init in run_inits if any(
 )]
 print(
     f"Weather archive preview: {len(origins):,} hourly issue origins, "
-    f"{len(pending_run_inits):,} new ECMWF API requests required, "
-    f"maximum {MAX_NEW_RUNS_PER_EXECUTION:,} requests in one execution. "
-    "Each request bundles all four configured stations."
+    f"{len(pending_run_inits):,} unique ECMWF run vintages pending, "
+    f"at most {MAX_NEW_RUNS_PER_EXECUTION:,} distinct runs selected, with a hard cap of "
+    f"{MAX_API_REQUEST_ATTEMPTS_PER_EXECUTION:,} actual HTTP attempts in one execution "
+    "including retries and fallback cycles. Each request bundles all four configured stations."
 )
 if not RUN_API_BACKFILL:
     dbutils.notebook.exit(
@@ -236,7 +243,7 @@ def temperature_map_for_run(run_init: dt.datetime) -> dict:
         return run_temperature_cache[run_init]
     try:
         payloads = request_run(run_init)
-    except DailyApiQuotaExceeded as error:
+    except (DailyApiQuotaExceeded, ApiRequestBudgetExceeded) as error:
         # Save only fully built origins. An incomplete origin is still local to
         # build_complete_origin and is never appended to this checkpoint batch.
         checkpoint(pending_rows)
@@ -247,6 +254,15 @@ def temperature_map_for_run(run_init: dt.datetime) -> dict:
                 f"({len(existing_origins):,} complete origins are now resumable)."
             )
             pending_rows = []
+        print(
+            f"Weather API request attempts used: {api_request_budget.used}/"
+            f"{api_request_budget.limit}."
+        )
+        if isinstance(error, ApiRequestBudgetExceeded):
+            dbutils.notebook.exit(
+                f"{error} Completed work has been checkpointed. Rerun this notebook to resume; "
+                "the next execution will again be limited to its configured request-attempt cap."
+            )
         raise RuntimeError(
             f"{error} The completed work has been saved. Stop this notebook and rerun it "
             "after the provider quota resets; it will resume from completed 168-hour origins."
@@ -359,6 +375,10 @@ for request_index, run_init in enumerate(selected_run_inits, start=1):
     time.sleep(REQUEST_PAUSE_SECONDS)
 
 checkpoint(pending_rows)
+print(
+    f"Weather API request attempts used: {api_request_budget.used}/"
+    f"{api_request_budget.limit}."
+)
 if pending_rows:
     existing_origins.update(row["forecast_origin_utc"] for row in pending_rows)
     print(f"Saved final batch of {len(pending_rows):,} rows.")
