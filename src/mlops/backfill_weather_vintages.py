@@ -195,19 +195,43 @@ print(
 )
 existing_origins = set()
 if spark.catalog.tableExists(TARGET_TABLE):
+    # A raw row count of 168 is not sufficient: duplicates can conceal a
+    # missing target hour, null weather features, or rows for another
+    # respondent. Only a complete ERCO lead-1..168 path is resumably complete.
+    target_weather = spark.table(TARGET_TABLE).filter(
+        (F.col("respondent") == "ERCO")
+        & (F.col("forecast_origin_utc") >= F.lit(ARCHIVE_START_UTC))
+    )
+    complete_weather_origins = target_weather.groupBy(
+        "respondent", "forecast_origin_utc"
+    ).agg(
+        F.countDistinct("target_timestamp_utc").alias("distinct_targets"),
+        F.sum(F.when(
+            F.col("weighted_temperature_f").isNull()
+            | F.col("cdh_65_forecast").isNull()
+            | F.col("hdh_65_forecast").isNull(), 1
+        ).otherwise(0)).alias("null_feature_rows"),
+        F.min("target_timestamp_utc").alias("first_target_utc"),
+        F.max("target_timestamp_utc").alias("last_target_utc"),
+    ).filter(
+        (F.col("distinct_targets") == HORIZON_HOURS)
+        & (F.col("null_feature_rows") == 0)
+        & (F.col("first_target_utc") == F.col("forecast_origin_utc") + F.expr("INTERVAL 1 HOUR"))
+        & (F.col("last_target_utc") == F.col("forecast_origin_utc") + F.expr("INTERVAL 168 HOURS"))
+    )
     existing_origins = {
         pd.to_datetime(row["forecast_origin_utc"], utc=True).to_pydatetime()
-        for row in spark.table(TARGET_TABLE)
-        .filter(F.col("forecast_origin_utc") >= F.lit(ARCHIVE_START_UTC))
-        .groupBy("forecast_origin_utc").count()
-        .filter(F.col("count") == HORIZON_HOURS)
-        .select("forecast_origin_utc").collect()
+        for row in complete_weather_origins.select("forecast_origin_utc").collect()
     }
 if spark.catalog.tableExists(EXCLUSIONS_TABLE):
     existing_origins.update(
         pd.to_datetime(value, utc=True).to_pydatetime()
         for value in spark.table(EXCLUSIONS_TABLE)
-        .filter(F.col("forecast_origin_utc") >= F.lit(ARCHIVE_START_UTC))
+        .filter(
+            (F.col("respondent") == "ERCO")
+            & F.col("exclusion_reason").isNotNull()
+            & (F.col("forecast_origin_utc") >= F.lit(ARCHIVE_START_UTC))
+        )
         .select("forecast_origin_utc").distinct().toPandas()["forecast_origin_utc"]
     )
 pending_origins = {origin for origin in origins if origin not in existing_origins}
