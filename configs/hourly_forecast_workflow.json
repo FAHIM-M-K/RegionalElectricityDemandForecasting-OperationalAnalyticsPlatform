@@ -148,7 +148,7 @@
         }
       ],
       "notebook_task": {
-        "notebook_path": "src/gold/benchmark_evaluation",
+        "notebook_path": "src/gold/benchmark_evaluation_task",
         "source": "GIT"
       },
       "timeout_seconds": 900,

@@ -29,7 +29,8 @@ from delta.tables import DeltaTable
 from pyspark.sql import functions as F
 
 CATALOG = "main"
-EXAMPLES_TABLE = f"{CATALOG}.gold.forecast_examples"
+# This historical backfill now follows the hourly issue cadence used in service.
+EXAMPLES_TABLE = f"{CATALOG}.gold.forecast_examples_hourly"
 TARGET_TABLE = f"{CATALOG}.silver.weather_backtest_features"
 API_URL = "https://single-runs-api.open-meteo.com/v1/forecast"
 MODEL = "ecmwf_ifs"
@@ -40,6 +41,10 @@ HORIZON_HOURS = 168
 FORECAST_DAYS = 9
 REQUEST_PAUSE_SECONDS = 0.15
 CHECKPOINT_EVERY_RUNS = 20
+# Preview is the default. After reviewing the exact request count in Databricks,
+# set RUN_API_BACKFILL=True to fetch at most this many distinct ECMWF vintages.
+RUN_API_BACKFILL = False
+MAX_NEW_RUNS_PER_EXECUTION = 250
 
 
 class DailyApiQuotaExceeded(RuntimeError):
@@ -64,6 +69,7 @@ from src.mlops.backtest_multihorizon import (
     evaluate_promotion_gate,
     generate_chronological_splits,
 )
+from src.mlops.weather_training_data import attach_weather_asof_issue
 from src.shared.forecast_contract import features_for_horizon
 
 config = load_platform_config("ercot_config.json")
@@ -158,10 +164,13 @@ if origin_pdf.empty:
     raise RuntimeError(f"No H{HORIZON_HOURS} example origins found after {ARCHIVE_START_UTC}.")
 origins = [pd.to_datetime(value, utc=True).to_pydatetime() for value in origin_pdf["forecast_origin_utc"]]
 
-# Cache by run initialization. With daily origins this is usually about one
-# archive request per origin; four locations are bundled in each request.
+# Cache by ECMWF initialization. Hourly origins share the same 00Z/12Z run for
+# about half a day, and each request bundles all four configured locations.
 selected = {origin: eligible_run(origin) for origin in origins}
-run_inits = sorted({item[0] for item in selected.values()})
+origins_by_run: dict[dt.datetime, list[dt.datetime]] = {}
+for origin, selection in selected.items():
+    origins_by_run.setdefault(selection[0], []).append(origin)
+run_inits = sorted(origins_by_run)
 print(
     f"Preparing {len(origins):,} H168 origins using {len(run_inits):,} unique archived ECMWF runs "
     f"from {origins[0]} onward. Each request bundles all four stations; checkpoints occur every "
@@ -177,6 +186,28 @@ if spark.catalog.tableExists(TARGET_TABLE):
         .filter(F.col("count") == HORIZON_HOURS)
         .select("forecast_origin_utc").collect()
     }
+pending_origins = {origin for origin in origins if origin not in existing_origins}
+pending_run_inits = [run_init for run_init in run_inits if any(
+    origin in pending_origins for origin in origins_by_run[run_init]
+)]
+print(
+    f"Weather archive preview: {len(origins):,} hourly issue origins, "
+    f"{len(pending_run_inits):,} new ECMWF API requests required, "
+    f"maximum {MAX_NEW_RUNS_PER_EXECUTION:,} requests in one execution. "
+    "Each request bundles all four configured stations."
+)
+if not RUN_API_BACKFILL:
+    dbutils.notebook.exit(
+        "Preview complete. No Open-Meteo request was made. Review the count, then set "
+        "RUN_API_BACKFILL=True to begin a resumable batch."
+    )
+
+selected_run_inits = pending_run_inits[:MAX_NEW_RUNS_PER_EXECUTION]
+if len(pending_run_inits) > len(selected_run_inits):
+    print(
+        f"This execution will process {len(selected_run_inits):,} requests. "
+        f"{len(pending_run_inits) - len(selected_run_inits):,} requests remain for later resumable batches."
+    )
 pending_rows = []
 processed_since_checkpoint = 0
 run_temperature_cache = {}
@@ -278,11 +309,8 @@ def build_complete_origin(origin: dt.datetime, run_init: dt.datetime) -> tuple[l
     return origin_rows, None
 
 
-for request_index, run_init in enumerate(run_inits, start=1):
-    run_origins = [
-        origin for origin in origins
-        if selected[origin][0] == run_init and origin not in existing_origins
-    ]
+for request_index, run_init in enumerate(selected_run_inits, start=1):
+    run_origins = [origin for origin in origins_by_run[run_init] if origin not in existing_origins]
     if not run_origins:
         continue
     for origin in run_origins:
@@ -316,9 +344,9 @@ for request_index, run_init in enumerate(run_inits, start=1):
         if len(origin_rows) != HORIZON_HOURS:
             raise RuntimeError(f"Origin {origin} produced {len(origin_rows)} rows; expected {HORIZON_HOURS}.")
         pending_rows.extend(origin_rows)
-    if request_index % 50 == 0 or request_index == len(run_inits):
+    if request_index % 50 == 0 or request_index == len(selected_run_inits):
         print(
-            f"Processed {request_index:,}/{len(run_inits):,} unique runs; "
+            f"Processed {request_index:,}/{len(selected_run_inits):,} runs in this batch; "
             f"{len(pending_rows):,} rows are waiting for the next checkpoint."
         )
     processed_since_checkpoint += 1
@@ -334,6 +362,13 @@ checkpoint(pending_rows)
 if pending_rows:
     existing_origins.update(row["forecast_origin_utc"] for row in pending_rows)
     print(f"Saved final batch of {len(pending_rows):,} rows.")
+remaining_origins = [origin for origin in origins if origin not in existing_origins]
+if remaining_origins:
+    dbutils.notebook.exit(
+        f"Weather backfill batch completed. {len(remaining_origins):,} hourly origins remain; "
+        "rerun after reviewing the next preview to resume. Candidate evaluation is deferred "
+        "until all requested origins have complete weather paths."
+    )
 if not spark.catalog.tableExists(TARGET_TABLE):
     raise RuntimeError("No weather backtest vintages were materialized.")
 
@@ -359,16 +394,28 @@ print(
 # a complete archived weather vintage are excluded from BOTH control and
 # candidate, preventing a coverage-driven sample difference from masquerading
 # as a weather skill change.
+example_columns = sorted(set(
+    [
+        "respondent", "forecast_origin_utc", "target_timestamp_utc", "horizon_hours",
+        "actual_demand_mw", "seasonal_naive_mw", "is_valid_training_example",
+    ]
+    + features_for_horizon(24) + features_for_horizon(168)
+))
 examples_pdf = (
     spark.table(EXAMPLES_TABLE)
     .filter(F.col("respondent") == "ERCO")
     .filter(F.col("horizon_hours").isin(24, 168))
     .filter(F.col("forecast_origin_utc") >= F.lit(ARCHIVE_START_UTC))
+    .select(*example_columns)
     .toPandas()
 )
 weather_pdf = (
     spark.table(TARGET_TABLE)
     .filter(F.col("forecast_origin_utc") >= F.lit(ARCHIVE_START_UTC))
+    .select(
+        "respondent", "forecast_origin_utc", "target_timestamp_utc", "weather_run_init_utc",
+        "weather_available_at_utc", "weighted_temperature_f", "cdh_65_forecast", "hdh_65_forecast",
+    )
     .toPandas()
 )
 origin_counts = weather_pdf.groupby("forecast_origin_utc").size()
@@ -384,16 +431,31 @@ for frame in (examples_pdf, weather_pdf):
     frame["forecast_origin_utc"] = pd.to_datetime(frame["forecast_origin_utc"], utc=True)
     frame["target_timestamp_utc"] = pd.to_datetime(frame["target_timestamp_utc"], utc=True)
 
-join_columns = [
-    "respondent", "forecast_origin_utc", "target_timestamp_utc",
-    "weighted_temperature_f", "cdh_65_forecast", "hdh_65_forecast",
-    "weather_run_init_utc", "weather_available_at_utc", "weather_issue_time_proxy_utc",
+matched_pdf, weather_coverage_pdf = attach_weather_asof_issue(
+    examples_pdf,
+    weather_pdf,
+    issue_delay_minutes=ISSUE_DELAY_MINUTES,
+)
+complete_issue_keys = weather_coverage_pdf.loc[
+    weather_coverage_pdf["complete_weather_horizon"],
+    ["respondent", "forecast_origin_utc", "horizon_hours"],
 ]
-matched_pdf = examples_pdf.merge(
-    weather_pdf[join_columns],
-    on=["respondent", "forecast_origin_utc", "target_timestamp_utc"],
+matched_pdf = matched_pdf.merge(
+    complete_issue_keys,
+    on=["respondent", "forecast_origin_utc", "horizon_hours"],
     how="inner",
     validate="many_to_one",
+)
+if matched_pdf.empty:
+    raise RuntimeError(
+        "No complete issue-time weather curves are available for a matched comparison. "
+        "The as-of selector excludes later vintages and partial horizons."
+    )
+print(
+    "As-of weather matching retained "
+    f"{complete_issue_keys['forecast_origin_utc'].nunique():,} complete issue/horizon groups "
+    f"across {matched_pdf['forecast_origin_utc'].nunique():,} origins; later/unavailable vintages "
+    "and incomplete curves were excluded."
 )
 weather_features = ["weighted_temperature_f", "cdh_65_forecast", "hdh_65_forecast"]
 model_params = {
