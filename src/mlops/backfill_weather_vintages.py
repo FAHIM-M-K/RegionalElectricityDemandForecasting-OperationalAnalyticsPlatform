@@ -71,6 +71,7 @@ for _ in range(5):
     _root = _parent
 
 from configs.loader import load_platform_config
+from src.shared.forecast_contract import FEATURE_SET_DEMAND_FOUNDATION
 from src.mlops.weather_api_budget import ApiRequestBudget, ApiRequestBudgetExceeded
 
 api_request_budget = ApiRequestBudget(MAX_API_REQUEST_ATTEMPTS_PER_EXECUTION)
@@ -169,6 +170,7 @@ def request_run(run_init: dt.datetime) -> list[dict]:
 origin_pdf = (
     spark.table(EXAMPLES_TABLE)
     .filter((F.col("respondent") == "ERCO") & (F.col("horizon_hours") == HORIZON_HOURS))
+    .filter(F.col("feature_set") == FEATURE_SET_DEMAND_FOUNDATION)
     .filter(F.col("forecast_origin_utc") >= F.lit(ARCHIVE_START_UTC))
     .select("forecast_origin_utc")
     .distinct()

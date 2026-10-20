@@ -9,7 +9,8 @@ training source and leaves the demand-only foundation untouched.
 from pyspark.sql import functions as F
 
 from src.shared.forecast_contract import (
-    FEATURE_SCHEMA_VERSION, FEATURE_SET_OPERATIONAL, WEATHER_FORECAST_FEATURES,
+    FEATURE_SCHEMA_VERSION, FEATURE_SET_DEMAND_FOUNDATION,
+    FEATURE_SET_OPERATIONAL, WEATHER_FORECAST_FEATURES,
 )
 
 CATALOG = "main"
@@ -32,6 +33,7 @@ if not spark.catalog.tableExists(WEATHER_TABLE):
 examples = (
     spark.table(EXAMPLES_TABLE)
     .filter((F.col("respondent") == "ERCO") & F.col("horizon_hours").isin(*HORIZONS))
+    .filter(F.col("feature_set") == FEATURE_SET_DEMAND_FOUNDATION)
     .filter(F.col("forecast_origin_utc") >= F.lit(ARCHIVE_START_UTC).cast("timestamp"))
 )
 weather = spark.table(WEATHER_TABLE)
