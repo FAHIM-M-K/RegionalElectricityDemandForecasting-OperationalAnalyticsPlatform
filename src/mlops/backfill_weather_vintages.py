@@ -36,13 +36,17 @@ ISSUE_DELAY_MINUTES = 65
 CONSERVATIVE_PUBLICATION_DELAY_HOURS = 6
 HORIZON_HOURS = 168
 FORECAST_DAYS = 9
-REQUEST_PAUSE_SECONDS = 0.15
+REQUEST_PAUSE_SECONDS = 1.0
 CHECKPOINT_EVERY_RUNS = 20
 # Preview is the default; a manual Databricks run must explicitly set the widget
 # to true before any external API requests are made.
 RUN_API_BACKFILL = False
-MAX_NEW_RUNS_PER_EXECUTION = 100
-MAX_API_REQUEST_ATTEMPTS_PER_EXECUTION = 100
+# The Open-Meteo free tier allows 10,000 calls/day. Keep 1,000 calls in reserve
+# for hourly production ingestion and other diagnostics. This is a daily safety
+# ceiling, not a small per-batch throttle. One batched request covers all four
+# stations; the one-second pause also stays below the documented minute/hour caps.
+MAX_NEW_RUNS_PER_EXECUTION = 9_000
+MAX_API_REQUEST_ATTEMPTS_PER_EXECUTION = 9_000
 
 
 class DailyApiQuotaExceeded(RuntimeError):
