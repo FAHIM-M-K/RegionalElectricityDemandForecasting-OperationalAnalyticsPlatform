@@ -31,6 +31,7 @@ from src.mlops.backtest_multihorizon import (
     generate_chronological_splits,
 )
 from src.shared.forecast_contract import FEATURE_SCHEMA_VERSION, HORIZONS, features_for_horizon
+from src.mlops.training_data_contract import clean_training_examples
 
 try:
     import mlflow
@@ -47,15 +48,7 @@ MODEL_PARAMS = {"objective": "regression_l1", "metric": "l1", "learning_rate": 0
 
 
 def _clean_examples(examples: pd.DataFrame, horizon: int) -> pd.DataFrame:
-    features = features_for_horizon(horizon)
-    data = examples.loc[(examples["horizon_hours"] == horizon) & (examples["is_valid_training_example"] == True)].copy()
-    data["forecast_origin_utc"] = pd.to_datetime(data["forecast_origin_utc"], utc=True)
-    data["target_timestamp_utc"] = pd.to_datetime(data["target_timestamp_utc"], utc=True)
-    data = data.dropna(subset=features + ["actual_demand_mw"]).sort_values("forecast_origin_utc")
-    if data.empty:
-        raise ValueError(f"No valid H{horizon} examples available for training.")
-    data["residual_target_mw"] = data["actual_demand_mw"] - data["seasonal_naive_mw"]
-    return data
+    return clean_training_examples(examples, horizon)
 
 
 def _fit(train: pd.DataFrame, validation: pd.DataFrame, features: list[str]):
