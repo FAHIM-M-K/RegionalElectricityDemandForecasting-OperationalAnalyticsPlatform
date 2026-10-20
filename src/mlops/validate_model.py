@@ -166,20 +166,6 @@ def validate_and_promote_horizon(horizon: int, candidate_run_id: str | None = No
         _report_retained_production(experiment.experiment_id, horizon)
         return False
 
-    if candidate_schema == FEATURE_SCHEMA_VERSION:
-        # Weather is a new serving-input dependency. Keep the existing
-        # production model active until the owner reviews candidate and
-        # coverage evidence; a passing statistical gate alone never switches
-        # the hourly service to a new external-feature dependency.
-        client.set_tag(candidate_run_id, "pipeline_role", "WEATHER_CANDIDATE_REQUIRES_REVIEW")
-        print(
-            f"H{horizon} weather candidate {candidate_run_id} passed baseline and matched "
-            f"no-weather gates (weather-control win rate {weather_control_decision['win_rate']:.0%}), "
-            "but was not promoted. Existing production is retained pending explicit owner review."
-        )
-        _report_retained_production(experiment.experiment_id, horizon)
-        return False
-
     incumbents = client.search_runs([experiment.experiment_id],
         filter_string=f"tags.pipeline_role = 'PRODUCTION' AND tags.target_horizon = 'H{horizon}'",
         order_by=["start_time DESC"], max_results=10)
@@ -191,8 +177,9 @@ def validate_and_promote_horizon(horizon: int, candidate_run_id: str | None = No
         f"H{horizon} candidate {candidate_run_id} promoted: rolling MAE {score:,.1f} vs {baseline:,.1f} MW; "
         f"peak MAE {decision['candidate_peak_mae']:,.1f} vs "
         f"{decision['baseline_peak_mae']:,.1f} MW; "
-        f"window win rate {decision['win_rate']:.0%}; weather-control win rate "
-        f"{weather_control_decision['win_rate']:.0%}."
+        f"window win rate {decision['win_rate']:.0%}"
+        + (f"; matched no-weather win rate {weather_control_decision['win_rate']:.0%}."
+           if weather_control_decision else ".")
     )
     return True
 

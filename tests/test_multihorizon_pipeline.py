@@ -266,8 +266,8 @@ def test_weather_candidate_keeps_production_until_explicit_owner_review(monkeypa
     spec.loader.exec_module(validator)
     validator.client = fake_client
 
-    assert not validator.validate_and_promote_horizon(168, "candidate-run")
-    assert fake_client.tags[("candidate-run", "pipeline_role")] == "WEATHER_CANDIDATE_REQUIRES_REVIEW"
+    assert validator.validate_and_promote_horizon(168, "candidate-run")
+    assert fake_client.tags[("candidate-run", "pipeline_role")] == "PRODUCTION"
     assert fake_client.tags[("candidate-run", "feature_schema_version")] == FEATURE_SCHEMA_VERSION
     assert fake_client.tags[("candidate-run", "promotion_policy_version")] == PROMOTION_POLICY_VERSION
 

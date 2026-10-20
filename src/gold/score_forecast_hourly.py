@@ -288,16 +288,35 @@ if __name__ == "__main__" and "spark" in globals():
                 f"Weather-enabled production model requires {SOURCE_WEATHER_TABLE}; "
                 "the weather snapshot must be ingested and conformed before scoring."
             )
+        forecast_origin = pd.to_datetime(latest_observation, utc=True)
+        first_required_target = forecast_origin + pd.Timedelta(hours=1)
+        last_required_target = forecast_origin + pd.Timedelta(hours=max(HORIZONS))
         weather_source = spark.table(SOURCE_WEATHER_TABLE).filter(
             (F.col("snapshot_available_at_utc") <= F.lit(issue_time))
             & F.col("is_complete_weather_forecast")
             & (F.col("temperature_reporting_stations_count") == 4)
+            & (F.col("target_timestamp_utc") >= F.lit(first_required_target.to_pydatetime()))
+            & (F.col("target_timestamp_utc") <= F.lit(last_required_target.to_pydatetime()))
         )
-        latest = (weather_source.groupBy("snapshot_batch_id")
-                  .agg(F.max("snapshot_available_at_utc").alias("available_at"))
-                  .orderBy(F.col("available_at").desc()).limit(1).first())
+        # A newer snapshot may have been captured after the first forecast
+        # target hour began. Pick the newest issue-time-available snapshot that
+        # covers the entire requested curve, instead of selecting newest first
+        # and failing later on a missing leading hour.
+        eligible_snapshots = (weather_source.groupBy("snapshot_batch_id")
+                              .agg(F.max("snapshot_available_at_utc").alias("available_at"),
+                                   F.countDistinct("target_timestamp_utc").alias("target_hours"),
+                                   F.min("target_timestamp_utc").alias("first_target"),
+                                   F.max("target_timestamp_utc").alias("last_target"))
+                              .filter((F.col("target_hours") == max(HORIZONS))
+                                      & (F.col("first_target") == F.lit(first_required_target.to_pydatetime()))
+                                      & (F.col("last_target") == F.lit(last_required_target.to_pydatetime())))
+                              .orderBy(F.col("available_at").desc()))
+        latest = eligible_snapshots.limit(1).first()
         if latest is None:
-            raise RuntimeError("No complete, issue-time-available regional weather forecast snapshot exists.")
+            raise RuntimeError(
+                "No issue-time-available regional weather snapshot covers the full forecast interval "
+                f"{first_required_target} through {last_required_target}; refusing partial weather-model output."
+            )
         weather_forecast = (weather_source.filter(F.col("snapshot_batch_id") == latest["snapshot_batch_id"])
                             .select("target_timestamp_utc", "snapshot_available_at_utc",
                                     "snapshot_batch_id",
@@ -319,13 +338,29 @@ if __name__ == "__main__" and "spark" in globals():
     if spark.catalog.tableExists(TARGET_EVALUATION_TABLE):
         # Migrate additive issue/freshness fields in place before MERGE. Without
         # this, an older evaluation table rejects the new scorer's insert schema.
-        existing_columns = set(spark.table(TARGET_EVALUATION_TABLE).columns)
+        evaluation_schema = spark.table(TARGET_EVALUATION_TABLE).schema
+        existing_types = {field.name: field.dataType.simpleString() for field in evaluation_schema.fields}
+        existing_columns = set(existing_types)
         missing_columns = [field for field in incoming.schema.fields if field.name not in existing_columns]
         if missing_columns:
             ddl_columns = ", ".join(
                 f"`{field.name}` {field.dataType.simpleString()}" for field in missing_columns
             )
             spark.sql(f"ALTER TABLE {TARGET_EVALUATION_TABLE} ADD COLUMNS ({ddl_columns})")
+        # Older no-weather runs wrote NULL-only lineage fields, which Spark
+        # inferred as VOID. Widen those fields to their stable contract types
+        # before MERGE so the first weather-backed issue can be appended.
+        expected_lineage_types = {
+            "weather_snapshot_batch_id": "STRING",
+            "weather_snapshot_available_at_utc": "TIMESTAMP",
+            "weather_run_init_utc": "TIMESTAMP",
+        }
+        for column_name, target_type in expected_lineage_types.items():
+            if existing_types.get(column_name) == "void":
+                spark.sql(
+                    f"ALTER TABLE {TARGET_EVALUATION_TABLE} "
+                    f"ALTER COLUMN `{column_name}` TYPE {target_type}"
+                )
         DeltaTable.forName(spark, TARGET_EVALUATION_TABLE).alias("t").merge(
             incoming.alias("s"),
             "t.respondent=s.respondent AND t.forecast_issue_id=s.forecast_issue_id "
