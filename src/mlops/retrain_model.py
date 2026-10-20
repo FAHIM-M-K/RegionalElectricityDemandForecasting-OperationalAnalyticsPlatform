@@ -31,7 +31,12 @@ from src.mlops.backtest_multihorizon import (
     generate_chronological_splits,
 )
 from src.shared.forecast_contract import FEATURE_SCHEMA_VERSION, HORIZONS, features_for_horizon
-from src.mlops.training_data_contract import clean_training_examples
+from src.mlops.training_data_contract import (
+    DEFAULT_EXAMPLES_TABLE,
+    ROLLING_EXAMPLES_TABLE,
+    clean_training_examples,
+    validate_examples_table,
+)
 
 try:
     import mlflow
@@ -113,7 +118,8 @@ def _mean_metric(results: list[Dict[str, Dict[str, float]]], model_name: str, me
 
 
 def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: int = 4,
-                               high_demand_threshold_mw: float = 75_000.0) -> dict:
+                               high_demand_threshold_mw: float = 75_000.0,
+                               examples_table: str = DEFAULT_EXAMPLES_TABLE) -> dict:
     """Fit and score one direct horizon model without random splitting."""
     features, data = features_for_horizon(horizon), _clean_examples(examples, horizon)
     splits = generate_chronological_splits(data["forecast_origin_utc"], n_test_windows=n_windows)
@@ -191,6 +197,7 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
         with mlflow.start_run(run_name=f"SeasonalResidual_LightGBM_H{horizon}") as run:
             result["run_id"] = run.info.run_id
             mlflow.log_params({**MODEL_PARAMS, "horizon_hours": horizon, "feature_schema_version": FEATURE_SCHEMA_VERSION,
+                               "training_examples_table": examples_table,
                                "feature_count": len(features), "selection_windows": len(selection_results),
                                "training_rows": len(pre_holdout), "training_origin_start": str(pre_holdout.forecast_origin_utc.min()),
                                "training_origin_end": str(pre_holdout.forecast_origin_utc.max()),
@@ -292,6 +299,7 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
                             "feature_importance.json")
             mlflow.set_tags({"pipeline_role": "CHAMPION_CANDIDATE", "target_horizon": f"H{horizon}",
                              "model_type": "seasonal_naive_residual_lightgbm", "weather_assumption": "no_weather",
+                             "training_origin_cadence": "hourly" if examples_table == ROLLING_EXAMPLES_TABLE else "daily",
                              "feature_schema_version": FEATURE_SCHEMA_VERSION,
                              "promotion_policy_version": PROMOTION_POLICY_VERSION})
             # Keep the model's input contract in MLflow so registry consumers
@@ -307,10 +315,37 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
 if __name__ == "__main__" and "spark" in globals():
     from configs.loader import load_platform_config
 
-    examples = spark.table(f"{CATALOG}.gold.forecast_examples").toPandas()
+    if "dbutils" in globals():
+        try:
+            dbutils.widgets.get("examples_table")
+        except Exception:
+            dbutils.widgets.text("examples_table", DEFAULT_EXAMPLES_TABLE, "Training examples table")
+        examples_table = dbutils.widgets.get("examples_table")
+    else:
+        examples_table = DEFAULT_EXAMPLES_TABLE
+    examples_table = validate_examples_table(examples_table)
+    if not spark.catalog.tableExists(examples_table):
+        raise RuntimeError(f"Training examples table does not exist: {examples_table}")
+
     threshold = float(load_platform_config("ercot_config.json")["region"]["default_peak_threshold_mw"])
-    results = {horizon: train_single_horizon_model(examples, horizon,
-                                                   high_demand_threshold_mw=threshold) for horizon in HORIZONS}
+    from pyspark.sql import functions as F
+
+    results = {}
+    for horizon in HORIZONS:
+        # Load one horizon at a time to cap driver memory, especially for the
+        # much larger hourly-origin example table.
+        examples = (
+            spark.table(examples_table)
+            .filter(F.col("horizon_hours") == horizon)
+            .toPandas()
+        )
+        results[horizon] = train_single_horizon_model(
+            examples,
+            horizon,
+            high_demand_threshold_mw=threshold,
+            examples_table=examples_table,
+        )
+        del examples
     for horizon, result in results.items():
         baseline_name = "daily" if horizon == 24 else "weekly"
         baseline_label = "daily naive" if horizon == 24 else "weekly naive"
@@ -352,4 +387,9 @@ if __name__ == "__main__" and "spark" in globals():
                 f"false alarms {model_alert['false_positive']:,}."
             )
         if result["run_id"]:
-            dbutils.jobs.taskValues.set(key=f"candidate_run_id_h{horizon}", value=result["run_id"])
+            try:
+                dbutils.jobs.taskValues.set(key=f"candidate_run_id_h{horizon}", value=result["run_id"])
+            except Exception as exc:
+                # Interactive candidate runs have no downstream validation
+                # task; the MLflow run remains available for manual review.
+                print(f"Candidate run ID is logged in MLflow; task value unavailable: {exc}")

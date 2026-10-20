@@ -10,6 +10,20 @@ import pandas as pd
 
 from src.shared.forecast_contract import EXAMPLE_GRAIN_KEYS, features_for_horizon
 
+DEFAULT_EXAMPLES_TABLE = "main.gold.forecast_examples"
+ROLLING_EXAMPLES_TABLE = "main.gold.forecast_examples_hourly"
+ALLOWED_EXAMPLES_TABLES = {DEFAULT_EXAMPLES_TABLE, ROLLING_EXAMPLES_TABLE}
+
+
+def validate_examples_table(table_name: str) -> str:
+    """Allow only the established daily or rolling-example training source."""
+    if table_name not in ALLOWED_EXAMPLES_TABLES:
+        raise ValueError(
+            f"Unsupported training source {table_name!r}; choose one of "
+            f"{sorted(ALLOWED_EXAMPLES_TABLES)}."
+        )
+    return table_name
+
 
 def clean_training_examples(examples: pd.DataFrame, horizon: int) -> pd.DataFrame:
     """Return valid examples for one horizon after enforcing temporal contracts."""

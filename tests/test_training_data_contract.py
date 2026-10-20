@@ -3,7 +3,19 @@ import pandas as pd
 import pytest
 
 from src.gold.forecast_example_features import generate_forecast_examples_df
-from src.mlops.training_data_contract import clean_training_examples
+from src.mlops.training_data_contract import (
+    DEFAULT_EXAMPLES_TABLE,
+    ROLLING_EXAMPLES_TABLE,
+    clean_training_examples,
+    validate_examples_table,
+)
+
+
+def test_training_source_allows_daily_and_hourly_tables_only():
+    assert validate_examples_table(DEFAULT_EXAMPLES_TABLE) == DEFAULT_EXAMPLES_TABLE
+    assert validate_examples_table(ROLLING_EXAMPLES_TABLE) == ROLLING_EXAMPLES_TABLE
+    with pytest.raises(ValueError, match="Unsupported training source"):
+        validate_examples_table("main.gold.any_other_table")
 
 
 def _examples():
