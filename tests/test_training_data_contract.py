@@ -7,6 +7,7 @@ from src.mlops.training_data_contract import (
     DEFAULT_EXAMPLES_TABLE,
     ROLLING_EXAMPLES_TABLE,
     clean_training_examples,
+    training_origin_stride_hours,
     validate_examples_table,
 )
 
@@ -16,6 +17,12 @@ def test_training_source_allows_daily_and_hourly_tables_only():
     assert validate_examples_table(ROLLING_EXAMPLES_TABLE) == ROLLING_EXAMPLES_TABLE
     with pytest.raises(ValueError, match="Unsupported training source"):
         validate_examples_table("main.gold.any_other_table")
+
+
+def test_training_origin_stride_bounds_only_the_hourly_h168_dataset():
+    assert training_origin_stride_hours(24, ROLLING_EXAMPLES_TABLE) == 1
+    assert training_origin_stride_hours(168, ROLLING_EXAMPLES_TABLE) == 6
+    assert training_origin_stride_hours(168, DEFAULT_EXAMPLES_TABLE) == 1
 
 
 def _examples():

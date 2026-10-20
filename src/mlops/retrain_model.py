@@ -31,10 +31,12 @@ from src.mlops.backtest_multihorizon import (
     generate_chronological_splits,
 )
 from src.shared.forecast_contract import FEATURE_SCHEMA_VERSION, HORIZONS, features_for_horizon
+from src.shared.forecast_contract import EXAMPLE_GRAIN_KEYS
 from src.mlops.training_data_contract import (
     DEFAULT_EXAMPLES_TABLE,
     ROLLING_EXAMPLES_TABLE,
     clean_training_examples,
+    training_origin_stride_hours,
     validate_examples_table,
 )
 
@@ -119,7 +121,8 @@ def _mean_metric(results: list[Dict[str, Dict[str, float]]], model_name: str, me
 
 def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: int = 4,
                                high_demand_threshold_mw: float = 75_000.0,
-                               examples_table: str = DEFAULT_EXAMPLES_TABLE) -> dict:
+                               examples_table: str = DEFAULT_EXAMPLES_TABLE,
+                               origin_stride_hours: int = 1) -> dict:
     """Fit and score one direct horizon model without random splitting."""
     features, data = features_for_horizon(horizon), _clean_examples(examples, horizon)
     splits = generate_chronological_splits(data["forecast_origin_utc"], n_test_windows=n_windows)
@@ -198,6 +201,7 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
             result["run_id"] = run.info.run_id
             mlflow.log_params({**MODEL_PARAMS, "horizon_hours": horizon, "feature_schema_version": FEATURE_SCHEMA_VERSION,
                                "training_examples_table": examples_table,
+                               "training_origin_stride_hours": origin_stride_hours,
                                "feature_count": len(features), "selection_windows": len(selection_results),
                                "training_rows": len(pre_holdout), "training_origin_start": str(pre_holdout.forecast_origin_utc.min()),
                                "training_origin_end": str(pre_holdout.forecast_origin_utc.max()),
@@ -300,6 +304,7 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
             mlflow.set_tags({"pipeline_role": "CHAMPION_CANDIDATE", "target_horizon": f"H{horizon}",
                              "model_type": "seasonal_naive_residual_lightgbm", "weather_assumption": "no_weather",
                              "training_origin_cadence": "hourly" if examples_table == ROLLING_EXAMPLES_TABLE else "daily",
+                             "training_origin_stride_hours": str(origin_stride_hours),
                              "feature_schema_version": FEATURE_SCHEMA_VERSION,
                              "promotion_policy_version": PROMOTION_POLICY_VERSION})
             # Keep the model's input contract in MLflow so registry consumers
@@ -324,6 +329,23 @@ if __name__ == "__main__" and "spark" in globals():
     else:
         examples_table = DEFAULT_EXAMPLES_TABLE
     examples_table = validate_examples_table(examples_table)
+
+    if "dbutils" in globals():
+        try:
+            dbutils.widgets.get("training_horizons")
+        except Exception:
+            dbutils.widgets.text("training_horizons", "24,168", "Horizons to train")
+        requested_horizons = dbutils.widgets.get("training_horizons")
+    else:
+        requested_horizons = "24,168"
+    try:
+        training_horizons = [int(value.strip()) for value in requested_horizons.split(",") if value.strip()]
+    except ValueError as exc:
+        raise ValueError("training_horizons must be a comma-separated list such as '24,168'.") from exc
+    if not training_horizons or len(set(training_horizons)) != len(training_horizons) or any(
+        horizon not in HORIZONS for horizon in training_horizons
+    ):
+        raise ValueError(f"training_horizons must contain unique values from {HORIZONS}.")
     if not spark.catalog.tableExists(examples_table):
         raise RuntimeError(f"Training examples table does not exist: {examples_table}")
 
@@ -331,19 +353,46 @@ if __name__ == "__main__" and "spark" in globals():
     from pyspark.sql import functions as F
 
     results = {}
-    for horizon in HORIZONS:
+    spark.conf.set("spark.sql.session.timeZone", "UTC")
+    for horizon in training_horizons:
         # Load one horizon at a time to cap driver memory, especially for the
         # much larger hourly-origin example table.
-        examples = (
-            spark.table(examples_table)
-            .filter(F.col("horizon_hours") == horizon)
-            .toPandas()
+        origin_stride = training_origin_stride_hours(horizon, examples_table)
+        examples_sdf = spark.table(examples_table).filter(F.col("horizon_hours") == horizon)
+        if origin_stride > 1:
+            # Sample entire origins, never individual rows, so every retained
+            # origin still has its full lead curve for peak-event evaluation.
+            examples_sdf = examples_sdf.filter(
+                F.pmod(F.xxhash64("forecast_origin_utc"), F.lit(origin_stride)) == 0
+            )
+        # Project only training, temporal-contract, and scoring columns before
+        # crossing the Spark/Pandas boundary. The source table also contains
+        # serving/lineage fields that the trainer never reads.
+        feature_columns = features_for_horizon(horizon)
+        required_columns = set(EXAMPLE_GRAIN_KEYS) | set(feature_columns) | {
+            "source_max_observation_utc", "actual_demand_mw", "is_valid_training_example",
+            "daily_naive_mw", "weekly_naive_mw", "eia_day_ahead_forecast_mw",
+        }
+        projected_columns = [name for name in examples_sdf.columns if name in required_columns]
+        missing_columns = required_columns - set(projected_columns)
+        if missing_columns:
+            raise RuntimeError(
+                f"Training source {examples_table} is missing required H{horizon} columns: "
+                f"{sorted(missing_columns)}"
+            )
+        examples_sdf = examples_sdf.select(*projected_columns)
+        selected_row_count = examples_sdf.count()
+        print(
+            f"H{horizon}: collecting {selected_row_count:,} rows from {examples_table}; "
+            f"origin sampling is 1/{origin_stride}, with full retained lead curves."
         )
+        examples = examples_sdf.toPandas()
         results[horizon] = train_single_horizon_model(
             examples,
             horizon,
             high_demand_threshold_mw=threshold,
             examples_table=examples_table,
+            origin_stride_hours=origin_stride,
         )
         del examples
     for horizon, result in results.items():

@@ -25,6 +25,19 @@ def validate_examples_table(table_name: str) -> str:
     return table_name
 
 
+def training_origin_stride_hours(horizon: int, table_name: str) -> int:
+    """Bound the hourly H168 driver dataset while retaining full issue curves.
+
+    The hourly H168 table has roughly seven times as many examples as the
+    daily-origin table. A deterministic 1-in-6 origin sample keeps all leads
+    for each selected origin and makes the driver-side LightGBM fit tractable.
+    H24 and the existing daily training source retain every available origin.
+    """
+    validate_examples_table(table_name)
+    features_for_horizon(horizon)  # Validate the horizon against the shared contract.
+    return 6 if table_name == ROLLING_EXAMPLES_TABLE and horizon == 168 else 1
+
+
 def clean_training_examples(examples: pd.DataFrame, horizon: int) -> pd.DataFrame:
     """Return valid examples for one horizon after enforcing temporal contracts."""
     features = features_for_horizon(horizon)
