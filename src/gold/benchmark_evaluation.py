@@ -288,13 +288,120 @@ def match_h168_and_ercot(
     return df_matched, summary_metrics
 
 
+def match_h168_and_weekly_naive(
+    df_h168_forecasts: pd.DataFrame,
+    df_actuals: pd.DataFrame,
+    lead_buckets: Optional[List[Tuple[int, int]]] = None,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Compare rolling H168 issues with a no-cost weekly seasonal-naive baseline.
+
+    The baseline for target T is the observed demand at T - 168 hours. That
+    value is available by the issue cutoff for every lead in [1, 168]. The
+    headline uses lead 168, giving one forecast per target; lead buckets are
+    diagnostic issue-target-pair metrics and report unique-target counts.
+    """
+    if lead_buckets is None:
+        lead_buckets = [(1, 24), (25, 48), (49, 168)]
+
+    h168 = df_h168_forecasts[df_h168_forecasts["horizon_hours"] == 168].copy()
+    if h168.empty or df_actuals.empty:
+        return pd.DataFrame(), {
+            "status": "PENDING_MATURED_ACTUALS",
+            "matched_rows": 0,
+            "unique_targets": 0,
+            "headline_policy": "lead_168",
+            "lead_bucket_metrics": {},
+            "notice": "No matured H168 target actuals are available yet.",
+        }
+
+    h168["target_timestamp_utc"] = pd.to_datetime(h168["target_timestamp_utc"], utc=True)
+    h168["forecast_origin_utc"] = pd.to_datetime(h168["forecast_origin_utc"], utc=True)
+    issue_keys = ["respondent", "forecast_origin_utc", "target_timestamp_utc"]
+    if "forecast_issue_id" in h168.columns:
+        issue_keys.insert(1, "forecast_issue_id")
+    _require_unique(h168, issue_keys, "H168 forecasts")
+
+    actuals = df_actuals[["respondent", "timestamp_utc", "actual_demand_mw"]].copy()
+    actuals["timestamp_utc"] = pd.to_datetime(actuals["timestamp_utc"], utc=True)
+    actuals = actuals[actuals["actual_demand_mw"].notna()]
+    _require_unique(actuals, ["respondent", "timestamp_utc"], "Actual demand")
+
+    target_actuals = actuals.rename(columns={
+        "timestamp_utc": "target_timestamp_utc",
+        "actual_demand_mw": "actual_demand_mw",
+    })
+    baseline_actuals = actuals.rename(columns={
+        "timestamp_utc": "baseline_timestamp_utc",
+        "actual_demand_mw": "weekly_naive_mw",
+    })
+    h168["baseline_timestamp_utc"] = h168["target_timestamp_utc"] - pd.Timedelta(hours=168)
+    matched = h168.merge(
+        target_actuals,
+        on=["respondent", "target_timestamp_utc"],
+        how="inner",
+    ).merge(
+        baseline_actuals,
+        on=["respondent", "baseline_timestamp_utc"],
+        how="inner",
+    )
+    # A missing or future baseline is not silently treated as a scoreable row.
+    matched = matched[matched["baseline_timestamp_utc"] <= matched["forecast_origin_utc"]].copy()
+    if matched.empty:
+        return pd.DataFrame(), {
+            "status": "PENDING_MATURED_ACTUALS",
+            "matched_rows": 0,
+            "unique_targets": 0,
+            "headline_policy": "lead_168",
+            "lead_bucket_metrics": {},
+            "notice": "No H168 rows have both matured target actuals and an issue-time-available weekly baseline.",
+        }
+
+    matched["model_error_mw"] = matched["predicted_demand_mw"] - matched["actual_demand_mw"]
+    matched["model_abs_error_mw"] = matched["model_error_mw"].abs()
+    matched["weekly_naive_error_mw"] = matched["weekly_naive_mw"] - matched["actual_demand_mw"]
+    matched["weekly_naive_abs_error_mw"] = matched["weekly_naive_error_mw"].abs()
+
+    bucket_metrics = {}
+    for first_lead, last_lead in lead_buckets:
+        subset = matched[(matched["lead_hours"] >= first_lead) & (matched["lead_hours"] <= last_lead)]
+        if subset.empty:
+            continue
+        bucket_metrics[f"leads_{first_lead}_{last_lead}"] = {
+            "matched_rows": int(len(subset)),
+            "unique_targets": int(subset["target_timestamp_utc"].nunique()),
+            "model_mae_mw": round(float(subset["model_abs_error_mw"].mean()), 2),
+            "weekly_naive_mae_mw": round(float(subset["weekly_naive_abs_error_mw"].mean()), 2),
+            "model_rmse_mw": round(float(np.sqrt((subset["model_error_mw"] ** 2).mean())), 2),
+            "weekly_naive_rmse_mw": round(float(np.sqrt((subset["weekly_naive_error_mw"] ** 2).mean())), 2),
+        }
+
+    headline = matched[matched["lead_hours"] == 168]
+    metrics = {
+        "status": "EVALUATED" if not headline.empty else "PENDING_LEAD_168_MATCHES",
+        "headline_policy": "lead_168_one_forecast_per_target",
+        "matched_rows": int(len(headline)),
+        "unique_targets": int(headline["target_timestamp_utc"].nunique()),
+        "model_mae_mw": round(float(headline["model_abs_error_mw"].mean()), 2) if not headline.empty else None,
+        "weekly_naive_mae_mw": round(float(headline["weekly_naive_abs_error_mw"].mean()), 2) if not headline.empty else None,
+        "model_rmse_mw": round(float(np.sqrt((headline["model_error_mw"] ** 2).mean())), 2) if not headline.empty else None,
+        "weekly_naive_rmse_mw": round(float(np.sqrt((headline["weekly_naive_error_mw"] ** 2).mean())), 2) if not headline.empty else None,
+        "model_bias_mw": round(float(headline["model_error_mw"].mean()), 2) if not headline.empty else None,
+        "weekly_naive_bias_mw": round(float(headline["weekly_naive_error_mw"].mean()), 2) if not headline.empty else None,
+        "all_lead_issue_target_pairs": int(len(matched)),
+        "all_lead_unique_targets": int(matched["target_timestamp_utc"].nunique()),
+        "lead_bucket_metrics": bucket_metrics,
+    }
+    return matched, metrics
+
+
 def run_benchmark_evaluation(spark_session) -> dict:
-    """Evaluate the latest production run against available as-of EIA/ERCOT vintages.
+    """Evaluate H24/EIA and H168 against weekly-naive plus optional ERCOT vintages.
 
     This is an operational materialization entry point. It evaluates the latest
-    served model run per horizon, keeps hourly H168 issue-target pairs for lead
-    buckets, and labels the ERCOT comparison pending until prospective vintages
-    have matured against actual demand.
+    served model run per horizon and keeps hourly H168 issue-target pairs for
+    lead buckets. H168's weekly seasonal-naive comparator is calculated from
+    actuals and requires no external API. ERCOT remains optional and is labeled
+    pending when no valid provider vintages are available.
     """
     from datetime import datetime, timezone
     from pyspark.sql import functions as F
@@ -370,7 +477,12 @@ def run_benchmark_evaluation(spark_session) -> dict:
     summary_rows = []
     detail_frames = []
     now = datetime.now(timezone.utc)
-    for horizon, provider, vintages in ((24, "EIA", eia_vintages), (168, "ERCOT", ercot_vintages)):
+    benchmark_jobs = (
+        (24, "EIA", eia_vintages),
+        (168, "WEEKLY_SEASONAL_NAIVE", None),
+        (168, "ERCOT", ercot_vintages),
+    )
+    for horizon, provider, vintages in benchmark_jobs:
         run_id = latest_runs[horizon]
         forecasts = all_forecasts[
             (all_forecasts["horizon_hours"] == horizon)
@@ -381,6 +493,11 @@ def run_benchmark_evaluation(spark_session) -> dict:
             benchmark_mae_key = "eia_mae_mw"
             benchmark_rmse_key = "eia_rmse_mw"
             benchmark_bias_key = "eia_bias_mw"
+        elif provider == "WEEKLY_SEASONAL_NAIVE":
+            matched, metrics = match_h168_and_weekly_naive(forecasts, actuals)
+            benchmark_mae_key = "weekly_naive_mae_mw"
+            benchmark_rmse_key = "weekly_naive_rmse_mw"
+            benchmark_bias_key = "weekly_naive_bias_mw"
         else:
             matched, metrics = match_h168_and_ercot(forecasts, vintages, actuals)
             benchmark_mae_key = "ercot_mae_mw"
@@ -444,7 +561,7 @@ def run_benchmark_evaluation(spark_session) -> dict:
         DeltaTable.forName(spark_session, detail_table).delete()
 
     print(
-        f"Materialized H24/EIA and H168/ERCOT benchmark status in {summary_table}; "
+        f"Materialized H24/EIA, H168/weekly-naive, and optional H168/ERCOT benchmark status in {summary_table}; "
         f"matched detail rows={sum(len(frame) for frame in detail_frames)}."
     )
     return {"summary_table": summary_table, "detail_table": detail_table, "rows": summary_rows}

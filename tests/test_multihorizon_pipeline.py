@@ -848,3 +848,39 @@ def test_match_h168_and_ercot_prospective_and_buckets():
     # Assert lead 168 diagnostic exists
     assert summary["lead_168_diagnostic"] is not None
     assert summary["lead_168_diagnostic"]["matched_rows"] == 1
+
+
+def test_match_h168_and_weekly_naive_uses_issue_time_available_lag():
+    from src.gold.benchmark_evaluation import match_h168_and_weekly_naive
+
+    origin = pd.Timestamp("2024-06-08 00:00:00", tz="UTC")
+    forecast_rows = []
+    actual_rows = []
+    for lead in range(1, 169):
+        target = origin + pd.Timedelta(hours=lead)
+        forecast_rows.append({
+            "respondent": "ERCO", "forecast_issue_id": "issue-1", "horizon_hours": 168,
+            "lead_hours": lead, "forecast_origin_utc": origin,
+            "target_timestamp_utc": target, "predicted_demand_mw": 50_000.0 + lead * 10,
+        })
+        actual_rows.append({"respondent": "ERCO", "timestamp_utc": target, "actual_demand_mw": 50_000.0})
+    for lag_hour in range(168):
+        actual_rows.append({
+            "respondent": "ERCO",
+            "timestamp_utc": origin - pd.Timedelta(hours=lag_hour),
+            "actual_demand_mw": 49_000.0,
+        })
+
+    matched, metrics = match_h168_and_weekly_naive(
+        pd.DataFrame(forecast_rows), pd.DataFrame(actual_rows)
+    )
+
+    assert metrics["status"] == "EVALUATED"
+    assert metrics["headline_policy"] == "lead_168_one_forecast_per_target"
+    assert metrics["matched_rows"] == 1
+    assert metrics["unique_targets"] == 1
+    assert metrics["model_mae_mw"] == 1_680.0
+    assert metrics["weekly_naive_mae_mw"] == 1_000.0
+    assert metrics["all_lead_issue_target_pairs"] == 168
+    assert metrics["lead_bucket_metrics"]["leads_49_168"]["matched_rows"] == 120
+    assert (matched["baseline_timestamp_utc"] <= matched["forecast_origin_utc"]).all()

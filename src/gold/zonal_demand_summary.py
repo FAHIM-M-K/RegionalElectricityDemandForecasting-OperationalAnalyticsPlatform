@@ -51,10 +51,21 @@ df_meta = spark.createDataFrame(
 )
 
 df_gold = (
+    # Silver already has a provider-supplied `zone_name`. Gold owns the
+    # canonical display label, so replace that field before joining metadata
+    # instead of publishing both `zone_name` and `zone_display_name`.
     df_silver
-    .join(F.broadcast(df_meta), on="zone_code", how="left")
+    .drop("zone_name")
+    .join(
+        F.broadcast(df_meta.withColumnRenamed("zone_display_name", "zone_name")),
+        on="zone_code",
+        how="left",
+    )
     .withColumn("_gold_processed_at_utc", F.current_timestamp())
 )
+
+if df_gold.columns.count("zone_name") != 1:
+    raise RuntimeError("Gold zonal contract must contain exactly one canonical zone_name column.")
 
 row_count = df_gold.count()
 print(f"Native Spark Pipeline Processed: {row_count:,} zonal observed-demand records.")
