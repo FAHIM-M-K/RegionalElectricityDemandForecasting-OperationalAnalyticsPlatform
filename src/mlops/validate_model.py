@@ -65,6 +65,12 @@ def validate_and_promote_horizon(horizon: int, candidate_run_id: str | None = No
             candidate_run_id = dbutils.jobs.taskValues.get(taskKey="retrain_model", key=f"candidate_run_id_h{horizon}", default=None)
         except NameError:
             pass
+        except ValueError as exc:
+            # A standalone validation run has no upstream task named
+            # ``retrain_model``. In that case, continue to the guarded MLflow
+            # candidate search below; propagate unrelated task-value failures.
+            if "Task key does not exist in run:" not in str(exc):
+                raise
     if candidate_run_id is None:
         candidates = client.search_runs([experiment.experiment_id],
             filter_string=f"tags.pipeline_role = 'CHAMPION_CANDIDATE' AND tags.target_horizon = 'H{horizon}'",
