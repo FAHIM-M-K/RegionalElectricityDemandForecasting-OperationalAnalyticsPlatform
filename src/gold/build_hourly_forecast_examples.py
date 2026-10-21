@@ -31,7 +31,7 @@ for _ in range(5):
     _root = os.path.dirname(_root)
 
 from src.gold.forecast_example_features import generate_forecast_examples_df
-from src.shared.forecast_contract import FEATURE_SET_DEMAND_FOUNDATION
+from src.shared.forecast_contract import FEATURE_SET_DEMAND_FOUNDATION, HORIZON_H24
 
 
 def _as_utc(value) -> pd.Timestamp:
