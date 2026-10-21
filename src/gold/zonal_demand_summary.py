@@ -4,7 +4,7 @@
 # MAGIC
 # MAGIC **Source:** `main.silver.clean_ercot_zonal_demand`  
 # MAGIC **Target Table:** `main.gold.ercot_zonal_demand`  
-# MAGIC **Local File Cache:** `data/ercot_zonal_demand.csv` (for Streamlit & Power BI ingestion)  
+# MAGIC **Consumer:** Power BI semantic model and report  
 # MAGIC **Granularity:** Hourly by ERCOT Weather Zone (8 zones)
 
 # COMMAND ----------
