@@ -12,6 +12,9 @@ from src.shared.forecast_contract import EXAMPLE_GRAIN_KEYS, features_for_horizo
 
 ROLLING_EXAMPLES_TABLE = "main.gold.forecast_examples_hourly"
 WEATHER_ROLLING_EXAMPLES_TABLE = "main.gold.forecast_examples_hourly_weather"
+# Compatibility for an older retrain notebook that may be synced separately.
+# Keep this pointed at the active rolling source so its cadence tag remains hourly.
+DEFAULT_EXAMPLES_TABLE = ROLLING_EXAMPLES_TABLE
 ALLOWED_EXAMPLES_TABLES = {ROLLING_EXAMPLES_TABLE, WEATHER_ROLLING_EXAMPLES_TABLE}
 
 

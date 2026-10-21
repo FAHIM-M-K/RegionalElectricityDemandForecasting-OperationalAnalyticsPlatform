@@ -33,7 +33,7 @@ from src.mlops.backtest_multihorizon import (
 from src.shared.forecast_contract import FEATURE_SCHEMA_VERSION, HORIZONS, features_for_horizon
 from src.shared.forecast_contract import EXAMPLE_GRAIN_KEYS
 from src.mlops.training_data_contract import (
-    DEFAULT_EXAMPLES_TABLE,
+    ROLLING_EXAMPLES_TABLE,
     WEATHER_ROLLING_EXAMPLES_TABLE,
     clean_training_examples,
     validate_examples_table,
@@ -335,7 +335,9 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
                             "feature_importance.json")
             mlflow.set_tags({"pipeline_role": "CHAMPION_CANDIDATE", "target_horizon": f"H{horizon}",
                              "model_type": "seasonal_naive_residual_lightgbm", "weather_assumption": "point_in_time_ecmwf_forecast",
-                             "training_origin_cadence": "hourly" if examples_table != DEFAULT_EXAMPLES_TABLE else "daily",
+                             "training_origin_cadence": "hourly" if examples_table in {
+                                 ROLLING_EXAMPLES_TABLE, WEATHER_ROLLING_EXAMPLES_TABLE
+                             } else "unknown",
                              "feature_schema_version": FEATURE_SCHEMA_VERSION,
                              "promotion_policy_version": PROMOTION_POLICY_VERSION})
             # Keep the model's input contract in MLflow so registry consumers
