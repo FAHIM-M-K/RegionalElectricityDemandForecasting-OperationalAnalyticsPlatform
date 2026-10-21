@@ -114,26 +114,6 @@ def compute_lead_bucket_metrics(df: pd.DataFrame, forecasts: Dict[str, Any], pea
     return result
 
 
-def compute_threshold_metrics(y_true, y_pred, threshold_mw: float) -> Dict[str, float]:
-    """Evaluate point-forecast threshold flags; this does not estimate risk probability."""
-    actual, predicted = np.asarray(y_true, dtype=float), np.asarray(y_pred, dtype=float)
-    if actual.shape != predicted.shape:
-        raise ValueError("Actuals and predictions must have the same shape.")
-    valid = np.isfinite(actual) & np.isfinite(predicted)
-    actual_high = actual[valid] >= threshold_mw
-    predicted_high = predicted[valid] >= threshold_mw
-    tp = int(np.sum(actual_high & predicted_high))
-    fp = int(np.sum(~actual_high & predicted_high))
-    fn = int(np.sum(actual_high & ~predicted_high))
-    precision = tp / (tp + fp) if tp + fp else np.nan
-    recall = tp / (tp + fn) if tp + fn else np.nan
-    return {"sample_count": int(valid.sum()), "actual_high_count": int(actual_high.sum()),
-            "predicted_high_count": int(predicted_high.sum()), "true_positive": tp,
-            "false_positive": fp, "false_negative": fn,
-            "precision": round(precision, 4) if np.isfinite(precision) else np.nan,
-            "recall": round(recall, 4) if np.isfinite(recall) else np.nan}
-
-
 def compute_peak_event_metrics(df: pd.DataFrame, forecasts: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
     """Measure peak height and peak-time error for complete forecast-origin paths."""
     required = {"forecast_origin_utc", "target_timestamp_utc", "horizon_hours", "lead_hours", "actual_demand_mw"}

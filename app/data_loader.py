@@ -73,7 +73,7 @@ def load_operational_forecast_data(cache_contract_version="h24-only-v3"):
             )
             SELECT f.respondent, f.forecast_origin_utc, f.issued_at_utc, f.target_timestamp_utc, f.timestamp_local,
                    f.horizon_hours, f.lead_hours, f.hour_local, f.predicted_demand_mw,
-                   f.is_predicted_high_demand, f.high_demand_threshold_mw, f.forecast_source, f.model_version, f.model_run_id,
+                   f.forecast_source, f.model_version, f.model_run_id,
                    a.timestamp_utc AS latest_actual_timestamp_utc,
                    a.actual_demand_mw AS latest_actual_demand_mw
             FROM main.gold.forecast_latest f

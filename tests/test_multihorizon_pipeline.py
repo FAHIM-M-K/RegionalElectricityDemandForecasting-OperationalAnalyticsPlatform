@@ -10,7 +10,6 @@ from src.gold.forecast_example_features import generate_forecast_examples_df
 from src.mlops.backtest_multihorizon import (
     compute_daily_naive_baseline,
     compute_lead_bucket_metrics,
-    compute_threshold_metrics,
     compute_matched_metrics,
     compute_peak_event_metrics,
     evaluate_promotion_gate,
@@ -124,22 +123,6 @@ def test_lead_bucket_metrics_cover_the_active_h24_curve():
     assert result["lead_1_24"]["daily"]["mae"] == 3.0
 
 
-def test_threshold_metrics_count_false_alarms_and_missed_high_demand():
-    result = compute_threshold_metrics(
-        [74_000.0, 76_000.0, 80_000.0, np.nan],
-        [77_000.0, 74_000.0, 79_000.0, 90_000.0],
-        threshold_mw=75_000.0,
-    )
-    assert result["sample_count"] == 3
-    assert result["actual_high_count"] == 2
-    assert result["predicted_high_count"] == 2
-    assert result["true_positive"] == 1
-    assert result["false_positive"] == 1
-    assert result["false_negative"] == 1
-    assert result["precision"] == 0.5
-    assert result["recall"] == 0.5
-
-
 def test_peak_event_metrics_score_peak_height_and_timing_per_complete_origin():
     origin = pd.Timestamp("2024-01-01", tz="UTC")
     leads = np.arange(1, 25)
@@ -224,12 +207,9 @@ def test_scoring_issues_only_the_h24_product():
     calendar_dates = set(pd.date_range("2024-01-01", periods=40, freq="D").date)
     output = generate_independent_forecasts(history, {24: ConstantModel()},
                                            {24: "run-h24"},
-                                           holiday_dates=set(), calendar_dates=calendar_dates,
-                                           high_demand_threshold_mw=50_000.0)
+                                           holiday_dates=set(), calendar_dates=calendar_dates)
     assert set(output.horizon_hours) == {24}
     assert len(output) == 24
-    assert output.high_demand_threshold_mw.eq(50_000.0).all()
-    assert output.is_predicted_high_demand.all()
     h24_lead1 = output[(output.horizon_hours == 24) & (output.lead_hours == 1)].iloc[0]
     assert h24_lead1.predicted_demand_mw == history.iloc[-24].actual_demand_mw
     invalid_history = history.copy()

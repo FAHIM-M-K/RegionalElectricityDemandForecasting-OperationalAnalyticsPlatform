@@ -44,7 +44,6 @@ from configs.loader import load_platform_config
 
 config = load_platform_config("ercot_config.json")
 BA_CODE = config.get("region", {}).get("code", "ERCO")
-PEAK_THRESHOLD_MW = float(config.get("region", {}).get("default_peak_threshold_mw", 75000.0))
 RESTATEMENT_BUFFER_DAYS = int(config.get("eia", {}).get("restatement_buffer_days", 5))
 
 # COMMAND ----------
@@ -71,7 +70,7 @@ else:
 
 # COMMAND ----------
 # DBTITLE 1,Transformation: Build Gold Fact Dataset
-def build_gold_fact_dataset(df_silver, ba_code=BA_CODE, peak_threshold_mw=PEAK_THRESHOLD_MW):
+def build_gold_fact_dataset(df_silver, ba_code=BA_CODE):
     """
     Transforms silver conformed grid records into the business analytics fact table.
     Enriches with EIA benchmark error metrics, operational peak indicators, and grid emergency flags.
@@ -112,19 +111,7 @@ def build_gold_fact_dataset(df_silver, ba_code=BA_CODE, peak_threshold_mw=PEAK_T
             ).otherwise(F.lit(None).cast(DoubleType()))
         )
         
-        # 3. High Demand Volume & Operational Window Indicators
-        # NOTE: This indicates high system demand volume against a configurable threshold (e.g. 75 GW).
-        # It does NOT represent loss-of-load or reserve margin reliability risk, which depends on available generation.
-        .withColumn(
-            "is_high_demand_threshold_exceeded",
-            F.when(
-                F.col("actual_demand_mw").isNotNull(),
-                F.col("actual_demand_mw") >= F.lit(peak_threshold_mw)
-            ).when(
-                F.col("day_ahead_forecast_mw").isNotNull(),
-                F.col("day_ahead_forecast_mw") >= F.lit(peak_threshold_mw)
-            ).otherwise(F.lit(False))
-        )
+        # 3. Operational time-window indicator
         .withColumn(
             "is_afternoon_ramp_window",
             F.col("hour_local").between(14, 18)

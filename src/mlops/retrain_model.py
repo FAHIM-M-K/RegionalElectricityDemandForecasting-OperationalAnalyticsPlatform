@@ -27,7 +27,7 @@ for _ in range(5):
 from src.mlops.backtest_multihorizon import (
     MAX_PEAK_MAE_REGRESSION, MIN_SELECTION_WINDOWS, MIN_WINDOW_WIN_RATE,
     PROMOTION_POLICY_VERSION, compute_lead_bucket_metrics, compute_matched_metrics, compute_metrics, compute_daily_naive_baseline,
-    compute_peak_event_metrics, compute_threshold_metrics,
+    compute_peak_event_metrics,
     generate_chronological_splits,
 )
 from src.shared.forecast_contract import FEATURE_SCHEMA_VERSION, HORIZONS, features_for_horizon
@@ -65,8 +65,7 @@ def _fit(train: pd.DataFrame, validation: pd.DataFrame, features: list[str]):
     return model
 
 
-def _score(model, frame: pd.DataFrame, horizon: int, include_eia: bool = False,
-           high_demand_threshold_mw: float = 75_000.0) -> Dict[str, Dict[str, float]]:
+def _score(model, frame: pd.DataFrame, horizon: int, include_eia: bool = False) -> Dict[str, Dict[str, float]]:
     # The booster predicts an adjustment to the forecast-origin-available
     # seasonal naive value. Score the reconstructed demand forecast.
     prediction = frame["seasonal_naive_mw"].to_numpy(dtype=float) + model.predict(frame[model.feature_name()])
@@ -86,23 +85,12 @@ def _score(model, frame: pd.DataFrame, horizon: int, include_eia: bool = False,
     lead_buckets = compute_lead_bucket_metrics(
         frame, {"model": prediction, "daily": daily}, peak
     )
-    leads = pd.to_numeric(frame["lead_hours"], errors="coerce").to_numpy(float)
-    bucket_ranges = {"lead_1_24": (1, 24)}
-    threshold_metrics = {}
-    for bucket, (lower, upper) in bucket_ranges.items():
-        in_bucket = np.isfinite(leads) & (leads >= lower) & (leads <= upper)
-        threshold_metrics[bucket] = {
-            name: compute_threshold_metrics(frame["actual_demand_mw"].to_numpy()[in_bucket], values[in_bucket],
-                                            high_demand_threshold_mw)
-            for name, values in {"model": prediction, "daily": daily}.items()
-        }
     peak_event_metrics = compute_peak_event_metrics(
         frame, {"model": prediction, "daily": daily}
     )
     return {"model": model_metrics,
             "daily": daily_metrics,
             "lead_buckets": lead_buckets,
-            "threshold_metrics": threshold_metrics,
             "peak_event_metrics": peak_event_metrics,
             "eia_matched": matched_eia,
             "eia": compute_metrics(frame["actual_demand_mw"], eia, peak) if include_eia else
@@ -115,7 +103,6 @@ def _mean_metric(results: list[Dict[str, Dict[str, float]]], model_name: str, me
 
 
 def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: int = 4,
-                               high_demand_threshold_mw: float = 75_000.0,
                                examples_table: str = WEATHER_ROLLING_EXAMPLES_TABLE) -> dict:
     """Fit and score one direct horizon model without random splitting."""
     features = features_for_horizon(horizon)
@@ -134,14 +121,8 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
             continue
         weather_model = _fit(fit_train, validation, features)
         control_model = _fit(fit_train, validation, control_features)
-        window_result = _score(
-            weather_model, test, horizon, include_eia=True,
-            high_demand_threshold_mw=high_demand_threshold_mw,
-        )
-        control_result = _score(
-            control_model, test, horizon, include_eia=True,
-            high_demand_threshold_mw=high_demand_threshold_mw,
-        )
+        window_result = _score(weather_model, test, horizon, include_eia=True)
+        control_result = _score(control_model, test, horizon, include_eia=True)
         window_result["no_weather_control"] = control_result["model"]
         window_result["test_start_utc"] = split["test_start"].isoformat()
         window_result["test_end_utc"] = split["test_end"].isoformat()
@@ -171,10 +152,8 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
         MODEL_PARAMS, lgb.Dataset(pre_holdout[control_features], label=pre_holdout["residual_target_mw"]),
         num_boost_round=selected_control_model.best_iteration,
     )
-    final_result = _score(booster, final_holdout, horizon, include_eia=True,
-                          high_demand_threshold_mw=high_demand_threshold_mw)
-    control_final = _score(control_booster, final_holdout, horizon, include_eia=True,
-                           high_demand_threshold_mw=high_demand_threshold_mw)
+    final_result = _score(booster, final_holdout, horizon, include_eia=True)
+    control_final = _score(control_booster, final_holdout, horizon, include_eia=True)
     final_result["no_weather_control"] = control_final["model"]
     selection_mae = _mean_metric(selection_results, "model", "mae")
     baseline_name = "daily"
@@ -249,14 +228,6 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
                 for metric in ("peak_magnitude_mae_mw", "peak_timing_mae_hours"):
                     if np.isfinite(peak[metric]):
                         logged_metrics[f"final_holdout_{label}_{metric}"] = peak[metric]
-            for bucket, forecasts in final_result["threshold_metrics"].items():
-                for label, model_key in (("model", "model"), ("baseline", baseline_name)):
-                    alert = forecasts[model_key]
-                    for metric in ("actual_high_count", "predicted_high_count", "true_positive", "false_positive", "false_negative"):
-                        logged_metrics[f"final_holdout_{bucket}_{label}_{metric}"] = alert[metric]
-                    for metric in ("precision", "recall"):
-                        if np.isfinite(alert[metric]):
-                            logged_metrics[f"final_holdout_{bucket}_{label}_{metric}"] = alert[metric]
             for bucket, bucket_results in final_result["lead_buckets"].items():
                 for label, model_key in (("model", "model"), ("baseline", baseline_name)):
                     metric = bucket_results[model_key]
@@ -302,14 +273,6 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
                         if np.isfinite(metric["mae"]):
                             logged_metrics[f"selection_window_{window_index}_{bucket}_{label}_mae"] = metric["mae"]
                         logged_metrics[f"selection_window_{window_index}_{bucket}_{label}_rows"] = metric["sample_count"]
-                for bucket, forecasts in window_result["threshold_metrics"].items():
-                    for label, model_key in (("model", "model"), ("baseline", baseline_name)):
-                        alert = forecasts[model_key]
-                        for metric in ("actual_high_count", "predicted_high_count", "true_positive", "false_positive", "false_negative"):
-                            logged_metrics[f"selection_window_{window_index}_{bucket}_{label}_{metric}"] = alert[metric]
-                        for metric in ("precision", "recall"):
-                            if np.isfinite(alert[metric]):
-                                logged_metrics[f"selection_window_{window_index}_{bucket}_{label}_{metric}"] = alert[metric]
                 matched = window_result["eia_matched"]
                 logged_metrics.update({
                     f"selection_window_{window_index}_eia_matched_rows": matched["sample_count"],
@@ -326,7 +289,6 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
                                "minimum_selection_windows": MIN_SELECTION_WINDOWS,
                                "minimum_window_win_rate": MIN_WINDOW_WIN_RATE,
                                "maximum_peak_mae_regression": MAX_PEAK_MAE_REGRESSION,
-                               "high_demand_threshold_mw": high_demand_threshold_mw,
                                "weather_control_policy": "same_rows_same_folds_no_weather_ablation",
                                "minimum_weather_control_win_rate": MIN_WINDOW_WIN_RATE})
             mlflow.log_dict({"horizon_hours": horizon, "importance_type": "gain",
@@ -351,8 +313,6 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
 
 
 if __name__ == "__main__" and "spark" in globals():
-    from configs.loader import load_platform_config
-
     if "dbutils" in globals():
         try:
             dbutils.widgets.get("examples_table")
@@ -366,7 +326,6 @@ if __name__ == "__main__" and "spark" in globals():
     if not spark.catalog.tableExists(examples_table):
         raise RuntimeError(f"Training examples table does not exist: {examples_table}")
 
-    threshold = float(load_platform_config("ercot_config.json")["region"]["default_peak_threshold_mw"])
     from pyspark.sql import functions as F
 
     results = {}
@@ -394,7 +353,6 @@ if __name__ == "__main__" and "spark" in globals():
         results[horizon] = train_single_horizon_model(
             examples,
             horizon,
-            high_demand_threshold_mw=threshold,
             examples_table=examples_table,
         )
         del examples
@@ -427,15 +385,6 @@ if __name__ == "__main__" and "spark" in globals():
                 f"  Holdout {bucket.replace('_', ' ')}: MAE "
                 f"{model_bucket['mae']:,.1f} vs {baseline_bucket['mae']:,.1f} MW "
                 f"{baseline_label}; rows {model_bucket['sample_count']:,}."
-            )
-        for bucket, alerts in result["final"]["threshold_metrics"].items():
-            model_alert = alerts["model"]
-            print(
-                f"  Holdout {bucket.replace('_', ' ')} at {threshold:,.0f} MW: "
-                f"actual high {model_alert['actual_high_count']:,}, "
-                f"flagged {model_alert['predicted_high_count']:,}, "
-                f"hits {model_alert['true_positive']:,}, misses {model_alert['false_negative']:,}, "
-                f"false alarms {model_alert['false_positive']:,}."
             )
         if result["run_id"]:
             try:

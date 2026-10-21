@@ -2,9 +2,7 @@
   "region": {
     "code": "ERCO",
     "name": "Electric Reliability Council of Texas",
-    "timezone": "America/Chicago",
-    "default_peak_threshold_mw": 75000.0,
-    "peak_alert_description": "User-configured high-demand advisory threshold. It is not a capacity limit or a probability of grid stress."
+    "timezone": "America/Chicago"
   },
   "eia": {
     "base_url": "https://api.eia.gov/v2/",

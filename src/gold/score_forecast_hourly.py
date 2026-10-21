@@ -75,7 +75,6 @@ def _snapshot(frame: pd.DataFrame, origin: pd.Timestamp) -> dict:
 
 def generate_independent_forecasts(df_history: pd.DataFrame, models: dict, model_runs: dict, origin_utc=None,
                                   holiday_dates: set | None = None, calendar_dates: set | None = None,
-                                  high_demand_threshold_mw: float = 75_000.0,
                                   issued_at_utc=None, weather_forecast: pd.DataFrame | None = None,
                                   model_schemas: dict | None = None) -> pd.DataFrame:
     """Return the 24 direct H24 predictions with issue identity and validation."""
@@ -181,8 +180,6 @@ def generate_independent_forecasts(df_history: pd.DataFrame, models: dict, model
                 "issued_at_utc": issued_at, "horizon_hours": horizon, "lead_hours": lead,
                 "timestamp_local": local.tz_localize(None), "date_local": local.date(),
                 "hour_local": feature["hour_local"], "predicted_demand_mw": round(predicted, 1),
-                "is_predicted_high_demand": bool(predicted >= high_demand_threshold_mw),
-                "high_demand_threshold_mw": high_demand_threshold_mw,
                 "freshness_status": freshness_status,
                 "source_data_age_hours": source_age_hours,
                 "feature_set": FEATURE_SET_OPERATIONAL if schema == FEATURE_SCHEMA_VERSION else "operational_no_weather",
@@ -238,10 +235,7 @@ def _production_models():
 
 
 if __name__ == "__main__" and "spark" in globals():
-    from configs.loader import load_platform_config
-
     spark.conf.set("spark.sql.session.timeZone", "UTC")
-    high_demand_threshold_mw = float(load_platform_config("ercot_config.json")["region"]["default_peak_threshold_mw"])
     history = (spark.table(SOURCE_FACT_TABLE)
                .filter((F.col("respondent") == "ERCO") & F.col("actual_demand_mw").isNotNull())
                .orderBy(F.col("timestamp_utc").desc()).limit(600).toPandas())
@@ -301,7 +295,6 @@ if __name__ == "__main__" and "spark" in globals():
                             .orderBy("target_timestamp_utc").toPandas())
     forecast = generate_independent_forecasts(
         history, models, run_ids, holiday_dates=holidays, calendar_dates=calendar_dates,
-        high_demand_threshold_mw=high_demand_threshold_mw,
         issued_at_utc=issue_time, weather_forecast=weather_forecast, model_schemas=model_schemas,
     )
     incoming = spark.createDataFrame(forecast)
