@@ -17,11 +17,26 @@
       "timeout_seconds": 1800
     },
     {
+      "task_key": "backfill_weather_vintages",
+      "description": "Resolves only missing issue-time H24 ECMWF weather origins before training-example materialization; API attempts are hard-capped and checkpointed.",
+      "depends_on": [
+        {
+          "task_key": "build_forecast_examples"
+        }
+      ],
+      "notebook_task": {
+        "notebook_path": "src/mlops/backfill_weather_vintages",
+        "source": "GIT"
+      },
+      "timeout_seconds": 3600,
+      "max_retries": 0
+    },
+    {
       "task_key": "build_weather_training_examples",
       "description": "Joins complete archived ECMWF forecasts to rolling demand examples using only weather available by the simulated hourly issue cutoff.",
       "depends_on": [
         {
-          "task_key": "build_forecast_examples"
+          "task_key": "backfill_weather_vintages"
         }
       ],
       "notebook_task": {
