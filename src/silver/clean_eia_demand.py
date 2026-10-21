@@ -18,6 +18,7 @@
 # COMMAND ----------
 # DBTITLE 1,Imports & Configuration
 import os
+import datetime
 from pyspark.sql import functions as F
 from pyspark.sql.types import DoubleType, StringType, BooleanType
 from delta.tables import DeltaTable
@@ -48,6 +49,7 @@ from configs.loader import load_platform_config
 config = load_platform_config("ercot_config.json")
 REGION_CODE = config.get("region", {}).get("code", "ERCO")
 REGION_TIMEZONE = config.get("region", {}).get("timezone", "America/Chicago")
+RESTATEMENT_BUFFER_DAYS = int(config.get("eia", {}).get("restatement_buffer_days", 5))
 
 # Physical plausible bounds for ERCOT grid (MW)
 MIN_PLAUSIBLE_DEMAND_MW = 10000.0  # Lowest historical base load ~20k MW; <10k is a physical telemetry failure
@@ -57,7 +59,29 @@ MAX_PLAUSIBLE_DEMAND_MW = 110000.0 # All-time record peak is ~85.5k MW; >110k is
 # DBTITLE 1,Read Bronze Source
 assert spark.catalog.tableExists(SOURCE_TABLE), f"Source table {SOURCE_TABLE} does not exist!"
 
+target_exists = spark.catalog.tableExists(TARGET_TABLE)
+target_cols = spark.table(TARGET_TABLE).columns if target_exists else []
+target_has_rows = target_exists and spark.table(TARGET_TABLE).limit(1).count() > 0
+requires_full_rebuild = (
+    not target_has_rows or "day_ahead_error_mw" in target_cols
+)
 df_bronze = spark.table(SOURCE_TABLE).filter(F.col("respondent") == REGION_CODE)
+
+if requires_full_rebuild:
+    print("Full Silver build required for initial creation or legacy schema migration.")
+else:
+    max_period = df_bronze.agg(F.max("period").alias("max_period")).first()["max_period"]
+    if max_period is None:
+        raise RuntimeError(f"No Bronze EIA rows exist for respondent {REGION_CODE}.")
+    cutoff_date = (
+        datetime.datetime.strptime(max_period[:10], "%Y-%m-%d")
+        - datetime.timedelta(days=RESTATEMENT_BUFFER_DAYS)
+    ).strftime("%Y-%m-%d")
+    df_bronze = df_bronze.filter(F.col("period") >= F.lit(f"{cutoff_date}T00"))
+    print(
+        f"Incremental Silver build: processing EIA periods from {cutoff_date} "
+        f"(with a {RESTATEMENT_BUFFER_DAYS}-day restatement lookback)."
+    )
 
 # COMMAND ----------
 # DBTITLE 1,Parse Timestamps & Assert Source Uniqueness
@@ -133,7 +157,7 @@ print(f"Silver EIA Pre-Merge Validation: Total {total_records} hours | Valid: {v
 
 # COMMAND ----------
 # DBTITLE 1,Idempotent Delta Upsert with Null-Safe Comparison
-if not spark.catalog.tableExists(TARGET_TABLE):
+if not target_exists:
     df_screened.write \
         .format("delta") \
         .mode("overwrite") \
@@ -141,12 +165,10 @@ if not spark.catalog.tableExists(TARGET_TABLE):
     print(f"Initialized Silver table {TARGET_TABLE} with {total_records} records.")
 else:
     delta_target = DeltaTable.forName(spark, TARGET_TABLE)
-    target_cols = [c.name for c in delta_target.toDF().schema]
-    
     # Schema Migration Check:
     # If the target table was initialized in an earlier run and still contains 'day_ahead_error_mw',
     # overwrite the schema once to align with the Medallion rule (error metrics moved to Gold).
-    if "day_ahead_error_mw" in target_cols:
+    if requires_full_rebuild:
         print(f"Migrating Silver schema: dropping legacy 'day_ahead_error_mw' from {TARGET_TABLE}...")
         df_screened.write \
             .format("delta") \
@@ -183,15 +205,3 @@ else:
             values=insert_set
         ).execute()
         print(f"Idempotent MERGE successfully executed on {TARGET_TABLE}.")
-
-# COMMAND ----------
-# MAGIC %sql
-# MAGIC SELECT 
-# MAGIC     count(*) as total_hours,
-# MAGIC     sum(case when is_valid_demand then 1 else 0 end) as valid_hours,
-# MAGIC     sum(case when anomaly_flag is not null then 1 else 0 end) as anomaly_hours,
-# MAGIC     min(timestamp_local) as min_local_time,
-# MAGIC     max(timestamp_local) as max_local_time,
-# MAGIC     round(avg(actual_demand_mw), 2) as avg_demand_mw,
-# MAGIC     round(max(actual_demand_mw), 2) as peak_demand_mw
-# MAGIC FROM silver.electricity_demand_hourly;

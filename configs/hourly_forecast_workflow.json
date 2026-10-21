@@ -1,9 +1,9 @@
 {
   "name": "ERCOT_Hourly_Forecast_and_Monitoring",
   "schedule": {
-    "quartz_cron_expression": "0 15 * * * ?",
+    "quartz_cron_expression": "0 15 */3 * * ?",
     "timezone_id": "UTC",
-    "pause_status": "UNPAUSED"
+    "pause_status": "PAUSED"
   },
   "max_concurrent_runs": 1,
   "tasks": [

@@ -3,7 +3,7 @@
   "schedule": {
     "quartz_cron_expression": "0 0 6 1 * ?",
     "timezone_id": "UTC",
-    "pause_status": "UNPAUSED"
+    "pause_status": "PAUSED"
   },
   "max_concurrent_runs": 1,
   "tasks": [

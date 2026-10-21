@@ -14,6 +14,7 @@
     "series_types": ["D", "DF"],
     "frequency": "hourly",
     "page_size": 5000,
+    "restatement_buffer_days": 5,
     "default_start_date": "2021-01-01T00",
     "subregions": [
       {"code": "NCENT", "eia_code": "NCEN", "name": "North Central"},

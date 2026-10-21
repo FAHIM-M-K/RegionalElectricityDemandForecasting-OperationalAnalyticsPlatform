@@ -24,7 +24,6 @@ from delta.tables import DeltaTable
 CATALOG = "main"
 TABLE_NAME = f"{CATALOG}.bronze.eia_hourly_raw"
 FULL_HISTORY_START = "2021-01-01"  # Earliest date for initial full load
-RESTATEMENT_BUFFER_DAYS = 5       # Overlap to catch EIA corrections on recent hours
 
 # Retrieve API Key securely: Secret Scope -> Cluster Env Var
 EIA_API_KEY = None
@@ -62,6 +61,7 @@ from configs.loader import load_platform_config
 
 config = load_platform_config("ercot_config.json")
 eia_cfg = config.get("eia", {})
+RESTATEMENT_BUFFER_DAYS = int(eia_cfg.get("restatement_buffer_days", 5))
 EIA_RESPONDENT = eia_cfg.get("respondent", "ERCO")
 EIA_SERIES_TYPES = eia_cfg.get("series_types", ["D", "DF"])
 EIA_PAGE_SIZE = eia_cfg.get("page_size", 5000)
@@ -72,9 +72,14 @@ EIA_BASE_URL = urllib.parse.urljoin(eia_cfg.get("base_url", "https://api.eia.gov
 now_utc = datetime.datetime.now(datetime.timezone.utc)
 end_date_str = now_utc.strftime("%Y-%m-%d")
 
-if spark.catalog.tableExists(TABLE_NAME) and spark.table(TABLE_NAME).count() > 0:
-    # Table exists with data: incremental from high-water mark minus restatement buffer
-    max_period = spark.sql(f"SELECT max(period) FROM {TABLE_NAME}").first()[0]
+if spark.catalog.tableExists(TABLE_NAME):
+    # One narrow aggregate replaces a full-history count followed by a second max scan.
+    max_period = spark.table(TABLE_NAME).agg(F.max("period").alias("max_period")).first()["max_period"]
+else:
+    max_period = None
+
+if max_period is not None:
+    # Incremental from the source high-water mark minus the configured correction window.
     hwm_dt = datetime.datetime.strptime(max_period[:10], "%Y-%m-%d") - datetime.timedelta(days=RESTATEMENT_BUFFER_DAYS)
     start_date_str = hwm_dt.strftime("%Y-%m-%d")
     print(f"[INCREMENTAL] High-water mark: {max_period}. Fetching from {start_date_str} (with {RESTATEMENT_BUFFER_DAYS}-day restatement buffer).")
