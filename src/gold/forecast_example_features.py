@@ -11,7 +11,7 @@ import pandas as pd
 
 from src.shared.forecast_contract import (
     DEMAND_MAX_VALID_MW, DEMAND_MIN_VALID_MW, EXAMPLE_GRAIN_KEYS,
-    FEATURE_SCHEMA_VERSION, FEATURE_SET_DEMAND_FOUNDATION, HORIZON_H24, LEAD_HOURS,
+    FEATURE_SET_DEMAND_FOUNDATION, HORIZON_H24, LEAD_HOURS,
     features_for_horizon,
 )
 

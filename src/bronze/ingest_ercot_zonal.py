@@ -432,7 +432,7 @@ if records:
             source_deduped.alias("source"),
             merge_condition
         ).whenMatchedUpdateAll(
-            condition=f"NOT (target.value <=> source.value)"
+            condition="NOT (target.value <=> source.value)"
         ).whenNotMatchedInsertAll(
         ).execute()
         print(f"Idempotent MERGE completed on {TABLE_NAME} (null-safe equality enabled).")

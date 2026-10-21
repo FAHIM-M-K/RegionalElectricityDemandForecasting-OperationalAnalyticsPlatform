@@ -387,9 +387,8 @@ if __name__ == "__main__" and "spark" in globals():
                 f"{sorted(missing_columns)}"
             )
         examples_sdf = examples_sdf.select(*projected_columns)
-        selected_row_count = examples_sdf.count()
-        print(f"H{horizon}: collecting {selected_row_count:,} projected rows from {examples_table}.")
         examples = examples_sdf.toPandas()
+        print(f"H{horizon}: collected {len(examples):,} projected rows from {examples_table}.")
         results[horizon] = train_single_horizon_model(
             examples,
             horizon,

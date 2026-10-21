@@ -121,7 +121,6 @@ def validate_and_promote_horizon(horizon: int, candidate_run_id: str | None = No
     if any(value is None or not np.isfinite(value) for value in (score, baseline, peak_score)):
         client.set_tag(candidate_run_id, "pipeline_role", "REJECTED_CANDIDATE")
         raise ValueError(f"H{horizon} candidate has incomplete rolling-selection metrics.")
-    baseline_name = "daily"
     window_count = int(candidate.data.params.get("selection_windows", 0))
     window_metrics = []
     for window_index in range(1, window_count + 1):

@@ -298,7 +298,7 @@ def checkpoint_exclusions(rows_to_write: list[dict]) -> None:
 
 def temperature_map_for_run(run_init: dt.datetime) -> dict | None:
     """Load aligned station-hour data once per vintage and retain nulls for diagnosis."""
-    global pending_rows
+    global pending_rows, pending_exclusions
     if run_init in run_temperature_cache:
         return run_temperature_cache[run_init]
     try:

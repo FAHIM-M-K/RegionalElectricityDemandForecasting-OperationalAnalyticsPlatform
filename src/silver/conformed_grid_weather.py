@@ -70,7 +70,7 @@ if spark.catalog.tableExists(WEATHER_TABLE):
 else:
     # Weather is an enrichment source, not a prerequisite for hourly demand
     # serving. An empty, typed frame keeps the canonical conformed schema stable.
-    from pyspark.sql.types import StructType, StructField, TimestampType, DoubleType
+    from pyspark.sql.types import StructType, StructField, TimestampType
     weather_schema = StructType([
         StructField("timestamp_utc", TimestampType(), True),
         StructField("timestamp_local", TimestampType(), True),

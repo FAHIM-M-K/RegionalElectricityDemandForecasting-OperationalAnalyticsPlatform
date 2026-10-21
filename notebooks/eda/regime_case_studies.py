@@ -85,4 +85,4 @@ pdf_ext = df_ext.toPandas()
 if len(pdf_ext) >= 2:
     slope, _, r, _, _ = stats.linregress(pdf_ext["temp_bin_f"], pdf_ext["median_mw"])
     print(f"Slope >95°F : +{slope:,.1f} MW/°F (R² = {r**2:.2f})")
-    print(f"Interpretation: Linear fit to temperature-bin medians only; descriptive and not evidence of a general causal response.")
+    print("Interpretation: Linear fit to temperature-bin medians only; descriptive and not evidence of a general causal response.")
