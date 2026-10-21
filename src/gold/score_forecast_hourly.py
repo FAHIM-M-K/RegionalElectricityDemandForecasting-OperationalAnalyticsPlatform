@@ -26,6 +26,7 @@ from src.shared.forecast_contract import (
     generate_forecast_issue_id, validate_forecast_issue_frame,
     MAX_STALE_ORIGIN_HOURS, MAX_FAIL_ORIGIN_HOURS,
 )
+from src.shared.delta_merge import merge_source_columns
 
 try:
     import mlflow
@@ -331,11 +332,15 @@ if __name__ == "__main__" and "spark" in globals():
                     f"ALTER TABLE {TARGET_EVALUATION_TABLE} "
                     f"ALTER COLUMN `{column_name}` TYPE {target_type}"
                 )
-        DeltaTable.forName(spark, TARGET_EVALUATION_TABLE).alias("t").merge(
-            incoming.alias("s"),
+        merge_source_columns(
+            DeltaTable.forName(spark, TARGET_EVALUATION_TABLE),
+            incoming,
             "t.respondent=s.respondent AND t.forecast_issue_id=s.forecast_issue_id "
-            "AND t.horizon_hours=s.horizon_hours AND t.target_timestamp_utc=s.target_timestamp_utc"
-        ).whenNotMatchedInsertAll().execute()
+            "AND t.horizon_hours=s.horizon_hours AND t.target_timestamp_utc=s.target_timestamp_utc",
+            target_alias="t",
+            source_alias="s",
+            update_matched=False,
+        )
     else:
         incoming.write.format("delta").mode("overwrite").saveAsTable(TARGET_EVALUATION_TABLE)
     print(f"Issued {len(forecast):,} direct forecast rows from {forecast.forecast_origin_utc.iloc[0]} (Issue: {forecast.forecast_issue_id.iloc[0]}).")

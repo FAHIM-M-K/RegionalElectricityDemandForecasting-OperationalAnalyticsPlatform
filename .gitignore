@@ -51,6 +51,13 @@ README.md
 ERCOTGridBI.pbip
 ERCOTGridBI.Report
 ERCOTGridBI.SemanticModel
+ERCOTDemandDecisionSupport.pbip
+ERCOTDemandDecisionSupport.Report/
 
 # tests
 # notebooks
+
+# Local Power BI redesign (kept outside version control)
+ERCOTLoadIntelligence.pbip
+ERCOTLoadIntelligence.Report/
+

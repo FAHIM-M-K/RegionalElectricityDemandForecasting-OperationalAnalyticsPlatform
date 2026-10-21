@@ -45,6 +45,7 @@ for _ in range(5):
         break
     _repo_root = _parent
 from configs.loader import load_platform_config
+from src.shared.delta_merge import merge_source_columns
 
 config = load_platform_config("ercot_config.json")
 REGION_CODE = config.get("region", {}).get("code", "ERCO")
@@ -194,18 +195,11 @@ else:
             "NOT (target.is_valid_demand <=> source.is_valid_demand)"
         )
         
-        # Explicit column mapping guarantees resilience against schema differences
-        update_cols = [c for c in df_screened.columns if c not in ["respondent", "timestamp_utc"]]
-        update_set = {col: f"source.{col}" for col in update_cols}
-        insert_set = {col: f"source.{col}" for col in df_screened.columns}
-        
-        delta_target.alias("target").merge(
-            df_screened.alias("source"),
-            merge_condition
-        ).whenMatchedUpdate(
-            condition=update_condition,
-            set=update_set
-        ).whenNotMatchedInsert(
-            values=insert_set
-        ).execute()
+        merge_source_columns(
+            delta_target,
+            df_screened,
+            merge_condition,
+            update_condition=update_condition,
+            update_exclude=("respondent", "timestamp_utc"),
+        )
         print(f"Idempotent MERGE successfully executed on {TARGET_TABLE}.")

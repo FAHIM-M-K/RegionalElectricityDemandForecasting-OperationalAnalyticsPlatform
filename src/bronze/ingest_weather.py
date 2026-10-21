@@ -41,6 +41,7 @@ for _ in range(5):
         break
     _repo_root = _parent
 from configs.loader import load_platform_config
+from src.shared.delta_merge import merge_source_columns
 
 config = load_platform_config("ercot_config.json")
 weather_cfg = config.get("weather", {})
@@ -232,11 +233,10 @@ else:
         "NOT (target.direct_normal_irradiance <=> source.direct_normal_irradiance)"
     )
     
-    delta_table.alias("target").merge(
-        source_deduped.alias("source"),
-        merge_condition
-    ).whenMatchedUpdateAll(
-        condition=update_condition
-    ).whenNotMatchedInsertAll(
-    ).execute()
+    merge_source_columns(
+        delta_table,
+        source_deduped,
+        merge_condition,
+        update_condition=update_condition,
+    )
     print(f"Idempotent MERGE completed on {TABLE_NAME} (null-safe equality enabled).")

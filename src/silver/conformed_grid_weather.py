@@ -54,6 +54,7 @@ for _ in range(5):
         break
     _repo_root = _parent
 from configs.loader import load_platform_config
+from src.shared.delta_merge import merge_source_columns
 
 config = load_platform_config("ercot_config.json")
 BA_CODE = config.get("region", {}).get("code", "ERCO")
@@ -258,19 +259,14 @@ def upsert_conformed_table(df_conformed, target_table, spark_session):
             business_cols = [c for c in df_conformed.columns if c not in ["respondent", "timestamp_utc", "_conformed_at_utc"]]
             update_condition = " OR ".join([f"NOT (target.{c} <=> source.{c})" for c in business_cols])
 
-            # When matched and business columns changed, update all columns including the processing timestamp
-            update_set = {col: f"source.{col}" for col in df_conformed.columns if col not in ["respondent", "timestamp_utc"]}
-            insert_set = {col: f"source.{col}" for col in df_conformed.columns}
-
-            delta_target.alias("target").merge(
-                df_conformed.alias("source"),
-                merge_condition
-            ).whenMatchedUpdate(
-                condition=update_condition,
-                set=update_set
-            ).whenNotMatchedInsert(
-                values=insert_set
-            ).execute()
+            # When matched and business columns changed, refresh non-key fields.
+            merge_source_columns(
+                delta_target,
+                df_conformed,
+                merge_condition,
+                update_condition=update_condition,
+                update_exclude=("respondent", "timestamp_utc"),
+            )
             print(f"Idempotent MERGE successfully executed on {target_table}.")
 
 

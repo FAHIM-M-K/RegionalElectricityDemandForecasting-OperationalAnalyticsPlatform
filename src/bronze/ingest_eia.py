@@ -58,6 +58,7 @@ for _ in range(5):
         break
     _repo_root = _parent
 from configs.loader import load_platform_config
+from src.shared.delta_merge import merge_source_columns
 
 config = load_platform_config("ercot_config.json")
 eia_cfg = config.get("eia", {})
@@ -248,13 +249,12 @@ else:
         f"AND target.period >= '{start_param}'"
     )
     # Null-safe inequality: updates only when value actually changed (handles null -> val, val -> null, val -> new_val)
-    delta_table.alias("target").merge(
-        source_deduped.alias("source"),
-        merge_condition
-    ).whenMatchedUpdateAll(
-        condition="NOT (target.value <=> source.value)"
-    ).whenNotMatchedInsertAll(
-    ).execute()
+    merge_source_columns(
+        delta_table,
+        source_deduped,
+        merge_condition,
+        update_condition="NOT (target.value <=> source.value)",
+    )
     print(f"Idempotent MERGE completed on {TABLE_NAME} (null-safe equality enabled).")
 
 # COMMAND ----------
@@ -304,13 +304,15 @@ if not spark.catalog.tableExists(BENCHMARK_TABLE):
     benchmark_rows.write.format("delta").mode("overwrite").saveAsTable(BENCHMARK_TABLE)
 else:
     benchmark_delta = DeltaTable.forName(spark, BENCHMARK_TABLE)
-    benchmark_delta.alias("target").merge(
-        benchmark_rows.alias("source"),
+    merge_source_columns(
+        benchmark_delta,
+        benchmark_rows,
         "target.benchmark_provider = source.benchmark_provider "
         "AND target.respondent = source.respondent "
         "AND target.vintage_id = source.vintage_id "
         "AND target.target_timestamp_utc = source.target_timestamp_utc",
-    ).whenNotMatchedInsertAll().execute()
+        update_matched=False,
+    )
 print(
     f"Captured {len(forecast_payload_for_hash):,} EIA forecast vintage rows "
     f"as observed at {observed_at.isoformat()} in {BENCHMARK_TABLE}."

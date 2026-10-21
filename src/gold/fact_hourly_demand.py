@@ -41,6 +41,7 @@ for _ in range(5):
         break
     _repo_root = _parent
 from configs.loader import load_platform_config
+from src.shared.delta_merge import merge_source_columns
 
 config = load_platform_config("ercot_config.json")
 BA_CODE = config.get("region", {}).get("code", "ERCO")
@@ -194,18 +195,18 @@ def upsert_gold_fact_table(df_fact, target_table, spark_session):
         if cutoff_utc is not None:
             merge_condition += f" AND target.timestamp_utc >= TIMESTAMP '{cutoff_utc.strftime('%Y-%m-%d %H:%M:%S')}'"
         
-        # Track ALL business columns (demand, weather, calendar, error metrics) for restatements (H-11)
-        # Excludes composite primary keys and processing timestamp to prevent unnecessary file churn
+        # Track business columns for restatements; keys are immutable, while
+        # the processed timestamp advances only when business values change.
         business_cols = [c for c in df_fact.columns if c not in ["respondent", "timestamp_utc", "_gold_processed_at_utc"]]
         update_condition = " OR ".join([f"NOT (target.{c} <=> source.{c})" for c in business_cols])
-        
-        delta_target.alias("target").merge(
-            df_fact.alias("source"),
-            merge_condition
-        ).whenMatchedUpdateAll(
-            condition=update_condition
-        ).whenNotMatchedInsertAll(
-        ).execute()
+
+        merge_source_columns(
+            delta_target,
+            df_fact,
+            merge_condition,
+            update_condition=update_condition,
+            update_exclude=("respondent", "timestamp_utc"),
+        )
         print(f"Idempotent MERGE successfully executed on {target_table}.")
 
 # COMMAND ----------

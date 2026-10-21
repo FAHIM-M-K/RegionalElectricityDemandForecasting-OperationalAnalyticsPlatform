@@ -47,6 +47,7 @@ for _ in range(5):
     _repo_root = _parent
 
 from configs.loader import load_platform_config
+from src.shared.delta_merge import merge_source_columns
 
 config = load_platform_config("ercot_config.json")
 weather_cfg = config["weather"]
@@ -216,12 +217,14 @@ if duplicate_count:
 if not spark.catalog.tableExists(TARGET_TABLE):
     incoming.write.format("delta").mode("overwrite").saveAsTable(TARGET_TABLE)
 else:
-    DeltaTable.forName(spark, TARGET_TABLE).alias("target").merge(
-        incoming.alias("source"),
+    merge_source_columns(
+        DeltaTable.forName(spark, TARGET_TABLE),
+        incoming,
         "target.snapshot_batch_id = source.snapshot_batch_id "
         "AND target.station_id = source.station_id "
         "AND target.target_timestamp_utc = source.target_timestamp_utc",
-    ).whenNotMatchedInsertAll().execute()
+        update_matched=False,
+    )
 
 print(
     f"Stored ECMWF IFS forecast snapshot {snapshot_batch_id}: "

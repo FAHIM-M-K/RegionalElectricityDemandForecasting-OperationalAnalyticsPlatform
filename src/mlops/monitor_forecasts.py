@@ -7,6 +7,21 @@ from implying that a forecast was evaluated before the target hour occurred.
 
 from pyspark.sql import functions as F
 from delta.tables import DeltaTable
+import os
+import sys
+
+_repo_root = os.getcwd()
+for _ in range(5):
+    if os.path.isdir(os.path.join(_repo_root, "src")):
+        if _repo_root not in sys.path:
+            sys.path.insert(0, _repo_root)
+        break
+    _parent = os.path.dirname(_repo_root)
+    if _parent == _repo_root:
+        break
+    _repo_root = _parent
+
+from src.shared.delta_merge import merge_source_columns
 
 CATALOG = "main"
 FORECASTS = f"{CATALOG}.gold.forecast_evaluation"
@@ -144,8 +159,11 @@ if __name__ == "__main__" and "spark" in globals():
             "t.lead_hours = s.lead_hours AND "
             "t.target_date_utc = s.target_date_utc"
         )
-        (target.alias("t").merge(daily.alias("s"), match)
-         .whenMatchedUpdateAll()
-         .whenNotMatchedInsertAll()
-         .execute())
+        merge_source_columns(
+            target,
+            daily,
+            match,
+            target_alias="t",
+            source_alias="s",
+        )
         print(f"Updated {METRICS} for the recent matured H24 evaluation window; older results were retained.")

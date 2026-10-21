@@ -70,6 +70,7 @@ for _ in range(5):
     _repo_root = _parent
 
 from configs.loader import load_platform_config
+from src.shared.delta_merge import merge_source_columns
 
 config = load_platform_config("ercot_config.json")
 eia_cfg = config.get("eia", {})
@@ -428,13 +429,12 @@ if records:
             f"AND target.{subba_col} = source.{subba_col} "
             f"AND target.period = source.period"
         )
-        delta_table.alias("target").merge(
-            source_deduped.alias("source"),
-            merge_condition
-        ).whenMatchedUpdateAll(
-            condition="NOT (target.value <=> source.value)"
-        ).whenNotMatchedInsertAll(
-        ).execute()
+        merge_source_columns(
+            delta_table,
+            source_deduped,
+            merge_condition,
+            update_condition="NOT (target.value <=> source.value)",
+        )
         print(f"Idempotent MERGE completed on {TABLE_NAME} (null-safe equality enabled).")
 else:
     # F-02: Fail-closed if no records returned on full load or significant request window

@@ -25,6 +25,7 @@ for _ in range(5):
     _repo_root = _parent
 
 from configs.loader import load_platform_config
+from src.shared.delta_merge import merge_source_columns
 
 config = load_platform_config("ercot_config.json")
 station_weights = {
@@ -129,11 +130,13 @@ if regional.filter(F.col("weighted_temperature_f").isNull()).limit(1).count():
 if not target_exists:
     regional.write.format("delta").mode("overwrite").saveAsTable(TARGET_TABLE)
 else:
-    DeltaTable.forName(spark, TARGET_TABLE).alias("target").merge(
-        regional.alias("source"),
+    merge_source_columns(
+        DeltaTable.forName(spark, TARGET_TABLE),
+        regional,
         "target.snapshot_batch_id = source.snapshot_batch_id "
         "AND target.target_timestamp_utc = source.target_timestamp_utc",
-    ).whenNotMatchedInsertAll().execute()
+        update_matched=False,
+    )
 
 latest_batch_id = regional.select("snapshot_batch_id").first()[0]
 summary = spark.table(TARGET_TABLE).filter(

@@ -44,6 +44,7 @@ for _ in range(5):
     _repo_root = _parent
 
 from configs.loader import load_platform_config
+from src.shared.delta_merge import merge_source_columns
 from src.shared.ercot_zones import source_to_zone_code_map
 
 config = load_platform_config("ercot_config.json")
@@ -239,11 +240,10 @@ else:
         ]
         update_cond = " OR ".join([f"NOT (target.{c} <=> source.{c})" for c in business_cols])
 
-        (
-            delta_tbl.alias("target")
-            .merge(df_features.alias("source"), merge_cond)
-            .whenMatchedUpdateAll(condition=update_cond)
-            .whenNotMatchedInsertAll()
-            .execute()
+        merge_source_columns(
+            delta_tbl,
+            df_features,
+            merge_cond,
+            update_condition=update_cond,
         )
         print(f"Idempotent MERGE completed on {TARGET_TABLE} (all 15 business columns tracked).")

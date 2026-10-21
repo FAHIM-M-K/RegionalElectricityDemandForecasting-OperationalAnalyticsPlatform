@@ -68,6 +68,7 @@ for _ in range(5):
     _root = _parent
 
 from configs.loader import load_platform_config
+from src.shared.delta_merge import merge_source_columns
 from src.shared.forecast_contract import FEATURE_SET_DEMAND_FOUNDATION
 from src.mlops.weather_api_budget import ApiRequestBudget, ApiRequestBudgetExceeded
 
@@ -274,12 +275,13 @@ def checkpoint(rows_to_write: list[dict]) -> None:
     if not spark.catalog.tableExists(TARGET_TABLE):
         incoming_batch.write.format("delta").mode("overwrite").saveAsTable(TARGET_TABLE)
     else:
-        DeltaTable.forName(spark, TARGET_TABLE).alias("target").merge(
-            incoming_batch.alias("source"),
+        merge_source_columns(
+            DeltaTable.forName(spark, TARGET_TABLE),
+            incoming_batch,
             "target.respondent = source.respondent "
             "AND target.forecast_origin_utc = source.forecast_origin_utc "
             "AND target.target_timestamp_utc = source.target_timestamp_utc",
-        ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+        )
 
 
 def checkpoint_exclusions(rows_to_write: list[dict]) -> None:
@@ -290,11 +292,12 @@ def checkpoint_exclusions(rows_to_write: list[dict]) -> None:
     if not spark.catalog.tableExists(EXCLUSIONS_TABLE):
         incoming.write.format("delta").mode("overwrite").saveAsTable(EXCLUSIONS_TABLE)
     else:
-        DeltaTable.forName(spark, EXCLUSIONS_TABLE).alias("target").merge(
-            incoming.alias("source"),
+        merge_source_columns(
+            DeltaTable.forName(spark, EXCLUSIONS_TABLE),
+            incoming,
             "target.respondent = source.respondent "
             "AND target.forecast_origin_utc = source.forecast_origin_utc",
-        ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+        )
 
 
 def temperature_map_for_run(run_init: dt.datetime) -> dict | None:

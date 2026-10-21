@@ -48,6 +48,7 @@ for _ in range(5):
         break
     _repo_root = _parent
 from configs.loader import load_platform_config
+from src.shared.delta_merge import merge_source_columns
 
 config = load_platform_config("ercot_config.json")
 REGION_TIMEZONE = config.get("region", {}).get("timezone", "America/Chicago")
@@ -253,11 +254,10 @@ else:
     ]
     update_condition = " OR ".join([f"NOT (target.{c} <=> source.{c})" for c in weather_business_cols])
     
-    delta_target.alias("target").merge(
-        df_conformed.alias("source"),
-        merge_condition
-    ).whenMatchedUpdateAll(
-        condition=update_condition
-    ).whenNotMatchedInsertAll(
-    ).execute()
+    merge_source_columns(
+        delta_target,
+        df_conformed,
+        merge_condition,
+        update_condition=update_condition,
+    )
     print(f"Idempotent MERGE successfully executed on {TARGET_TABLE} (all business attributes checked).")
