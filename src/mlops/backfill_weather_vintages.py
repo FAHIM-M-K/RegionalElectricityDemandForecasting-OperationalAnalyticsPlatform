@@ -75,7 +75,8 @@ api_request_budget = ApiRequestBudget(MAX_API_REQUEST_ATTEMPTS_PER_EXECUTION)
 
 print(
     "Backfill mode: automatically request only unresolved weather vintages. "
-    "This notebook is manually run and is not part of the scheduled production workflow."
+    "Run after build_forecast_examples and before build_weather_training_examples; "
+    "it can also be run manually to repair the archive."
 )
 
 config = load_platform_config("ercot_config.json")
