@@ -59,19 +59,23 @@ for _ in range(5):
     _repo_root = _parent
 from configs.loader import load_platform_config
 from src.shared.delta_merge import merge_source_columns
+from src.shared.eia_time import operating_day_end_utc
 
 config = load_platform_config("ercot_config.json")
 eia_cfg = config.get("eia", {})
+REGION_TIMEZONE = config.get("region", {}).get("timezone", "America/Chicago")
 RESTATEMENT_BUFFER_DAYS = int(eia_cfg.get("restatement_buffer_days", 5))
 EIA_RESPONDENT = eia_cfg.get("respondent", "ERCO")
 EIA_SERIES_TYPES = eia_cfg.get("series_types", ["D", "DF"])
+EIA_FREQUENCY = eia_cfg.get("frequency", "hourly")
+assert EIA_FREQUENCY == "hourly", "EIA timestamps must use the UTC 'hourly' frequency."
 EIA_PAGE_SIZE = eia_cfg.get("page_size", 5000)
 EIA_BASE_URL = urllib.parse.urljoin(eia_cfg.get("base_url", "https://api.eia.gov/v2/"), eia_cfg.get("route", "electricity/rto/region-data/data/"))
 
 # COMMAND ----------
 # DBTITLE 1,High-Water Mark: Auto-Detect Full Load vs Incremental
 now_utc = datetime.datetime.now(datetime.timezone.utc)
-end_date_str = now_utc.strftime("%Y-%m-%d")
+end_utc = operating_day_end_utc(now_utc, REGION_TIMEZONE)
 
 if spark.catalog.tableExists(TABLE_NAME):
     # One narrow aggregate replaces a full-history count followed by a second max scan.
@@ -90,7 +94,12 @@ else:
     print(f"[FULL LOAD] No existing data found. Loading full history from {start_date_str}.")
 
 start_param = f"{start_date_str}T00"
-end_param = f"{end_date_str}T23"
+end_param = end_utc.strftime("%Y-%m-%dT%H")
+print(
+    f"EIA UTC-frequency request window: {start_param} through {end_param} UTC; "
+    f"end is the next {REGION_TIMEZONE} midnight so the full current operating-day "
+    "forecast is included."
+)
 
 # COMMAND ----------
 # DBTITLE 1,Paginated EIA API Client with Full Envelope Preservation
@@ -109,7 +118,7 @@ def fetch_eia_dataset(api_key: str, start: str, end: str, series_types: list, re
         # Build query params including explicit series facets (e.g. facets[type][]=D & facets[type][]=DF)
         query_params = [
             ("api_key", api_key),
-            ("frequency", "hourly"),
+            ("frequency", EIA_FREQUENCY),
             ("data[0]", "value"),
             ("facets[respondent][]", respondent),
             ("start", start),
@@ -184,7 +193,7 @@ print(f"Total EIA records retrieved: {len(records)} across {len(raw_payloads)} A
 
 if not records:
     raise RuntimeError(
-        f"Bronze Ingestion Failure: 0 EIA records retrieved for window {start_date_str} to {end_date_str}. "
+        f"Bronze Ingestion Failure: 0 EIA records retrieved for UTC window {start_param} to {end_param}. "
         f"Pipeline failed closed to prevent downstream silent stale tables (C-03)."
     )
 
@@ -192,7 +201,7 @@ if not records:
 raw_landing_dir = f"/Volumes/{CATALOG}/bronze/raw_landing/eia"
 os.makedirs(raw_landing_dir, exist_ok=True)
 timestamp_epoch = int(time.time())
-raw_file_name = f"eia_erco_{start_date_str}_{end_date_str}_{timestamp_epoch}.json"
+raw_file_name = f"eia_erco_{start_date_str}_{end_utc.strftime('%Y-%m-%d')}_{timestamp_epoch}.json"
 raw_file_path = f"{raw_landing_dir}/{raw_file_name}"
 
 with open(raw_file_path, "w", encoding="utf-8") as f:

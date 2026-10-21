@@ -6,7 +6,7 @@
 # MAGIC **Output Table:** `main.silver.electricity_demand_hourly`  
 # MAGIC
 # MAGIC ### Core Transformations:
-# MAGIC 1. **Timezone Normalization:** Parse EIA `period` string (`YYYY-MM-DDTHH`) to exact UTC timestamp (`timestamp_utc`) and local Central Time (`timestamp_local`, `America/Chicago`).
+# MAGIC 1. **Timezone Normalization:** Bronze requests EIA's `hourly` (UTC) frequency. Parse `period` as the canonical UTC key, then derive Central Time for reporting; do not reinterpret the source period as local wall time.
 # MAGIC 2. **Pivoting Series:** Restructure long format (`D` = Demand, `DF` = Day-ahead Forecast) into single hourly row: `actual_demand_mw` and `day_ahead_forecast_mw`.
 # MAGIC 3. **Physical Domain Screening:** Flag negative demand and physical operating boundary violations without silently dropping rows (`is_valid_demand`, `anomaly_flag`).
 # MAGIC 4. **Incremental Idempotency:** Null-safe Delta `MERGE` on `(respondent, timestamp_utc)` updating only when values change or restatements arrive.
@@ -91,8 +91,8 @@ else:
 
 # COMMAND ----------
 # DBTITLE 1,Parse Timestamps & Assert Source Uniqueness
-# EIA period is string formatted as "yyyy-MM-ddTHH" (representing UTC hour)
-# Example: "2021-01-01T00" -> 2021-01-01 00:00:00 UTC
+# Bronze requests EIA's `hourly` frequency (UTC), not `local-hourly`.
+# Preserve period as the canonical UTC hour; derive CT only as a display/calendar field.
 df_parsed = df_bronze \
     .withColumn(
         "timestamp_utc",
