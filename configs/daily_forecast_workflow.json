@@ -65,6 +65,16 @@
         "source": "GIT"
       },
       "timeout_seconds": 1800
+    },
+    {
+      "task_key": "evaluate_benchmarks",
+      "description": "Daily issue-time-matched H24 versus EIA evaluation; pending status remains until mature matched targets exist.",
+      "notebook_task": {
+        "notebook_path": "src/gold/benchmark_evaluation_task",
+        "source": "GIT"
+      },
+      "timeout_seconds": 900,
+      "max_retries": 1
     }
   ],
   "format": "MULTI_TASK"

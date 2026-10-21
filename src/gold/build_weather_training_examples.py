@@ -6,6 +6,8 @@ than the simulated issue cutoff are eligible. This produces a separate model
 training source and leaves the demand-only foundation untouched.
 """
 
+import datetime
+
 from pyspark.sql import functions as F
 
 from src.shared.forecast_contract import (
@@ -20,6 +22,7 @@ TARGET_TABLE = f"{CATALOG}.gold.forecast_examples_hourly_weather"
 EXCLUSIONS_TABLE = f"{CATALOG}.silver.weather_backtest_exclusions"
 HORIZON_HOURS = 24
 ARCHIVE_START_UTC = "2025-01-15 00:00:00"
+CORRECTION_LOOKBACK_DAYS = 7
 
 spark.conf.set("spark.sql.session.timeZone", "UTC")
 if not spark.catalog.tableExists(EXAMPLES_TABLE):
@@ -30,14 +33,47 @@ if not spark.catalog.tableExists(WEATHER_TABLE):
         "Run/resume the bounded weather vintage backfill before building weather-trained models."
     )
 
+target_exists = spark.catalog.tableExists(TARGET_TABLE)
+latest_example_origin = (
+    spark.table(EXAMPLES_TABLE)
+    .filter(
+        (F.col("respondent") == "ERCO")
+        & (F.col("horizon_hours") == HORIZON_HOURS)
+        & (F.col("feature_set") == FEATURE_SET_DEMAND_FOUNDATION)
+    )
+    .agg(F.max("forecast_origin_utc").alias("latest_origin"))
+    .first()["latest_origin"]
+)
+if latest_example_origin is None:
+    raise RuntimeError(f"No H24 demand examples exist in {EXAMPLES_TABLE}.")
+correction_start_utc = datetime.datetime.fromisoformat(ARCHIVE_START_UTC)
+if target_exists:
+    last_materialized_origin = (
+        spark.table(TARGET_TABLE)
+        .filter(
+            (F.col("horizon_hours") == HORIZON_HOURS)
+            & (F.col("feature_set") == FEATURE_SET_OPERATIONAL)
+        )
+        .agg(F.max("forecast_origin_utc").alias("latest_origin"))
+        .first()["latest_origin"]
+    )
+    if last_materialized_origin is not None:
+        latest_materialized = min(last_materialized_origin, latest_example_origin)
+        correction_start_utc = max(
+            datetime.datetime.fromisoformat(ARCHIVE_START_UTC),
+            latest_materialized - datetime.timedelta(days=CORRECTION_LOOKBACK_DAYS),
+        )
+correction_start = F.lit(correction_start_utc)
+
 examples = (
     spark.table(EXAMPLES_TABLE)
     .filter((F.col("respondent") == "ERCO") & (F.col("horizon_hours") == HORIZON_HOURS))
     .filter(F.col("feature_set") == FEATURE_SET_DEMAND_FOUNDATION)
-    .filter(F.col("forecast_origin_utc") >= F.lit(ARCHIVE_START_UTC).cast("timestamp"))
+    .filter(F.col("forecast_origin_utc") >= correction_start)
 )
 weather = spark.table(WEATHER_TABLE).filter(
-    F.col("target_timestamp_utc") <= F.col("forecast_origin_utc") + F.expr("INTERVAL 24 HOURS")
+    (F.col("forecast_origin_utc") >= correction_start)
+    & (F.col("target_timestamp_utc") <= F.col("forecast_origin_utc") + F.expr("INTERVAL 24 HOURS"))
 )
 weather_keys = ["respondent", "forecast_origin_utc", "target_timestamp_utc"]
 if weather.groupBy(*weather_keys).count().filter(F.col("count") > 1).limit(1).count():
@@ -85,7 +121,7 @@ if missing_origin_count and not spark.catalog.tableExists(EXCLUSIONS_TABLE):
 if spark.catalog.tableExists(EXCLUSIONS_TABLE):
     excluded = spark.table(EXCLUSIONS_TABLE).select(
         "respondent", "forecast_origin_utc", "exclusion_reason"
-    ).distinct()
+    ).filter(F.col("forecast_origin_utc") >= correction_start).distinct()
     unclassified_missing = missing_origins.join(
         excluded.select("respondent", "forecast_origin_utc"),
         ["respondent", "forecast_origin_utc"], "left_anti"
@@ -145,14 +181,15 @@ if target.groupBy(
 ).count().filter(F.col("count") > 1).limit(1).count():
     raise RuntimeError("Weather training source violates the forecast-example natural key.")
 
-if not target.limit(1).count():
+if not target.limit(1).count() and not target_exists:
     raise RuntimeError(
         "No complete point-in-time weather training examples exist. Resume the archived "
         "weather backfill; no no-weather training fallback is allowed."
     )
-# Replace only the active H24 partition. Retired H168 training rows are
-# historical data and must not disappear as a side effect of this refactor.
-if spark.catalog.tableExists(TARGET_TABLE):
+# Replace only the recent correction window in the active H24 partition.
+# Retired H168 and older H24 rows remain intact; a stale watermark naturally
+# widens this range after a missed monthly run.
+if target_exists:
     existing_columns = set(spark.table(TARGET_TABLE).columns)
     if existing_columns != set(target.columns):
         raise RuntimeError(
@@ -160,18 +197,9 @@ if spark.catalog.tableExists(TARGET_TABLE):
             "Handle any schema migration explicitly so historical partitions are preserved."
         )
     target.write.format("delta").mode("overwrite").option(
-        "replaceWhere", f"horizon_hours = {HORIZON_HOURS}"
+        "replaceWhere",
+        f"horizon_hours = {HORIZON_HOURS} AND forecast_origin_utc >= TIMESTAMP '{correction_start_utc:%Y-%m-%d %H:%M:%S}'",
     ).saveAsTable(TARGET_TABLE)
 else:
     target.write.format("delta").mode("overwrite").partitionBy("horizon_hours").saveAsTable(TARGET_TABLE)
-
-summary = spark.table(TARGET_TABLE).groupBy("horizon_hours").agg(
-    F.count("*").alias("rows"), F.countDistinct("forecast_origin_utc").alias("complete_origins"),
-    F.min("forecast_origin_utc").alias("first_origin"), F.max("forecast_origin_utc").alias("last_origin"),
-).orderBy("horizon_hours")
-for row in summary.collect():
-    print(
-        f"H{row['horizon_hours']} point-in-time weather training source: "
-        f"{row['rows']:,} rows across {row['complete_origins']:,} complete origins, "
-        f"{row['first_origin']} through {row['last_origin']} UTC."
-    )
+print(f"Updated recent H24 point-in-time weather examples in {TARGET_TABLE}; correction start: {correction_start_utc} UTC.")

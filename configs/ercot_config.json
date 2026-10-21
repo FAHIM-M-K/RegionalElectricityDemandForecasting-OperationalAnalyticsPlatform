@@ -29,6 +29,7 @@
   },
   "weather": {
     "aggregation_note": "Configured representative-site weights are a descriptive heuristic, not measured ERCOT load shares or population weights.",
+    "restatement_buffer_days": 3,
     "archive_base_url": "https://archive-api.open-meteo.com/v1/archive",
     "forecast_base_url": "https://api.open-meteo.com/v1/ecmwf",
     "hourly_variables": [

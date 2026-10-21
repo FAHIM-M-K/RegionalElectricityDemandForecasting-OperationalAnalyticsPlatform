@@ -21,6 +21,7 @@
 # COMMAND ----------
 # DBTITLE 1,Imports & Configuration
 import os
+import datetime
 from pyspark.sql import functions as F
 from pyspark.sql.types import DoubleType
 from delta.tables import DeltaTable
@@ -51,6 +52,7 @@ from configs.loader import load_platform_config
 config = load_platform_config("ercot_config.json")
 REGION_TIMEZONE = config.get("region", {}).get("timezone", "America/Chicago")
 weather_stations = config.get("weather", {}).get("stations", [])
+RESTATEMENT_BUFFER_DAYS = int(config.get("weather", {}).get("restatement_buffer_days", 3))
 
 station_weights = {s["station_id"]: float(s["weight"]) for s in weather_stations}
 assert abs(sum(station_weights.values()) - 1.0) < 1e-9, f"Station weights must sum to 1.0, got {sum(station_weights.values())}"
@@ -61,6 +63,27 @@ print(f"Loaded station load weights: {station_weights}")
 assert spark.catalog.tableExists(SOURCE_TABLE), f"Source table {SOURCE_TABLE} does not exist!"
 
 df_bronze_weather = spark.table(SOURCE_TABLE)
+target_exists = spark.catalog.tableExists(TARGET_TABLE)
+target_max_timestamp = None
+if target_exists:
+    target_max_timestamp = (
+        spark.table(TARGET_TABLE)
+        .agg(F.max("timestamp_utc").alias("max_timestamp_utc"))
+        .first()["max_timestamp_utc"]
+    )
+
+requires_full_rebuild = not target_exists or target_max_timestamp is None
+cutoff_utc = None
+if requires_full_rebuild:
+    print("Full weather Silver build required for initial creation or empty target.")
+else:
+    cutoff_utc = target_max_timestamp - datetime.timedelta(days=RESTATEMENT_BUFFER_DAYS)
+    cutoff_text = cutoff_utc.strftime("%Y-%m-%dT%H:%M")
+    df_bronze_weather = df_bronze_weather.filter(F.col("time_utc") >= F.lit(cutoff_text))
+    print(
+        f"Incremental weather Silver build from {cutoff_text} UTC "
+        f"({RESTATEMENT_BUFFER_DAYS}-day correction lookback)."
+    )
 
 # Open-Meteo time_utc format is "yyyy-MM-dd'T'HH:mm" (e.g., "2021-01-01T00:00")
 df_time_std = df_bronze_weather \
@@ -177,21 +200,23 @@ df_conformed = df_conformed.drop("temp_weight_sum")
 
 # COMMAND ----------
 # DBTITLE 1,Pre-Merge Integrity Assertions
-null_time_count = df_conformed.filter(F.col("timestamp_utc").isNull()).count()
-assert null_time_count == 0, f"Integrity Failure: Found {null_time_count} rows with null timestamp_utc."
+quality = df_conformed.agg(
+    F.count(F.lit(1)).alias("total_hours"),
+    F.sum(F.when(F.col("timestamp_utc").isNull(), 1).otherwise(0)).alias("null_times"),
+    F.sum(F.when(F.col("reporting_stations_count") == 0, 1).otherwise(0)).alias("zero_station_hours"),
+    F.sum(F.when(F.col("is_complete_weather_reading") == False, 1).otherwise(0)).alias("incomplete_station_hours"),
+).first()
+total_hours = quality["total_hours"] or 0
+assert not quality["null_times"], f"Integrity Failure: Found {quality['null_times']} rows with null timestamp_utc."
+assert not quality["zero_station_hours"], f"Completeness Failure: Found {quality['zero_station_hours']} hours with 0 reporting stations."
 
-dupe_time_count = df_conformed.count() - df_conformed.dropDuplicates(["timestamp_utc"]).count()
-assert dupe_time_count == 0, f"Integrity Failure: Found {dupe_time_count} duplicate hourly timestamps."
+dupe_time_count = df_conformed.groupBy("timestamp_utc").count().filter(F.col("count") > 1).limit(1).count()
+assert dupe_time_count == 0, "Integrity Failure: Found duplicate hourly timestamps."
 
-# Verify zero unrepresented hours (at least 1 station must report)
-zero_station_hours = df_conformed.filter(F.col("reporting_stations_count") == 0).count()
-assert zero_station_hours == 0, f"Completeness Failure: Found {zero_station_hours} hours with 0 reporting stations."
-
-incomplete_station_hours = df_conformed.filter(F.col("is_complete_weather_reading") == False).count()
+incomplete_station_hours = quality["incomplete_station_hours"] or 0
 if incomplete_station_hours > 0:
     print(f"Notice: {incomplete_station_hours:,} hours have partial station coverage (< {len(station_weights)} stations). Dynamic weight normalization preserved valid thermal scaling.")
 
-total_hours = df_conformed.count()
 print(f"Silver Weather Pre-Merge Validation: Total {total_hours:,} hourly regional indices verified.")
 
 # COMMAND ----------
@@ -204,6 +229,8 @@ if not spark.catalog.tableExists(TARGET_TABLE):
     print(f"Initialized Silver table {TARGET_TABLE} with {total_hours:,} records.")
 else:
     merge_condition = "target.timestamp_utc = source.timestamp_utc"
+    if cutoff_utc is not None:
+        merge_condition += f" AND target.timestamp_utc >= TIMESTAMP '{cutoff_utc.strftime('%Y-%m-%d %H:%M:%S')}'"
 
     # Add the newly introduced quality flag to existing Silver tables before
     # referencing it in MERGE. Databricks does not resolve source-only columns
@@ -234,16 +261,3 @@ else:
     ).whenNotMatchedInsertAll(
     ).execute()
     print(f"Idempotent MERGE successfully executed on {TARGET_TABLE} (all business attributes checked).")
-
-# COMMAND ----------
-# MAGIC %sql
-# MAGIC SELECT 
-# MAGIC     count(*) as total_hours,
-# MAGIC     min(timestamp_local) as min_local_time,
-# MAGIC     max(timestamp_local) as max_local_time,
-# MAGIC     round(avg(weighted_temperature_f), 2) as avg_regional_temp_f,
-# MAGIC     round(min(weighted_temperature_f), 2) as min_regional_temp_f,
-# MAGIC     round(max(weighted_temperature_f), 2) as max_regional_temp_f,
-# MAGIC     round(sum(cdh_65), 1) as total_cdh,
-# MAGIC     round(sum(hdh_65), 1) as total_hdh
-# MAGIC FROM silver.weather_hourly_conformed;

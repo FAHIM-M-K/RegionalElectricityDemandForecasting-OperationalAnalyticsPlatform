@@ -109,7 +109,7 @@
     {
       "task_key": "score_forecast_hourly",
       "description": "Issues one rolling H24 forecast curve from the latest valid demand origin; atomically publishes the 24 active leads and appends issue history.",
-      "run_if": "AT_LEAST_ONE_SUCCESS",
+      "run_if": "ALL_SUCCESS",
       "depends_on": [
         {
           "task_key": "build_demand_fact"
@@ -141,21 +141,6 @@
         "source": "GIT"
       },
       "timeout_seconds": 600,
-      "max_retries": 1
-    },
-    {
-      "task_key": "evaluate_benchmarks",
-      "description": "Materializes issue-time-matched H24 versus EIA metrics. Reports remain pending until matched forecast targets mature; no external ERCOT issue-vintage feed is configured.",
-      "depends_on": [
-        {
-          "task_key": "monitor_forecasts"
-        }
-      ],
-      "notebook_task": {
-        "notebook_path": "src/gold/benchmark_evaluation_task",
-        "source": "GIT"
-      },
-      "timeout_seconds": 900,
       "max_retries": 1
     }
   ],

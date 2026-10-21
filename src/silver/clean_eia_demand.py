@@ -61,22 +61,27 @@ assert spark.catalog.tableExists(SOURCE_TABLE), f"Source table {SOURCE_TABLE} do
 
 target_exists = spark.catalog.tableExists(TARGET_TABLE)
 target_cols = spark.table(TARGET_TABLE).columns if target_exists else []
-target_has_rows = target_exists and spark.table(TARGET_TABLE).limit(1).count() > 0
+last_actual_timestamp = None
+if target_exists and "day_ahead_error_mw" not in target_cols:
+    last_actual_timestamp = (
+        spark.table(TARGET_TABLE)
+        .filter(F.col("actual_demand_mw").isNotNull())
+        .agg(F.max("timestamp_utc").alias("last_actual_timestamp"))
+        .first()["last_actual_timestamp"]
+    )
 requires_full_rebuild = (
-    not target_has_rows or "day_ahead_error_mw" in target_cols
+    not target_exists or "day_ahead_error_mw" in target_cols or last_actual_timestamp is None
 )
 df_bronze = spark.table(SOURCE_TABLE).filter(F.col("respondent") == REGION_CODE)
 
 if requires_full_rebuild:
     print("Full Silver build required for initial creation or legacy schema migration.")
 else:
-    max_period = df_bronze.agg(F.max("period").alias("max_period")).first()["max_period"]
-    if max_period is None:
-        raise RuntimeError(f"No Bronze EIA rows exist for respondent {REGION_CODE}.")
     cutoff_date = (
-        datetime.datetime.strptime(max_period[:10], "%Y-%m-%d")
+        last_actual_timestamp.date()
         - datetime.timedelta(days=RESTATEMENT_BUFFER_DAYS)
     ).strftime("%Y-%m-%d")
+    merge_cutoff_utc = f"{cutoff_date} 00:00:00"
     df_bronze = df_bronze.filter(F.col("period") >= F.lit(f"{cutoff_date}T00"))
     print(
         f"Incremental Silver build: processing EIA periods from {cutoff_date} "
@@ -99,8 +104,8 @@ df_parsed = df_bronze \
     .withColumn("value_num", F.col("value").cast(DoubleType()))
 
 # Assert source natural key uniqueness prior to pivoting (prevents silent multi-row collisions)
-pre_pivot_dupes = df_parsed.count() - df_parsed.dropDuplicates(["respondent", "period", "type"]).count()
-assert pre_pivot_dupes == 0, f"Source Integrity Failure: Found {pre_pivot_dupes} duplicate (respondent, period, type) records in Bronze."
+pre_pivot_dupe = df_parsed.groupBy("respondent", "period", "type").count().filter("count > 1").limit(1).count()
+assert pre_pivot_dupe == 0, "Source Integrity Failure: duplicate (respondent, period, type) rows in Bronze."
 
 # COMMAND ----------
 # DBTITLE 1,Pivot Series: Align Actuals (D) and Day-Ahead Forecast (DF)
@@ -140,20 +145,18 @@ df_screened = df_pivoted \
 # COMMAND ----------
 # DBTITLE 1,Quality & Structural Pre-Merge Assertions
 # 1. Zero null keys
-null_keys_count = df_screened.filter(
-    F.col("respondent").isNull() | F.col("timestamp_utc").isNull()
-).count()
-assert null_keys_count == 0, f"Integrity Failure: Found {null_keys_count} rows with null composite keys."
+quality = df_screened.agg(
+    F.count(F.lit(1)).alias("rows"),
+    F.sum(F.when(F.col("respondent").isNull() | F.col("timestamp_utc").isNull(), 1).otherwise(0)).alias("null_keys"),
+    F.sum(F.when(F.col("is_valid_demand") == True, 1).otherwise(0)).alias("valid_rows"),
+    F.sum(F.when(F.col("anomaly_flag").isNotNull(), 1).otherwise(0)).alias("anomaly_rows"),
+).first()
+assert not quality["null_keys"], f"Integrity Failure: {quality['null_keys']} null composite keys."
+duplicate_key = df_screened.groupBy("respondent", "timestamp_utc").count().filter("count > 1").limit(1).count()
+assert duplicate_key == 0, "Integrity Failure: duplicate natural keys in Silver transformation."
+total_records = quality["rows"] or 0
 
-# 2. Strict deduplication check on target natural key
-dupe_keys_count = df_screened.count() - df_screened.dropDuplicates(["respondent", "timestamp_utc"]).count()
-assert dupe_keys_count == 0, f"Integrity Failure: Found {dupe_keys_count} duplicate keys in silver transformation."
-
-total_records = df_screened.count()
-valid_count = df_screened.filter(F.col("is_valid_demand") == True).count()
-anomalies_count = df_screened.filter(F.col("anomaly_flag").isNotNull()).count()
-
-print(f"Silver EIA Pre-Merge Validation: Total {total_records} hours | Valid: {valid_count} | Flagged Anomalies: {anomalies_count}")
+print(f"Silver EIA pre-merge checks passed for {total_records:,} impacted rows; valid={quality['valid_rows'] or 0:,}, flagged={quality['anomaly_rows'] or 0:,}.")
 
 # COMMAND ----------
 # DBTITLE 1,Idempotent Delta Upsert with Null-Safe Comparison
@@ -179,7 +182,8 @@ else:
     else:
         merge_condition = (
             "target.respondent = source.respondent "
-            "AND target.timestamp_utc = source.timestamp_utc"
+            "AND target.timestamp_utc = source.timestamp_utc "
+            f"AND target.timestamp_utc >= TIMESTAMP '{merge_cutoff_utc}'"
         )
         
         # Update only if measurements or anomaly flags actually changed

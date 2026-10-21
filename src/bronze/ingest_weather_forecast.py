@@ -29,8 +29,8 @@ from pyspark.sql import functions as F
 CATALOG = "main"
 TARGET_TABLE = f"{CATALOG}.bronze.weather_forecast_snapshots"
 RAW_DIR = f"/Volumes/{CATALOG}/bronze/raw_landing/weather_forecasts"
-SNAPSHOT_HOURS = 168
-FORECAST_DAYS = 8
+SNAPSHOT_HOURS = 24
+FORECAST_DAYS = 2  # Request enough provider coverage to retain the next 24 complete target hours.
 MAX_ATTEMPTS = 2  # Retry a transient transport/server failure once; never retry 429.
 
 spark.conf.set("spark.sql.session.timeZone", "UTC")
@@ -118,7 +118,7 @@ params = {
 }
 location_payloads, raw_payload, requested_at, available_at = request_weather_forecast(params)
 
-# Keep exactly the next 168 complete target hours after this snapshot became
+# Keep exactly the next 24 complete target hours after this snapshot became
 # available. This preserves the forecast vintage and excludes already-started hours.
 first_target = available_at.replace(minute=0, second=0, microsecond=0) + dt.timedelta(hours=1)
 last_target = available_at + dt.timedelta(hours=SNAPSHOT_HOURS)

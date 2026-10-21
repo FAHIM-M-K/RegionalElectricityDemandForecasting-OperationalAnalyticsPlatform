@@ -244,7 +244,8 @@ else:
     merge_condition = (
         "target.respondent = source.respondent "
         "AND target.period = source.period "
-        "AND target.type = source.type"
+        "AND target.type = source.type "
+        f"AND target.period >= '{start_param}'"
     )
     # Null-safe inequality: updates only when value actually changed (handles null -> val, val -> null, val -> new_val)
     delta_table.alias("target").merge(

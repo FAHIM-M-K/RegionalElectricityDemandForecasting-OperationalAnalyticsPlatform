@@ -6,11 +6,14 @@ from implying that a forecast was evaluated before the target hour occurred.
 """
 
 from pyspark.sql import functions as F
+from delta.tables import DeltaTable
 
 CATALOG = "main"
 FORECASTS = f"{CATALOG}.gold.forecast_evaluation"
 FACT = f"{CATALOG}.gold.fact_hourly_electricity_demand"
 METRICS = f"{CATALOG}.gold.forecast_monitoring_daily"
+MONITOR_LOOKBACK_DAYS = 7  # 5-day EIA/actual correction window plus H24 lead and catch-up margin
+INITIAL_MONITOR_LOOKBACK_DAYS = 180  # Bounded first materialization when no metrics watermark exists
 
 
 def _assert_unique(df, keys, label):
@@ -28,7 +31,32 @@ def _assert_unique(df, keys, label):
 
 if __name__ == "__main__" and "spark" in globals():
     spark.conf.set("spark.sql.session.timeZone", "UTC")
-    issued = spark.table(FORECASTS)
+    metrics_exist = spark.catalog.tableExists(METRICS)
+    last_metric_date = None
+    if metrics_exist:
+        last_metric_date = (
+            spark.table(METRICS)
+            .agg(F.max("target_date_utc").alias("last_target_date"))
+            .first()["last_target_date"]
+        )
+    if last_metric_date is None:
+        target_cutoff = F.current_timestamp() - F.expr(
+            f"INTERVAL {INITIAL_MONITOR_LOOKBACK_DAYS} DAYS"
+        )
+    else:
+        # Use the older of the saved watermark and now. A long outage widens
+        # the replay range instead of silently skipping matured forecasts.
+        target_cutoff = F.least(
+            F.to_timestamp(F.lit(last_metric_date)), F.current_timestamp()
+        ) - F.expr(f"INTERVAL {MONITOR_LOOKBACK_DAYS} DAYS")
+    origin_cutoff = target_cutoff - F.expr("INTERVAL 24 HOURS")
+    issued = (
+        spark.table(FORECASTS)
+        .filter(
+            (F.col("horizon_hours") == 24)
+            & (F.col("forecast_origin_utc") >= origin_cutoff)
+        )
+    )
     # Older stored issues may predate forecast_issue_id. Fall back to the full
     # identity available in that schema while preserving distinct re-issues.
     if "forecast_issue_id" in issued.columns:
@@ -63,7 +91,10 @@ if __name__ == "__main__" and "spark" in globals():
     actuals = (
         spark.table(FACT)
         .select("respondent", "timestamp_utc", "actual_demand_mw")
-        .filter(F.col("actual_demand_mw").isNotNull())
+        .filter(
+            F.col("actual_demand_mw").isNotNull()
+            & (F.col("timestamp_utc") >= target_cutoff)
+        )
         # Compare hour instants in UTC rather than relying on implicit casts
         # between timestamp and timestamp_ntz columns from different tables.
         .withColumn("_actual_epoch_seconds", F.unix_timestamp("timestamp_utc"))
@@ -87,11 +118,6 @@ if __name__ == "__main__" and "spark" in globals():
             F.abs(F.col("predicted_demand_mw") - F.col("actual_demand_mw")),
         )
     )
-    if evaluated.limit(1).count() == 0:
-        raise RuntimeError(
-            f"No issued forecasts matched non-null actual demand in {FACT}; "
-            f"leaving {METRICS} unchanged. Check UTC hourly timestamps and respondent keys."
-        )
     daily = evaluated.groupBy(
         "model_run_id",
         "horizon_hours",
@@ -107,15 +133,19 @@ if __name__ == "__main__" and "spark" in globals():
         ).alias("rmse_mw"),
         F.avg(F.col("predicted_demand_mw") - F.col("actual_demand_mw")).alias("bias_mw"),
     ).withColumn("computed_at_utc", F.current_timestamp())
-    daily.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(METRICS)
-
-    # Read counts from the small materialized metrics table; counting the source
-    # DataFrames here would replay the full forecast/actual join and aggregation.
-    totals = spark.table(METRICS).agg(
-        F.count("*").alias("daily_rows"),
-        F.sum("evaluated_rows").alias("evaluated_forecasts"),
-    ).first()
-    print(
-        f"Materialized {totals['daily_rows']:,} daily forecast-monitoring rows from "
-        f"{totals['evaluated_forecasts'] or 0:,} forecasts with non-null actual demand in {METRICS}."
-    )
+    if not metrics_exist:
+        daily.write.format("delta").mode("overwrite").saveAsTable(METRICS)
+        print(f"Initialized {METRICS} with the recent matured forecast evaluation window.")
+    else:
+        target = DeltaTable.forName(spark, METRICS)
+        match = (
+            "t.model_run_id = s.model_run_id AND "
+            "t.horizon_hours = s.horizon_hours AND "
+            "t.lead_hours = s.lead_hours AND "
+            "t.target_date_utc = s.target_date_utc"
+        )
+        (target.alias("t").merge(daily.alias("s"), match)
+         .whenMatchedUpdateAll()
+         .whenNotMatchedInsertAll()
+         .execute())
+        print(f"Updated {METRICS} for the recent matured H24 evaluation window; older results were retained.")

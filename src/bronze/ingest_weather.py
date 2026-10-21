@@ -22,7 +22,6 @@ from delta.tables import DeltaTable
 CATALOG = "main"
 TABLE_NAME = f"{CATALOG}.bronze.weather_hourly_raw"
 FULL_HISTORY_START = "2021-01-01"  # Earliest date for initial full load
-RESTATEMENT_BUFFER_DAYS = 3       # Overlap to catch weather observation corrections
 ARCHIVE_DELAY_DAYS = 5            # Open-Meteo ERA5 archive is published with a five-day delay
 
 spark.sql(f"USE CATALOG {CATALOG}")
@@ -45,6 +44,7 @@ from configs.loader import load_platform_config
 
 config = load_platform_config("ercot_config.json")
 weather_cfg = config.get("weather", {})
+RESTATEMENT_BUFFER_DAYS = int(weather_cfg.get("restatement_buffer_days", 3))
 weather_stations = weather_cfg.get("stations", [])
 weather_vars = weather_cfg.get("hourly_variables", [])
 ARCHIVE_BASE_URL = weather_cfg.get("archive_base_url", "https://archive-api.open-meteo.com/v1/archive")
@@ -86,9 +86,13 @@ def fetch_weather_chunk(url: str, params: dict, station_id: str) -> dict:
 now_utc = datetime.datetime.now(datetime.timezone.utc)
 end_date_str = (now_utc.date() - datetime.timedelta(days=ARCHIVE_DELAY_DAYS)).strftime("%Y-%m-%d")
 
-if spark.catalog.tableExists(TABLE_NAME) and spark.table(TABLE_NAME).count() > 0:
-    # Table exists with data: incremental from high-water mark minus buffer
-    max_time = spark.sql(f"SELECT max(time_utc) FROM {TABLE_NAME}").first()[0]
+if spark.catalog.tableExists(TABLE_NAME):
+    # One aggregate determines both whether data exists and its high-water mark.
+    max_time = spark.table(TABLE_NAME).agg(F.max("time_utc").alias("max_time")).first()["max_time"]
+else:
+    max_time = None
+
+if max_time is not None:
     hwm_dt = datetime.datetime.strptime(max_time[:10], "%Y-%m-%d") - datetime.timedelta(days=RESTATEMENT_BUFFER_DAYS)
     start_date_str = hwm_dt.strftime("%Y-%m-%d")
     if start_date_str > end_date_str:
@@ -213,7 +217,8 @@ else:
     delta_table = DeltaTable.forName(spark, TABLE_NAME)
     merge_condition = (
         "target.station_id = source.station_id "
-        "AND target.time_utc = source.time_utc"
+        "AND target.time_utc = source.time_utc "
+        f"AND target.time_utc >= '{start_date_str}T00:00'"
     )
     
     # Null-safe inequality: NOT (target <=> source) correctly detects null -> val, val -> null, val -> new_val
@@ -235,9 +240,3 @@ else:
     ).whenNotMatchedInsertAll(
     ).execute()
     print(f"Idempotent MERGE completed on {TABLE_NAME} (null-safe equality enabled).")
-
-# COMMAND ----------
-# MAGIC %sql
-# MAGIC SELECT station_id, count(*) as count, min(time_utc) as min_time, max(time_utc) as max_time
-# MAGIC FROM bronze.weather_hourly_raw
-# MAGIC GROUP BY station_id;

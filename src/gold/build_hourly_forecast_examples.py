@@ -19,6 +19,7 @@ RESPONDENT = "ERCO"
 CHUNK_DAYS = 30
 HISTORY_HOURS = 336
 MAX_HORIZON_HOURS = 24
+CORRECTION_LOOKBACK_DAYS = 7  # EIA restatements plus 24h labels and margin
 
 spark.conf.set("spark.sql.session.timeZone", "UTC")
 _root = os.getcwd()
@@ -64,10 +65,37 @@ if first_origin > last_origin:
     )
 
 source_columns = sorted(required_columns)
-chunk_start = first_origin
 total_written = 0
 chunk_number = 0
 table_exists = spark.catalog.tableExists(TARGET_TABLE)
+last_materialized_origin = None
+if table_exists:
+    last_materialized_origin = (
+        spark.table(TARGET_TABLE)
+        .filter(
+            (F.col("respondent") == RESPONDENT)
+            & (F.col("horizon_hours") == HORIZON_H24)
+            & (F.col("feature_set") == FEATURE_SET_DEMAND_FOUNDATION)
+        )
+        .agg(F.max("forecast_origin_utc").alias("last_origin"))
+        .first()["last_origin"]
+    )
+
+chunk_start = first_origin
+if last_materialized_origin is not None:
+    stored_origin = _as_utc(last_materialized_origin)
+    rebuild_anchor = min(stored_origin, last_origin)
+    chunk_start = max(
+        first_origin,
+        rebuild_anchor - pd.Timedelta(days=CORRECTION_LOOKBACK_DAYS),
+    )
+    print(
+        f"Incremental example rebuild from {chunk_start} through {last_origin}; "
+        f"the {CORRECTION_LOOKBACK_DAYS}-day overlap refreshes recent corrections and a missed run catches up from its stored watermark."
+    )
+else:
+    print(f"Initial example build from {first_origin} through {last_origin}.")
+rebuild_start = chunk_start
 
 while chunk_start <= last_origin:
     chunk_number += 1
@@ -119,18 +147,7 @@ while chunk_start <= last_origin:
 
 if not table_exists:
     raise RuntimeError("No rolling examples were generated; inspect history continuity and data quality.")
-
-summary = spark.table(TARGET_TABLE).agg(
-    F.count("*").alias("rows"),
-    F.countDistinct("forecast_origin_utc").alias("origins"),
-    F.min("forecast_origin_utc").alias("first_origin"),
-    F.max("forecast_origin_utc").alias("last_origin"),
-    F.sum(F.col("is_valid_training_example").cast("int")).alias("valid_rows"),
-).first()
 print(
-    f"Rolling hourly examples are ready in {TARGET_TABLE}: "
-    f"{summary['rows']:,} rows, {summary['origins']:,} hourly origins, "
-    f"{summary['valid_rows']:,} valid training rows, "
-    f"{summary['first_origin']} through {summary['last_origin']}. "
-    f"Rows rewritten in this run: {total_written:,}."
+    f"Rolling hourly examples updated in {TARGET_TABLE}: {total_written:,} rows rewritten "
+    f"across {chunk_number:,} chunks from {rebuild_start} through {last_origin}."
 )

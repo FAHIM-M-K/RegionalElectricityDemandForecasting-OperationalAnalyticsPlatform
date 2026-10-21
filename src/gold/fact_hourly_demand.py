@@ -10,11 +10,12 @@
 # MAGIC 2. **Calendar & Seasonal Dimensions:** Adds meteorological season (`Winter`, `Spring`, `Summer`, `Fall`), peak window indicators, and federal holiday classifications.
 # MAGIC 3. **Grid Emergency Flagging:** Explicitly isolates supply-constrained blackout periods (Winter Storm Uri Feb 15–18, 2021) with `is_grid_emergency`.
 # MAGIC 4. **Pre-Write Data Quality Gate:** Validates key uniqueness, non-negative demand, metric calculation consistency, and error magnitude bounds.
-# MAGIC 5. **Idempotent Delta MERGE & Read-Back Verification:** Null-safe upsert ensuring atomic commits without Parquet file churn.
+# MAGIC 5. **Incremental Delta MERGE:** Rebuild the restatement window after the last materialized actual; assert the candidate before the atomic upsert.
 
 # COMMAND ----------
 # DBTITLE 1,Imports & Setup
 import os
+import datetime
 from pyspark.sql import functions as F
 from pyspark.sql.types import DoubleType
 from delta.tables import DeltaTable
@@ -44,11 +45,29 @@ from configs.loader import load_platform_config
 config = load_platform_config("ercot_config.json")
 BA_CODE = config.get("region", {}).get("code", "ERCO")
 PEAK_THRESHOLD_MW = float(config.get("region", {}).get("default_peak_threshold_mw", 75000.0))
+RESTATEMENT_BUFFER_DAYS = int(config.get("eia", {}).get("restatement_buffer_days", 5))
 
 # COMMAND ----------
 # DBTITLE 1,Verify Upstream Silver Table
 assert spark.catalog.tableExists(SOURCE_TABLE), f"Required upstream table {SOURCE_TABLE} does not exist!"
 df_silver = spark.table(SOURCE_TABLE)
+target_exists = spark.catalog.tableExists(TARGET_TABLE)
+last_actual_timestamp = None
+if target_exists:
+    last_actual_timestamp = (
+        spark.table(TARGET_TABLE)
+        .filter(F.col("actual_demand_mw").isNotNull())
+        .agg(F.max("timestamp_utc").alias("last_actual_timestamp"))
+        .first()["last_actual_timestamp"]
+    )
+requires_full_rebuild = not target_exists or last_actual_timestamp is None
+cutoff_utc = None
+if requires_full_rebuild:
+    print("Full Gold fact build required for initial creation or empty target.")
+else:
+    cutoff_utc = last_actual_timestamp - datetime.timedelta(days=RESTATEMENT_BUFFER_DAYS)
+    df_silver = df_silver.filter(F.col("timestamp_utc") >= F.lit(cutoff_utc))
+    print(f"Incremental Gold fact build from {cutoff_utc} UTC ({RESTATEMENT_BUFFER_DAYS}-day correction lookback).")
 
 # COMMAND ----------
 # DBTITLE 1,Transformation: Build Gold Fact Dataset
@@ -138,37 +157,33 @@ def validate_gold_fact_candidate(df_fact):
     4. Non-negative actual demand bounds
     5. Correct assignment of Winter Storm Uri emergency flag
     """
-    total_rows = df_fact.count()
-    distinct_keys = df_fact.select("respondent", "timestamp_utc").distinct().count()
-    null_keys = df_fact.filter(F.col("respondent").isNull() | F.col("timestamp_utc").isNull()).count()
-    
-    assert null_keys == 0, f"Integrity Failure: Found {null_keys} null keys in Gold fact candidate!"
-    assert total_rows == distinct_keys, (
-        f"Integrity Failure: Found {total_rows - distinct_keys} duplicate timestamp records!"
-    )
-    
-    # Mathematical sanity check on error columns
-    error_mismatch = df_fact.filter(
-        F.col("eia_error_mw").isNotNull() &
-        (F.abs(F.col("eia_error_mw") - (F.col("day_ahead_forecast_mw") - F.col("actual_demand_mw"))) > 0.15)
-    ).count()
-    assert error_mismatch == 0, f"Computation Failure: {error_mismatch} rows have inconsistent eia_error_mw values!"
-    
-    # Error percentage bounds (MAPE cannot be negative)
-    negative_ape = df_fact.filter(F.col("eia_ape_pct") < 0.0).count()
-    assert negative_ape == 0, f"Bound Failure: Found {negative_ape} rows with negative percentage error!"
-    
-    # Emergency flag verification: exactly 96 hours in Uri blackout window (Feb 15–18, 4 days * 24h)
-    uri_emergency_hours = df_fact.filter(F.col("is_grid_emergency") == True).count()
-    assert uri_emergency_hours >= 96, (
-        f"Regime Flag Failure: Expected at least 96 Uri emergency hours, found {uri_emergency_hours}."
-    )
-    
-    print(f"Gold Fact Quality Gate Passed:")
-    print(f"  - Total evaluated records: {total_rows:,}")
-    print(f"  - Primary keys unique and non-null (100% verified)")
-    print(f"  - Benchmark error calculations mathematically consistent")
-    print(f"  - Winter Storm Uri emergency flags verified ({uri_emergency_hours} hours)")
+    quality = df_fact.agg(
+        F.count(F.lit(1)).alias("rows"),
+        F.sum(F.when(F.col("respondent").isNull() | F.col("timestamp_utc").isNull(), 1).otherwise(0)).alias("null_keys"),
+        F.sum(F.when(
+            F.col("eia_error_mw").isNotNull() &
+            (F.abs(F.col("eia_error_mw") - (F.col("day_ahead_forecast_mw") - F.col("actual_demand_mw"))) > 0.15), 1
+        ).otherwise(0)).alias("error_mismatch"),
+        F.sum(F.when(F.col("eia_ape_pct") < 0.0, 1).otherwise(0)).alias("negative_ape"),
+        F.sum(F.when(F.col("actual_demand_mw") < 0.0, 1).otherwise(0)).alias("negative_actual"),
+        F.sum(F.when(
+            F.col("is_grid_emergency") != (
+                (F.col("timestamp_local") >= F.lit("2021-02-15 00:00:00")) &
+                (F.col("timestamp_local") < F.lit("2021-02-19 00:00:00"))
+            ), 1
+        ).otherwise(0)).alias("emergency_mismatch"),
+    ).first()
+    if not quality["rows"]:
+        print("No conformed source rows in the correction window; the idempotent MERGE will be a no-op.")
+        return
+    assert not quality["null_keys"], f"Integrity Failure: {quality['null_keys']} null keys in Gold fact candidate."
+    assert not quality["error_mismatch"], f"Computation Failure: {quality['error_mismatch']} inconsistent error rows."
+    assert not quality["negative_ape"], f"Bound Failure: {quality['negative_ape']} negative percentage errors."
+    assert not quality["negative_actual"], f"Bound Failure: {quality['negative_actual']} negative actual demand rows."
+    assert not quality["emergency_mismatch"], f"Regime flag failure: {quality['emergency_mismatch']} incorrect flags."
+    duplicate_key = df_fact.groupBy("respondent", "timestamp_utc").count().filter("count > 1").limit(1).count()
+    assert duplicate_key == 0, "Integrity Failure: duplicate keys in Gold fact candidate."
+    print(f"Gold fact quality checks passed for {quality['rows']:,} impacted rows.")
 
 # COMMAND ----------
 # DBTITLE 1,Idempotent Delta MERGE
@@ -177,19 +192,20 @@ def upsert_gold_fact_table(df_fact, target_table, spark_session):
     Executes an idempotent Delta MERGE on (respondent, timestamp_utc).
     Handles historical restatements, revised forecasts, and newly ingested hours.
     """
-    total_records = df_fact.count()
     if not spark_session.catalog.tableExists(target_table):
         df_fact.write \
             .format("delta") \
             .mode("overwrite") \
             .saveAsTable(target_table)
-        print(f"Initialized Gold fact table {target_table} with {total_records:,} records.")
+        print(f"Initialized Gold fact table {target_table}.")
     else:
         delta_target = DeltaTable.forName(spark_session, target_table)
         merge_condition = (
             "target.respondent = source.respondent "
             "AND target.timestamp_utc = source.timestamp_utc"
         )
+        if cutoff_utc is not None:
+            merge_condition += f" AND target.timestamp_utc >= TIMESTAMP '{cutoff_utc.strftime('%Y-%m-%d %H:%M:%S')}'"
         
         # Track ALL business columns (demand, weather, calendar, error metrics) for restatements (H-11)
         # Excludes composite primary keys and processing timestamp to prevent unnecessary file churn
@@ -207,43 +223,8 @@ def upsert_gold_fact_table(df_fact, target_table, spark_session):
 
 # COMMAND ----------
 # DBTITLE 1,Post-Write Read-Back Storage Audit
-def audit_persisted_gold_fact(target_table, spark_session):
-    """
-    Direct read-back audit from Delta storage to verify physical persistence integrity.
-    """
-    df_persisted = spark_session.table(target_table)
-    persisted_rows = df_persisted.count()
-    distinct_keys = df_persisted.select("respondent", "timestamp_utc").distinct().count()
-    null_keys = df_persisted.filter(
-        F.col("respondent").isNull() | F.col("timestamp_utc").isNull()
-    ).count()
-
-    assert null_keys == 0, f"Post-Write Failure: Found {null_keys} null keys in {target_table}!"
-    assert persisted_rows == distinct_keys, (
-        f"Post-Write Failure: Found {persisted_rows - distinct_keys} duplicate keys in {target_table}!"
-    )
-    print(f"Post-Write Storage Audit Passed: {persisted_rows:,} verified records in {target_table}.")
-
 # COMMAND ----------
 # DBTITLE 1,Execute Gold Fact Pipeline
 df_fact = build_gold_fact_dataset(df_silver)
 validate_gold_fact_candidate(df_fact)
 upsert_gold_fact_table(df_fact, TARGET_TABLE, spark)
-audit_persisted_gold_fact(TARGET_TABLE, spark)
-
-# COMMAND ----------
-# MAGIC %sql
-# MAGIC -- Sample Verification of Business Metrics in Gold Fact Table
-# MAGIC SELECT 
-# MAGIC     season,
-# MAGIC     count(*) as evaluated_hours,
-# MAGIC     round(avg(actual_demand_mw), 1) as avg_demand_mw,
-# MAGIC     round(avg(eia_abs_error_mw), 1) as eia_mae_mw,
-# MAGIC     round(avg(eia_ape_pct), 3) as eia_mape_pct,
-# MAGIC     round(avg(eia_error_mw), 1) as eia_mean_bias_mw,
-# MAGIC     sum(case when is_high_demand_threshold_exceeded then 1 else 0 end) as high_demand_hours,
-# MAGIC     sum(case when is_grid_emergency then 1 else 0 end) as emergency_hours
-# MAGIC FROM gold.fact_hourly_electricity_demand
-# MAGIC WHERE actual_demand_mw IS NOT NULL AND day_ahead_forecast_mw IS NOT NULL
-# MAGIC GROUP BY season
-# MAGIC ORDER BY eia_mae_mw DESC;

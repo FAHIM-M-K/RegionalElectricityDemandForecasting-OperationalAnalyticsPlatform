@@ -38,6 +38,23 @@ if not spark.catalog.tableExists(SOURCE_TABLE):
     raise RuntimeError(f"Weather forecast snapshot table does not exist: {SOURCE_TABLE}")
 
 raw = spark.table(SOURCE_TABLE)
+target_exists = spark.catalog.tableExists(TARGET_TABLE)
+if target_exists:
+    # Each production run adds an immutable issue batch. Restrict conformation
+    # and all downstream assertions to the newest batch window; reread the
+    # latest timestamp so same-second batches are safely included and MERGE
+    # remains idempotent on task retries.
+    latest_materialized_at = (
+        spark.table(TARGET_TABLE)
+        .agg(F.max("snapshot_available_at_utc").alias("latest_available_at"))
+        .first()["latest_available_at"]
+    )
+    if latest_materialized_at is not None:
+        raw = raw.filter(F.col("snapshot_available_at_utc") >= F.lit(latest_materialized_at))
+if not raw.limit(1).count():
+    print(f"No new weather forecast snapshot to conform into {TARGET_TABLE}; no-op.")
+    dbutils.notebook.exit("No new weather forecast snapshot; no-op.")
+
 key_columns = ["snapshot_batch_id", "station_id", "target_timestamp_utc"]
 if raw.groupBy(*key_columns).count().filter(F.col("count") > 1).limit(1).count():
     raise RuntimeError("Bronze weather forecast snapshots contain duplicate station/target keys.")
@@ -109,7 +126,7 @@ if regional.groupBy("snapshot_batch_id", "target_timestamp_utc").count().filter(
 if regional.filter(F.col("weighted_temperature_f").isNull()).limit(1).count():
     raise RuntimeError("A regional forecast row has no usable temperature values.")
 
-if not spark.catalog.tableExists(TARGET_TABLE):
+if not target_exists:
     regional.write.format("delta").mode("overwrite").saveAsTable(TARGET_TABLE)
 else:
     DeltaTable.forName(spark, TARGET_TABLE).alias("target").merge(
