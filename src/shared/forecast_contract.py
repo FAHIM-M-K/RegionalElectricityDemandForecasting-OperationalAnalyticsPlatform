@@ -1,17 +1,11 @@
-"""Shared contract for direct ERCOT demand forecasts.
-
-Each row represents one prediction for one target timestamp, issued at one
-forecast origin.  H24 is day ahead and H168 is week ahead.  Training and
-scoring import this module so their feature definitions cannot drift apart.
-"""
+"""Shared contract for the active rolling ERCOT H24 forecast product."""
 
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 HORIZON_H24 = 24
-HORIZON_H168 = 168
-HORIZONS: List[int] = [HORIZON_H24, HORIZON_H168]
-LEAD_HOURS = {HORIZON_H24: range(1, 25), HORIZON_H168: range(1, 169)}
+HORIZONS: List[int] = [HORIZON_H24]
+LEAD_HOURS = {HORIZON_H24: range(1, HORIZON_H24 + 1)}
 
 FEATURE_SET_OPERATIONAL = "operational_point_in_time_weather"
 FEATURE_SET_DEMAND_FOUNDATION = "rolling_demand_foundation"
@@ -65,19 +59,9 @@ OPERATIONAL_FEATURES_H24_BASE = [
     "demand_lag_24h_origin", "demand_lag_48h_origin", "demand_lag_168h_origin",
     "demand_rolling_avg_24h_origin", "demand_rolling_std_24h_origin",
 ]
-OPERATIONAL_FEATURES_H168_BASE = [
-    "lead_hours", "seasonal_naive_mw", "hour_local", "day_of_week_local", "is_weekend", "is_holiday",
-    "sin_hour", "cos_hour", "sin_dow", "cos_dow", "demand_origin",
-    "demand_lag_24h_origin", "demand_lag_168h_origin", "demand_lag_336h_origin",
-    "demand_rolling_avg_24h_origin", "demand_rolling_avg_168h_origin",
-]
-
-
 def features_for_horizon(horizon: int, include_weather: bool = True) -> List[str]:
     if horizon == HORIZON_H24:
         base = OPERATIONAL_FEATURES_H24_BASE
-    elif horizon == HORIZON_H168:
-        base = OPERATIONAL_FEATURES_H168_BASE
     else:
         raise ValueError(f"Unsupported horizon: {horizon}")
     return list(base) + (list(WEATHER_FORECAST_FEATURES) if include_weather else [])
@@ -119,6 +103,12 @@ def validate_forecast_issue_frame(df, expected_horizons: List[int] | None = None
         raise ValueError(f"Forecast issue is missing required columns: {sorted(missing_columns)}")
     if df[list(required)].isna().any().any():
         raise ValueError("Forecast issue contains null identity, time, horizon, lead, or prediction values.")
+    unsupported_horizons = set(df["horizon_hours"].unique()) - set(expected_horizons)
+    if unsupported_horizons:
+        raise ValueError(
+            f"Unsupported forecast horizons: {sorted(unsupported_horizons)}; "
+            f"active horizons are {sorted(expected_horizons)}."
+        )
     for horizon in expected_horizons:
         subset = df[df["horizon_hours"] == horizon]
         if subset.empty:

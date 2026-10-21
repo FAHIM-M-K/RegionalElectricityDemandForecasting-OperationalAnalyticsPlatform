@@ -2,7 +2,7 @@
 # COMMAND ----------
 # MAGIC %pip install lightgbm==4.7.0
 # COMMAND ----------
-"""Train direct, point-in-time LightGBM models for H24 and H168.
+"""Train the direct, point-in-time rolling H24 LightGBM model.
 
 Model selection uses rolling chronological windows.  The final 30 days are
 logged as an audit holdout and are never used to choose a candidate or promote
@@ -26,7 +26,7 @@ for _ in range(5):
 
 from src.mlops.backtest_multihorizon import (
     MAX_PEAK_MAE_REGRESSION, MIN_SELECTION_WINDOWS, MIN_WINDOW_WIN_RATE,
-    PROMOTION_POLICY_VERSION, compute_lead_bucket_metrics, compute_matched_metrics, compute_metrics, compute_naive_baselines,
+    PROMOTION_POLICY_VERSION, compute_lead_bucket_metrics, compute_matched_metrics, compute_metrics, compute_daily_naive_baseline,
     compute_peak_event_metrics, compute_threshold_metrics,
     generate_chronological_splits,
 )
@@ -36,7 +36,6 @@ from src.mlops.training_data_contract import (
     DEFAULT_EXAMPLES_TABLE,
     WEATHER_ROLLING_EXAMPLES_TABLE,
     clean_training_examples,
-    training_origin_stride_hours,
     validate_examples_table,
 )
 
@@ -72,12 +71,11 @@ def _score(model, frame: pd.DataFrame, horizon: int, include_eia: bool = False,
     # seasonal naive value. Score the reconstructed demand forecast.
     prediction = frame["seasonal_naive_mw"].to_numpy(dtype=float) + model.predict(frame[model.feature_name()])
     peak = frame["hour_local"].between(14, 18).to_numpy()
-    daily, weekly = compute_naive_baselines(frame)
+    daily = compute_daily_naive_baseline(frame)
     eia = frame["eia_day_ahead_forecast_mw"] if "eia_day_ahead_forecast_mw" in frame else pd.Series(np.nan, index=frame.index)
     model_metrics = compute_metrics(frame["actual_demand_mw"], prediction, peak)
     daily_metrics = compute_metrics(frame["actual_demand_mw"], daily, peak)
-    weekly_metrics = compute_metrics(frame["actual_demand_mw"], weekly, peak)
-    selection_baseline = daily_metrics if horizon == 24 else weekly_metrics
+    selection_baseline = daily_metrics
     if model_metrics["sample_count"] != selection_baseline["sample_count"]:
         raise ValueError(f"H{horizon} model and seasonal baseline were scored on different row counts.")
     matched_eia = compute_matched_metrics(
@@ -86,26 +84,23 @@ def _score(model, frame: pd.DataFrame, horizon: int, include_eia: bool = False,
         peak_mask=peak,
     ) if include_eia else {"sample_count": 0, "coverage_pct": 0.0, "metrics": {}}
     lead_buckets = compute_lead_bucket_metrics(
-        frame, {"model": prediction, "daily": daily, "weekly": weekly}, peak
+        frame, {"model": prediction, "daily": daily}, peak
     )
     leads = pd.to_numeric(frame["lead_hours"], errors="coerce").to_numpy(float)
-    bucket_ranges = {"lead_1_24": (1, 24)} if horizon == 24 else {
-        "lead_1_24": (1, 24), "lead_25_48": (25, 48), "lead_49_168": (49, 168)
-    }
+    bucket_ranges = {"lead_1_24": (1, 24)}
     threshold_metrics = {}
     for bucket, (lower, upper) in bucket_ranges.items():
         in_bucket = np.isfinite(leads) & (leads >= lower) & (leads <= upper)
         threshold_metrics[bucket] = {
             name: compute_threshold_metrics(frame["actual_demand_mw"].to_numpy()[in_bucket], values[in_bucket],
                                             high_demand_threshold_mw)
-            for name, values in {"model": prediction, "daily": daily, "weekly": weekly}.items()
+            for name, values in {"model": prediction, "daily": daily}.items()
         }
     peak_event_metrics = compute_peak_event_metrics(
-        frame, {"model": prediction, "daily": daily, "weekly": weekly}
+        frame, {"model": prediction, "daily": daily}
     )
     return {"model": model_metrics,
             "daily": daily_metrics,
-            "weekly": weekly_metrics,
             "lead_buckets": lead_buckets,
             "threshold_metrics": threshold_metrics,
             "peak_event_metrics": peak_event_metrics,
@@ -121,8 +116,7 @@ def _mean_metric(results: list[Dict[str, Dict[str, float]]], model_name: str, me
 
 def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: int = 4,
                                high_demand_threshold_mw: float = 75_000.0,
-                               examples_table: str = WEATHER_ROLLING_EXAMPLES_TABLE,
-                               origin_stride_hours: int = 1) -> dict:
+                               examples_table: str = WEATHER_ROLLING_EXAMPLES_TABLE) -> dict:
     """Fit and score one direct horizon model without random splitting."""
     features = features_for_horizon(horizon)
     control_features = features_for_horizon(horizon, include_weather=False)
@@ -141,11 +135,11 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
         weather_model = _fit(fit_train, validation, features)
         control_model = _fit(fit_train, validation, control_features)
         window_result = _score(
-            weather_model, test, horizon, include_eia=(horizon == 24),
+            weather_model, test, horizon, include_eia=True,
             high_demand_threshold_mw=high_demand_threshold_mw,
         )
         control_result = _score(
-            control_model, test, horizon, include_eia=(horizon == 24),
+            control_model, test, horizon, include_eia=True,
             high_demand_threshold_mw=high_demand_threshold_mw,
         )
         window_result["no_weather_control"] = control_result["model"]
@@ -177,13 +171,13 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
         MODEL_PARAMS, lgb.Dataset(pre_holdout[control_features], label=pre_holdout["residual_target_mw"]),
         num_boost_round=selected_control_model.best_iteration,
     )
-    final_result = _score(booster, final_holdout, horizon, include_eia=(horizon == 24),
+    final_result = _score(booster, final_holdout, horizon, include_eia=True,
                           high_demand_threshold_mw=high_demand_threshold_mw)
-    control_final = _score(control_booster, final_holdout, horizon, include_eia=(horizon == 24),
+    control_final = _score(control_booster, final_holdout, horizon, include_eia=True,
                            high_demand_threshold_mw=high_demand_threshold_mw)
     final_result["no_weather_control"] = control_final["model"]
     selection_mae = _mean_metric(selection_results, "model", "mae")
-    baseline_name = "daily" if horizon == 24 else "weekly"
+    baseline_name = "daily"
     selection_baseline = _mean_metric(selection_results, baseline_name, "mae")
     selection_peak_baseline = _mean_metric(selection_results, baseline_name, "peak_mae")
     selection_window_wins = sum(
@@ -233,7 +227,6 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
             result["run_id"] = run.info.run_id
             mlflow.log_params({**MODEL_PARAMS, "horizon_hours": horizon, "feature_schema_version": FEATURE_SCHEMA_VERSION,
                                "training_examples_table": examples_table,
-                               "training_origin_stride_hours": origin_stride_hours,
                                "feature_count": len(features), "selection_windows": len(selection_results),
                                "training_rows": len(pre_holdout), "training_origin_start": str(pre_holdout.forecast_origin_utc.min()),
                                "training_origin_end": str(pre_holdout.forecast_origin_utc.max()),
@@ -248,9 +241,8 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
                               "final_holdout_peak_mae": final_result["model"]["peak_mae"],
                               "final_holdout_no_weather_control_mae": final_result["no_weather_control"]["mae"],
                               "final_holdout_no_weather_control_peak_mae": final_result["no_weather_control"]["peak_mae"],
-                              "final_holdout_daily_naive_mae": final_result["daily"]["mae"],
-                              "final_holdout_weekly_naive_mae": final_result["weekly"]["mae"]}
-            baseline_name = "daily" if horizon == 24 else "weekly"
+                              "final_holdout_daily_naive_mae": final_result["daily"]["mae"]}
+            baseline_name = "daily"
             for label, model_key in (("model", "model"), ("baseline", baseline_name)):
                 peak = final_result["peak_event_metrics"][model_key]
                 logged_metrics[f"final_holdout_{label}_complete_peak_origins"] = peak["complete_origins"]
@@ -271,18 +263,17 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
                     if np.isfinite(metric["mae"]):
                         logged_metrics[f"final_holdout_{bucket}_{label}_mae"] = metric["mae"]
                     logged_metrics[f"final_holdout_{bucket}_{label}_rows"] = metric["sample_count"]
-            if horizon == 24:
-                matched = final_result["eia_matched"]
+            matched = final_result["eia_matched"]
+            logged_metrics.update({
+                "final_holdout_eia_matched_rows": matched["sample_count"],
+                "final_holdout_eia_coverage_pct": matched["coverage_pct"],
+            })
+            if matched["sample_count"]:
                 logged_metrics.update({
-                    "final_holdout_eia_matched_rows": matched["sample_count"],
-                    "final_holdout_eia_coverage_pct": matched["coverage_pct"],
+                    "final_holdout_model_mae_on_eia_hours": matched["metrics"]["model"]["mae"],
+                    "final_holdout_daily_naive_mae_on_eia_hours": matched["metrics"]["daily_naive"]["mae"],
+                    "final_holdout_eia_mae_on_matched_hours": matched["metrics"]["eia"]["mae"],
                 })
-                if matched["sample_count"]:
-                    logged_metrics.update({
-                        "final_holdout_model_mae_on_eia_hours": matched["metrics"]["model"]["mae"],
-                        "final_holdout_daily_naive_mae_on_eia_hours": matched["metrics"]["daily_naive"]["mae"],
-                        "final_holdout_eia_mae_on_matched_hours": matched["metrics"]["eia"]["mae"],
-                    })
             logged_metrics["selection_baseline_peak_mae"] = _mean_metric(
                 selection_results, baseline_name, "peak_mae"
             )
@@ -319,18 +310,17 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
                         for metric in ("precision", "recall"):
                             if np.isfinite(alert[metric]):
                                 logged_metrics[f"selection_window_{window_index}_{bucket}_{label}_{metric}"] = alert[metric]
-                if horizon == 24:
-                    matched = window_result["eia_matched"]
+                matched = window_result["eia_matched"]
+                logged_metrics.update({
+                    f"selection_window_{window_index}_eia_matched_rows": matched["sample_count"],
+                    f"selection_window_{window_index}_eia_coverage_pct": matched["coverage_pct"],
+                })
+                if matched["sample_count"]:
                     logged_metrics.update({
-                        f"selection_window_{window_index}_eia_matched_rows": matched["sample_count"],
-                        f"selection_window_{window_index}_eia_coverage_pct": matched["coverage_pct"],
+                        f"selection_window_{window_index}_model_mae_on_eia_hours": matched["metrics"]["model"]["mae"],
+                        f"selection_window_{window_index}_daily_naive_mae_on_eia_hours": matched["metrics"]["daily_naive"]["mae"],
+                        f"selection_window_{window_index}_eia_mae_on_matched_hours": matched["metrics"]["eia"]["mae"],
                     })
-                    if matched["sample_count"]:
-                        logged_metrics.update({
-                            f"selection_window_{window_index}_model_mae_on_eia_hours": matched["metrics"]["model"]["mae"],
-                            f"selection_window_{window_index}_daily_naive_mae_on_eia_hours": matched["metrics"]["daily_naive"]["mae"],
-                            f"selection_window_{window_index}_eia_mae_on_matched_hours": matched["metrics"]["eia"]["mae"],
-                        })
             mlflow.log_metrics(logged_metrics)
             mlflow.log_params({"promotion_policy_version": PROMOTION_POLICY_VERSION,
                                "minimum_selection_windows": MIN_SELECTION_WINDOWS,
@@ -346,7 +336,6 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
             mlflow.set_tags({"pipeline_role": "CHAMPION_CANDIDATE", "target_horizon": f"H{horizon}",
                              "model_type": "seasonal_naive_residual_lightgbm", "weather_assumption": "point_in_time_ecmwf_forecast",
                              "training_origin_cadence": "hourly" if examples_table != DEFAULT_EXAMPLES_TABLE else "daily",
-                             "training_origin_stride_hours": str(origin_stride_hours),
                              "feature_schema_version": FEATURE_SCHEMA_VERSION,
                              "promotion_policy_version": PROMOTION_POLICY_VERSION})
             # Keep the model's input contract in MLflow so registry consumers
@@ -372,22 +361,6 @@ if __name__ == "__main__" and "spark" in globals():
         examples_table = WEATHER_ROLLING_EXAMPLES_TABLE
     examples_table = validate_examples_table(examples_table)
 
-    if "dbutils" in globals():
-        try:
-            dbutils.widgets.get("training_horizons")
-        except Exception:
-            dbutils.widgets.text("training_horizons", "24,168", "Horizons to train")
-        requested_horizons = dbutils.widgets.get("training_horizons")
-    else:
-        requested_horizons = "24,168"
-    try:
-        training_horizons = [int(value.strip()) for value in requested_horizons.split(",") if value.strip()]
-    except ValueError as exc:
-        raise ValueError("training_horizons must be a comma-separated list such as '24,168'.") from exc
-    if not training_horizons or len(set(training_horizons)) != len(training_horizons) or any(
-        horizon not in HORIZONS for horizon in training_horizons
-    ):
-        raise ValueError(f"training_horizons must contain unique values from {HORIZONS}.")
     if not spark.catalog.tableExists(examples_table):
         raise RuntimeError(f"Training examples table does not exist: {examples_table}")
 
@@ -396,24 +369,15 @@ if __name__ == "__main__" and "spark" in globals():
 
     results = {}
     spark.conf.set("spark.sql.session.timeZone", "UTC")
-    for horizon in training_horizons:
-        # Load one horizon at a time to cap driver memory, especially for the
-        # much larger hourly-origin example table.
-        origin_stride = training_origin_stride_hours(horizon, examples_table)
+    for horizon in HORIZONS:
         examples_sdf = spark.table(examples_table).filter(F.col("horizon_hours") == horizon)
-        if origin_stride > 1:
-            # Sample entire origins, never individual rows, so every retained
-            # origin still has its full lead curve for peak-event evaluation.
-            examples_sdf = examples_sdf.filter(
-                F.pmod(F.xxhash64("forecast_origin_utc"), F.lit(origin_stride)) == 0
-            )
         # Project only training, temporal-contract, and scoring columns before
         # crossing the Spark/Pandas boundary. The source table also contains
         # serving/lineage fields that the trainer never reads.
         feature_columns = features_for_horizon(horizon)
         required_columns = set(EXAMPLE_GRAIN_KEYS) | set(feature_columns) | {
             "source_max_observation_utc", "actual_demand_mw", "is_valid_training_example",
-            "daily_naive_mw", "weekly_naive_mw", "eia_day_ahead_forecast_mw",
+            "daily_naive_mw", "eia_day_ahead_forecast_mw",
         }
         projected_columns = [name for name in examples_sdf.columns if name in required_columns]
         missing_columns = required_columns - set(projected_columns)
@@ -424,22 +388,18 @@ if __name__ == "__main__" and "spark" in globals():
             )
         examples_sdf = examples_sdf.select(*projected_columns)
         selected_row_count = examples_sdf.count()
-        print(
-            f"H{horizon}: collecting {selected_row_count:,} rows from {examples_table}; "
-            f"origin sampling is 1/{origin_stride}, with full retained lead curves."
-        )
+        print(f"H{horizon}: collecting {selected_row_count:,} projected rows from {examples_table}.")
         examples = examples_sdf.toPandas()
         results[horizon] = train_single_horizon_model(
             examples,
             horizon,
             high_demand_threshold_mw=threshold,
             examples_table=examples_table,
-            origin_stride_hours=origin_stride,
         )
         del examples
     for horizon, result in results.items():
-        baseline_name = "daily" if horizon == 24 else "weekly"
-        baseline_label = "daily naive" if horizon == 24 else "weekly naive"
+        baseline_name = "daily"
+        baseline_label = "daily naive"
         line = (
             f"H{horizon} candidate {result['run_id'] or 'not logged'}: "
             f"rolling MAE {result['selection_mae']:,.1f} vs {result['selection_baseline_mae']:,.1f} MW {baseline_label}; "
@@ -448,9 +408,8 @@ if __name__ == "__main__" and "spark" in globals():
             f"final holdout MAE {result['final']['model']['mae']:,.1f} vs "
             f"{result['final'][baseline_name]['mae']:,.1f} MW {baseline_label}."
         )
-        if horizon == 24:
-            matched = result["final"]["eia_matched"]
-            line += f" EIA matched hours: {matched['sample_count']:,} ({matched['coverage_pct']:.1f}% coverage)."
+        matched = result["final"]["eia_matched"]
+        line += f" EIA matched hours: {matched['sample_count']:,} ({matched['coverage_pct']:.1f}% coverage)."
         print(line)
         model_peak = result["final"]["peak_event_metrics"]["model"]
         baseline_peak = result["final"]["peak_event_metrics"][baseline_name]

@@ -44,7 +44,7 @@ def get_databricks_connection():
 
 
 @st.cache_data(ttl=300)
-def load_operational_forecast_data(cache_contract_version="four-value-v2"):
+def load_operational_forecast_data(cache_contract_version="h24-only-v3"):
     """Return the latest persisted forecast and an honest connection status.
 
     The version argument is part of Streamlit's cache key. Bump it whenever
@@ -78,8 +78,8 @@ def load_operational_forecast_data(cache_contract_version="four-value-v2"):
                    a.actual_demand_mw AS latest_actual_demand_mw
             FROM main.gold.forecast_latest f
             LEFT JOIN latest_actual a ON TRUE
-            WHERE f.respondent = 'ERCO'
-            ORDER BY f.horizon_hours, f.target_timestamp_utc
+            WHERE f.respondent = 'ERCO' AND f.horizon_hours = 24
+            ORDER BY f.target_timestamp_utc
         """)
         logger.info("Latest forecast query returned %s rows.", len(forecast))
         if forecast.empty:
@@ -102,7 +102,7 @@ def load_operational_forecast_data(cache_contract_version="four-value-v2"):
                 SELECT model_run_id, horizon_hours, lead_hours, target_date_utc,
                        evaluated_rows, mae_mw, rmse_mw, bias_mw
                 FROM main.gold.forecast_monitoring_daily
-                WHERE target_date_utc >= date_sub(current_date(), 30)
+                WHERE horizon_hours = 24 AND target_date_utc >= date_sub(current_date(), 30)
                 ORDER BY target_date_utc
             """)
             logger.info("Forecast monitoring query returned %s rows.", len(monitoring))

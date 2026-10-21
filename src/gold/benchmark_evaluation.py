@@ -1,23 +1,13 @@
-"""EIA H24 Day-Ahead Benchmark Evaluation and As-Of Vintage Matching.
+"""Fair issue-time-matched evaluation of the active rolling H24 forecast against EIA."""
 
-Implements fair head-to-head comparison between rolling H24 model issues and
-EIA-930 day-ahead reference forecasts:
-1. Strict as-of vintage selection (first_observed_at_utc <= model_issued_at_utc).
-2. Prevents look-ahead: future benchmark revisions or later vintages are rejected.
-3. Pre-registered one-forecast-per-target headline policy to prevent overlapping
-   hourly issues from biasing evaluation with repeated target weighting.
-4. Lead slices (including lead 24), signed bias (forecast - actual), MAE, RMSE,
-   and peak window metrics.
-"""
-
-from typing import Any, Dict, List, Optional, Tuple
 import json
+from datetime import datetime, timezone
+from typing import Dict, List, Tuple
+
 import numpy as np
 import pandas as pd
 
-from src.shared.forecast_contract import (
-    HORIZON_H24,
-)
+from src.shared.forecast_contract import HORIZON_H24
 
 
 def _require_unique(frame: pd.DataFrame, keys: List[str], label: str) -> None:
@@ -36,45 +26,28 @@ def select_as_of_benchmark_vintages(
     provider: str = "EIA",
     respondent: str = "ERCO",
 ) -> pd.DataFrame:
-    """Return the newest benchmark vintage for each target available as of as_of_time_utc.
-
-    Enforces no look-ahead: vintages with first_observed_at_utc > as_of_time_utc are excluded.
-    """
+    """Select each target's latest benchmark vintage actually available at issue time."""
     if df_vintages.empty:
         return pd.DataFrame(columns=df_vintages.columns)
 
     frame = df_vintages.copy()
     frame["target_timestamp_utc"] = pd.to_datetime(frame["target_timestamp_utc"], utc=True)
     frame["first_observed_at_utc"] = pd.to_datetime(frame["first_observed_at_utc"], utc=True)
-    as_of_ts = pd.to_datetime(as_of_time_utc, utc=True)
-
-    # Filter to eligible vintages available by the as-of cutoff
+    as_of = pd.to_datetime(as_of_time_utc, utc=True)
     eligible = frame[
         (frame["benchmark_provider"] == provider)
         & (frame["respondent"] == respondent)
-        & (frame["first_observed_at_utc"] <= as_of_ts)
+        & (frame["first_observed_at_utc"] <= as_of)
         & frame["forecast_mw"].notna()
     ].copy()
-
+    if "published_at_utc" in eligible:
+        published = pd.to_datetime(eligible["published_at_utc"], utc=True)
+        eligible = eligible[published.isna() | (published <= as_of)]
     if eligible.empty:
         return pd.DataFrame(columns=frame.columns)
-
-    # If provider published timestamp exists, also assert it is <= as_of_ts
-    if "published_at_utc" in eligible.columns:
-        valid_published = eligible["published_at_utc"].isna() | (
-            pd.to_datetime(eligible["published_at_utc"], utc=True) <= as_of_ts
-        )
-        eligible = eligible[valid_published]
-
-    # Select the latest observed vintage per target timestamp
-    # Row selection must preserve a single real vintage. DataFrameGroupBy.last()
-    # works column-by-column and can accidentally combine values from different
-    # rows when nullable fields differ across vintages.
-    eligible = eligible.sort_values(
+    return eligible.sort_values(
         ["target_timestamp_utc", "first_observed_at_utc", "vintage_id"]
-    )
-    latest_vintages = eligible.drop_duplicates("target_timestamp_utc", keep="last")
-    return latest_vintages
+    ).drop_duplicates("target_timestamp_utc", keep="last")
 
 
 def match_h24_and_eia(
@@ -82,374 +55,97 @@ def match_h24_and_eia(
     df_eia_vintages: pd.DataFrame,
     df_actuals: pd.DataFrame,
     headline_policy: str = "lead_24",
-) -> Tuple[pd.DataFrame, Dict[str, float]]:
-    """Match rolling H24 forecasts to EIA vintages on identical target hours and actual demand.
-
-    Parameters:
-      headline_policy: 'lead_24' selects exact lead-24 slice for headline metrics;
-                       'all_leads' evaluates every rolling lead with lead-bucket breakdowns.
-    """
-    h24 = df_h24_forecasts[df_h24_forecasts["horizon_hours"] == HORIZON_H24].copy()
-    h24["target_timestamp_utc"] = pd.to_datetime(h24["target_timestamp_utc"], utc=True)
-    h24["issued_at_utc"] = pd.to_datetime(h24["issued_at_utc"], utc=True)
+) -> Tuple[pd.DataFrame, Dict[str, object]]:
+    """Match model, EIA and matured actuals on target hour and issue-time availability."""
+    forecasts = df_h24_forecasts[
+        df_h24_forecasts["horizon_hours"] == HORIZON_H24
+    ].copy()
+    forecasts["target_timestamp_utc"] = pd.to_datetime(forecasts["target_timestamp_utc"], utc=True)
+    forecasts["issued_at_utc"] = pd.to_datetime(forecasts["issued_at_utc"], utc=True)
     issue_keys = ["respondent", "horizon_hours", "forecast_origin_utc", "issued_at_utc", "target_timestamp_utc"]
-    if "forecast_issue_id" in h24.columns:
+    if "forecast_issue_id" in forecasts:
         issue_keys.insert(1, "forecast_issue_id")
-    _require_unique(h24, issue_keys, "H24 forecasts")
+    _require_unique(forecasts, issue_keys, "H24 forecasts")
 
     actuals = df_actuals[["respondent", "timestamp_utc", "actual_demand_mw"]].copy()
     actuals["timestamp_utc"] = pd.to_datetime(actuals["timestamp_utc"], utc=True)
     actuals = actuals[actuals["actual_demand_mw"].notna()]
     _require_unique(actuals, ["respondent", "timestamp_utc"], "Actual demand")
 
-    matched_records = []
-    # Evaluate by unique issue origin or across issues
-    issue_group_keys = ["forecast_origin_utc", "issued_at_utc"]
-    if "forecast_issue_id" in h24.columns:
-        issue_group_keys.append("forecast_issue_id")
-    for _, issue_group in h24.groupby(issue_group_keys, dropna=False):
-        issued_at = issue_group["issued_at_utc"].iloc[0]
-        as_of_benchmarks = select_as_of_benchmark_vintages(df_eia_vintages, issued_at)
-        if as_of_benchmarks.empty:
+    matched_issues = []
+    issue_keys = ["forecast_origin_utc", "issued_at_utc"]
+    if "forecast_issue_id" in forecasts:
+        issue_keys.append("forecast_issue_id")
+    for _, issue in forecasts.groupby(issue_keys, dropna=False):
+        vintages = select_as_of_benchmark_vintages(df_eia_vintages, issue["issued_at_utc"].iloc[0])
+        if vintages.empty:
             continue
-
-        joined = issue_group.merge(
-            as_of_benchmarks[["target_timestamp_utc", "forecast_mw"]].rename(
+        matched = issue.merge(
+            vintages[["target_timestamp_utc", "forecast_mw"]].rename(
                 columns={"forecast_mw": "eia_forecast_mw"}
             ),
-            on="target_timestamp_utc",
-            how="inner",
+            on="target_timestamp_utc", how="inner",
         ).merge(
             actuals.rename(columns={"timestamp_utc": "target_timestamp_utc"}),
-            on=["respondent", "target_timestamp_utc"],
-            how="inner",
+            on=["respondent", "target_timestamp_utc"], how="inner",
         )
-        matched_records.append(joined)
+        if not matched.empty:
+            matched_issues.append(matched)
 
-    if not matched_records:
-        return pd.DataFrame(), {
-            "status": "PROSPECTIVE_PENDING_MATURED_DATA",
-            "matched_rows": 0,
-            "unique_targets": 0,
-            "model_mae_mw": None,
-            "eia_mae_mw": None,
-            "model_rmse_mw": None,
-            "eia_rmse_mw": None,
-            "model_bias_mw": None,
-            "eia_bias_mw": None,
-            "notice": "No H24 forecast targets have both an issue-time-available EIA vintage and a matured actual; metrics are pending, not zero.",
-        }
+    pending = {
+        "status": "PROSPECTIVE_PENDING_MATURED_DATA",
+        "matched_rows": 0,
+        "unique_targets": 0,
+        "model_mae_mw": None,
+        "eia_mae_mw": None,
+        "model_rmse_mw": None,
+        "eia_rmse_mw": None,
+        "model_bias_mw": None,
+        "eia_bias_mw": None,
+        "notice": "No H24 targets have both an issue-time-available EIA vintage and a matured actual; metrics are pending, not zero.",
+    }
+    if not matched_issues:
+        return pd.DataFrame(), pending
 
-    df_matched = pd.concat(matched_records, ignore_index=True)
-    df_matched["model_error_mw"] = df_matched["predicted_demand_mw"] - df_matched["actual_demand_mw"]
-    df_matched["model_abs_error_mw"] = df_matched["model_error_mw"].abs()
-    df_matched["eia_error_mw"] = df_matched["eia_forecast_mw"] - df_matched["actual_demand_mw"]
-    df_matched["eia_abs_error_mw"] = df_matched["eia_error_mw"].abs()
+    matched = pd.concat(matched_issues, ignore_index=True)
+    matched["model_error_mw"] = matched["predicted_demand_mw"] - matched["actual_demand_mw"]
+    matched["model_abs_error_mw"] = matched["model_error_mw"].abs()
+    matched["eia_error_mw"] = matched["eia_forecast_mw"] - matched["actual_demand_mw"]
+    matched["eia_abs_error_mw"] = matched["eia_error_mw"].abs()
 
-    # Apply headline policy to avoid repeated target sample inflation
     if headline_policy == "lead_24":
-        headline_df = df_matched[df_matched["lead_hours"] == 24]
+        headline = matched[matched["lead_hours"] == 24]
     elif headline_policy == "all_leads":
-        # Default: latest issue per target
-        sort_columns = ["target_timestamp_utc", "issued_at_utc", "forecast_origin_utc"]
-        if "forecast_issue_id" in df_matched.columns:
-            sort_columns.append("forecast_issue_id")
-        headline_df = df_matched.sort_values(sort_columns).drop_duplicates(
-            "target_timestamp_utc", keep="last"
-        )
+        sort_by = ["target_timestamp_utc", "issued_at_utc", "forecast_origin_utc"]
+        if "forecast_issue_id" in matched:
+            sort_by.append("forecast_issue_id")
+        headline = matched.sort_values(sort_by).drop_duplicates("target_timestamp_utc", keep="last")
     else:
         raise ValueError("headline_policy must be 'lead_24' or 'all_leads'.")
 
-    if headline_df.empty:
-        return df_matched, {
-            "status": "PENDING_LEAD_24_MATCHES",
-            "matched_rows": 0,
-            "unique_targets": 0,
-            "model_mae_mw": None,
-            "eia_mae_mw": None,
-            "model_rmse_mw": None,
-            "eia_rmse_mw": None,
-            "model_bias_mw": None,
-            "eia_bias_mw": None,
-            "notice": "Matched non-headline leads exist, but no matured lead-24 rows are available for the declared H24 headline.",
-        }
+    if headline.empty:
+        pending["status"] = "PENDING_LEAD_24_MATCHES"
+        pending["notice"] = "Other matched leads exist, but no matured lead-24 targets are available for the H24 headline."
+        return matched, pending
 
-    summary_metrics = {
+    return matched, {
         "status": "EVALUATED",
-        "matched_rows": int(len(headline_df)),
-        "unique_targets": int(headline_df["target_timestamp_utc"].nunique()),
-        "model_mae_mw": round(float(headline_df["model_abs_error_mw"].mean()), 2),
-        "eia_mae_mw": round(float(headline_df["eia_abs_error_mw"].mean()), 2),
-        "model_rmse_mw": round(float(np.sqrt((headline_df["model_error_mw"] ** 2).mean())), 2),
-        "eia_rmse_mw": round(float(np.sqrt((headline_df["eia_error_mw"] ** 2).mean())), 2),
-        "model_bias_mw": round(float(headline_df["model_error_mw"].mean()), 2),
-        "eia_bias_mw": round(float(headline_df["eia_error_mw"].mean()), 2),
-    }
-
-    return df_matched, summary_metrics
-
-
-def match_h168_and_ercot(
-    df_h168_forecasts: pd.DataFrame,
-    df_ercot_vintages: pd.DataFrame,
-    df_actuals: pd.DataFrame,
-    lead_buckets: Optional[List[Tuple[int, int]]] = None,
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """Match rolling H168 forecasts to official ERCOT 7-day benchmark vintages.
-
-    Reports overall metrics, lead-bucket metrics (1-24, 25-48, 49-168), and lead-168 diagnostic.
-    Missing ERCOT vintages are reported as EXTERNAL_BENCHMARK_UNAVAILABLE;
-    present but not-yet-matched vintages remain prospectively pending.
-    """
-    if lead_buckets is None:
-        lead_buckets = [(1, 24), (25, 48), (49, 168)]
-
-    if df_h168_forecasts.empty:
-        return pd.DataFrame(), {
-            "status": "NO_H168_FORECASTS",
-            "matched_rows": 0,
-            "unique_targets": 0,
-            "lead_bucket_metrics": {},
-            "lead_168_diagnostic": None,
-            "notice": "No H168 forecast rows are available for the external comparison.",
-        }
-    if df_ercot_vintages.empty:
-        return pd.DataFrame(), {
-            "status": "EXTERNAL_BENCHMARK_UNAVAILABLE",
-            "matched_rows": 0,
-            "unique_targets": 0,
-            "lead_bucket_metrics": {},
-            "lead_168_diagnostic": None,
-            "notice": "No authorized ERCOT issue-vintage data is available; H168 is evaluated against the weekly seasonal-naive baseline.",
-        }
-    if df_actuals.empty:
-        return pd.DataFrame(), {
-            "status": "PROSPECTIVE_PENDING_MATURED_DATA",
-            "matched_rows": 0,
-            "unique_targets": 0,
-            "lead_bucket_metrics": {},
-            "lead_168_diagnostic": None,
-            "notice": "ERCOT vintages are present, but no matched target actuals have matured yet.",
-        }
-
-    h168 = df_h168_forecasts[df_h168_forecasts["horizon_hours"] == 168].copy()
-    h168["target_timestamp_utc"] = pd.to_datetime(h168["target_timestamp_utc"], utc=True)
-    h168["issued_at_utc"] = pd.to_datetime(h168["issued_at_utc"], utc=True)
-    issue_keys = ["respondent", "horizon_hours", "forecast_origin_utc", "issued_at_utc", "target_timestamp_utc"]
-    if "forecast_issue_id" in h168.columns:
-        issue_keys.insert(1, "forecast_issue_id")
-    _require_unique(h168, issue_keys, "H168 forecasts")
-
-    actuals = df_actuals[["respondent", "timestamp_utc", "actual_demand_mw"]].copy()
-    actuals["timestamp_utc"] = pd.to_datetime(actuals["timestamp_utc"], utc=True)
-    actuals = actuals[actuals["actual_demand_mw"].notna()]
-    _require_unique(actuals, ["respondent", "timestamp_utc"], "Actual demand")
-
-    matched_records = []
-    issue_group_keys = ["forecast_origin_utc", "issued_at_utc"]
-    if "forecast_issue_id" in h168.columns:
-        issue_group_keys.append("forecast_issue_id")
-    for _, issue_group in h168.groupby(issue_group_keys, dropna=False):
-        issued_at = issue_group["issued_at_utc"].iloc[0]
-        as_of_benchmarks = select_as_of_benchmark_vintages(
-            df_ercot_vintages, issued_at, provider="ERCOT", respondent="ERCO"
-        )
-        if as_of_benchmarks.empty:
-            continue
-
-        joined = issue_group.merge(
-            as_of_benchmarks[["target_timestamp_utc", "forecast_mw"]].rename(
-                columns={"forecast_mw": "ercot_forecast_mw"}
-            ),
-            on="target_timestamp_utc",
-            how="inner",
-        ).merge(
-            actuals.rename(columns={"timestamp_utc": "target_timestamp_utc"}),
-            on=["respondent", "target_timestamp_utc"],
-            how="inner",
-        )
-        matched_records.append(joined)
-
-    if not matched_records:
-        return pd.DataFrame(), {
-            "status": "PROSPECTIVE_PENDING_MATURED_DATA",
-            "matched_rows": 0,
-            "unique_targets": 0,
-            "lead_bucket_metrics": {},
-            "lead_168_diagnostic": None,
-            "notice": "No mature overlapping actuals available yet for captured ERCOT vintages.",
-        }
-
-    df_matched = pd.concat(matched_records, ignore_index=True)
-    df_matched["model_error_mw"] = df_matched["predicted_demand_mw"] - df_matched["actual_demand_mw"]
-    df_matched["model_abs_error_mw"] = df_matched["model_error_mw"].abs()
-    df_matched["ercot_error_mw"] = df_matched["ercot_forecast_mw"] - df_matched["actual_demand_mw"]
-    df_matched["ercot_abs_error_mw"] = df_matched["ercot_error_mw"].abs()
-
-    # H168 is a rolling issue product. These lead-bucket metrics describe each
-    # distinct issued forecast decision; they are not a unique-target headline.
-    # State both counts so repeated targets across successive issues are visible.
-    bucket_results = {}
-    for (start_lead, end_lead) in lead_buckets:
-        b_slice = df_matched[(df_matched["lead_hours"] >= start_lead) & (df_matched["lead_hours"] <= end_lead)]
-        if not b_slice.empty:
-            bucket_results[f"leads_{start_lead}_{end_lead}"] = {
-                "matched_rows": len(b_slice),
-                "unique_targets": int(b_slice["target_timestamp_utc"].nunique()),
-                "model_mae_mw": round(float(b_slice["model_abs_error_mw"].mean()), 2),
-                "ercot_mae_mw": round(float(b_slice["ercot_abs_error_mw"].mean()), 2),
-                "model_rmse_mw": round(float(np.sqrt((b_slice["model_error_mw"] ** 2).mean())), 2),
-                "ercot_rmse_mw": round(float(np.sqrt((b_slice["ercot_error_mw"] ** 2).mean())), 2),
-            }
-
-    # Lead 168 diagnostic
-    lead_168_slice = df_matched[df_matched["lead_hours"] == 168]
-    lead_168_diag = None
-    if not lead_168_slice.empty:
-        lead_168_diag = {
-            "matched_rows": len(lead_168_slice),
-            "model_mae_mw": round(float(lead_168_slice["model_abs_error_mw"].mean()), 2),
-            "ercot_mae_mw": round(float(lead_168_slice["ercot_abs_error_mw"].mean()), 2),
-        }
-
-    summary_metrics = {
-        "status": "EVALUATED",
-        "matched_rows": len(df_matched),
-        "unique_targets": int(df_matched["target_timestamp_utc"].nunique()),
-        "evaluation_unit": "forecast_issue_target_pair; repeated targets across rolling issues are retained",
-        "model_mae_mw": round(float(df_matched["model_abs_error_mw"].mean()), 2),
-        "ercot_mae_mw": round(float(df_matched["ercot_abs_error_mw"].mean()), 2),
-        "model_rmse_mw": round(float(np.sqrt((df_matched["model_error_mw"] ** 2).mean())), 2),
-        "ercot_rmse_mw": round(float(np.sqrt((df_matched["ercot_error_mw"] ** 2).mean())), 2),
-        "model_bias_mw": round(float(df_matched["model_error_mw"].mean()), 2),
-        "ercot_bias_mw": round(float(df_matched["ercot_error_mw"].mean()), 2),
-        "lead_bucket_metrics": bucket_results,
-        "lead_168_diagnostic": lead_168_diag,
-    }
-
-    return df_matched, summary_metrics
-
-
-def match_h168_and_weekly_naive(
-    df_h168_forecasts: pd.DataFrame,
-    df_actuals: pd.DataFrame,
-    lead_buckets: Optional[List[Tuple[int, int]]] = None,
-) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """Compare rolling H168 issues with a no-cost weekly seasonal-naive baseline.
-
-    The baseline for target T is the observed demand at T - 168 hours. That
-    value is available by the issue cutoff for every lead in [1, 168]. The
-    headline uses lead 168, giving one forecast per target; lead buckets are
-    diagnostic issue-target-pair metrics and report unique-target counts.
-    """
-    if lead_buckets is None:
-        lead_buckets = [(1, 24), (25, 48), (49, 168)]
-
-    h168 = df_h168_forecasts[df_h168_forecasts["horizon_hours"] == 168].copy()
-    if h168.empty or df_actuals.empty:
-        return pd.DataFrame(), {
-            "status": "PENDING_MATURED_ACTUALS",
-            "matched_rows": 0,
-            "unique_targets": 0,
-            "headline_policy": "lead_168",
-            "lead_bucket_metrics": {},
-            "notice": "No matured H168 target actuals are available yet.",
-        }
-
-    h168["target_timestamp_utc"] = pd.to_datetime(h168["target_timestamp_utc"], utc=True)
-    h168["forecast_origin_utc"] = pd.to_datetime(h168["forecast_origin_utc"], utc=True)
-    issue_keys = ["respondent", "forecast_origin_utc", "target_timestamp_utc"]
-    if "forecast_issue_id" in h168.columns:
-        issue_keys.insert(1, "forecast_issue_id")
-    _require_unique(h168, issue_keys, "H168 forecasts")
-
-    actuals = df_actuals[["respondent", "timestamp_utc", "actual_demand_mw"]].copy()
-    actuals["timestamp_utc"] = pd.to_datetime(actuals["timestamp_utc"], utc=True)
-    actuals = actuals[actuals["actual_demand_mw"].notna()]
-    _require_unique(actuals, ["respondent", "timestamp_utc"], "Actual demand")
-
-    target_actuals = actuals.rename(columns={
-        "timestamp_utc": "target_timestamp_utc",
-        "actual_demand_mw": "actual_demand_mw",
-    })
-    baseline_actuals = actuals.rename(columns={
-        "timestamp_utc": "baseline_timestamp_utc",
-        "actual_demand_mw": "weekly_naive_mw",
-    })
-    h168["baseline_timestamp_utc"] = h168["target_timestamp_utc"] - pd.Timedelta(hours=168)
-    matched = h168.merge(
-        target_actuals,
-        on=["respondent", "target_timestamp_utc"],
-        how="inner",
-    ).merge(
-        baseline_actuals,
-        on=["respondent", "baseline_timestamp_utc"],
-        how="inner",
-    )
-    # A missing or future baseline is not silently treated as a scoreable row.
-    matched = matched[matched["baseline_timestamp_utc"] <= matched["forecast_origin_utc"]].copy()
-    if matched.empty:
-        return pd.DataFrame(), {
-            "status": "PENDING_MATURED_ACTUALS",
-            "matched_rows": 0,
-            "unique_targets": 0,
-            "headline_policy": "lead_168",
-            "lead_bucket_metrics": {},
-            "notice": "No H168 rows have both matured target actuals and an issue-time-available weekly baseline.",
-        }
-
-    matched["model_error_mw"] = matched["predicted_demand_mw"] - matched["actual_demand_mw"]
-    matched["model_abs_error_mw"] = matched["model_error_mw"].abs()
-    matched["weekly_naive_error_mw"] = matched["weekly_naive_mw"] - matched["actual_demand_mw"]
-    matched["weekly_naive_abs_error_mw"] = matched["weekly_naive_error_mw"].abs()
-
-    bucket_metrics = {}
-    for first_lead, last_lead in lead_buckets:
-        subset = matched[(matched["lead_hours"] >= first_lead) & (matched["lead_hours"] <= last_lead)]
-        if subset.empty:
-            continue
-        bucket_metrics[f"leads_{first_lead}_{last_lead}"] = {
-            "matched_rows": int(len(subset)),
-            "unique_targets": int(subset["target_timestamp_utc"].nunique()),
-            "model_mae_mw": round(float(subset["model_abs_error_mw"].mean()), 2),
-            "weekly_naive_mae_mw": round(float(subset["weekly_naive_abs_error_mw"].mean()), 2),
-            "model_rmse_mw": round(float(np.sqrt((subset["model_error_mw"] ** 2).mean())), 2),
-            "weekly_naive_rmse_mw": round(float(np.sqrt((subset["weekly_naive_error_mw"] ** 2).mean())), 2),
-        }
-
-    headline = matched[matched["lead_hours"] == 168]
-    metrics = {
-        "status": "EVALUATED" if not headline.empty else "PENDING_LEAD_168_MATCHES",
-        "headline_policy": "lead_168_one_forecast_per_target",
         "matched_rows": int(len(headline)),
         "unique_targets": int(headline["target_timestamp_utc"].nunique()),
-        "model_mae_mw": round(float(headline["model_abs_error_mw"].mean()), 2) if not headline.empty else None,
-        "weekly_naive_mae_mw": round(float(headline["weekly_naive_abs_error_mw"].mean()), 2) if not headline.empty else None,
-        "model_rmse_mw": round(float(np.sqrt((headline["model_error_mw"] ** 2).mean())), 2) if not headline.empty else None,
-        "weekly_naive_rmse_mw": round(float(np.sqrt((headline["weekly_naive_error_mw"] ** 2).mean())), 2) if not headline.empty else None,
-        "model_bias_mw": round(float(headline["model_error_mw"].mean()), 2) if not headline.empty else None,
-        "weekly_naive_bias_mw": round(float(headline["weekly_naive_error_mw"].mean()), 2) if not headline.empty else None,
-        "all_lead_issue_target_pairs": int(len(matched)),
-        "all_lead_unique_targets": int(matched["target_timestamp_utc"].nunique()),
-        "lead_bucket_metrics": bucket_metrics,
+        "model_mae_mw": round(float(headline["model_abs_error_mw"].mean()), 2),
+        "eia_mae_mw": round(float(headline["eia_abs_error_mw"].mean()), 2),
+        "model_rmse_mw": round(float(np.sqrt((headline["model_error_mw"] ** 2).mean())), 2),
+        "eia_rmse_mw": round(float(np.sqrt((headline["eia_error_mw"] ** 2).mean())), 2),
+        "model_bias_mw": round(float(headline["model_error_mw"].mean()), 2),
+        "eia_bias_mw": round(float(headline["eia_error_mw"].mean()), 2),
     }
-    return matched, metrics
 
 
 def run_benchmark_evaluation(spark_session) -> dict:
-    """Evaluate H24/EIA and H168 against weekly-naive plus optional ERCOT vintages.
-
-    This is an operational materialization entry point. It evaluates the latest
-    served model run per horizon and keeps hourly H168 issue-target pairs for
-    lead buckets. H168's weekly seasonal-naive comparator is calculated from
-    actuals and requires no external API. ERCOT remains optional and is labeled
-    pending when no valid provider vintages are available.
-    """
-    from datetime import datetime, timezone
+    """Materialize H24/EIA metrics for the latest served model run."""
     from pyspark.sql import functions as F
     from pyspark.sql.types import (
-        DoubleType, IntegerType, LongType, StringType, StructField, StructType,
-        TimestampType,
+        DoubleType, IntegerType, LongType, StringType, StructField, StructType, TimestampType,
     )
 
     catalog = "main"
@@ -457,118 +153,79 @@ def run_benchmark_evaluation(spark_session) -> dict:
     serving_table = f"{catalog}.gold.forecast_latest"
     actuals_table = f"{catalog}.gold.fact_hourly_electricity_demand"
     eia_table = f"{catalog}.bronze.eia_forecast_vintages"
-    ercot_table = f"{catalog}.bronze.ercot_benchmark_raw"
     summary_table = f"{catalog}.gold.forecast_benchmark_metrics"
     detail_table = f"{catalog}.gold.forecast_benchmark_evaluation"
-
     for table in (forecasts_table, serving_table, actuals_table):
         if not spark_session.catalog.tableExists(table):
             raise RuntimeError(f"Benchmark evaluation requires table {table}.")
-    latest_run_rows = (
-        spark_session.table(serving_table)
-        .select("horizon_hours", "model_run_id")
-        .distinct()
-        .collect()
-    )
-    latest_runs = {int(row["horizon_hours"]): row["model_run_id"] for row in latest_run_rows}
-    if 24 not in latest_runs or 168 not in latest_runs:
-        raise RuntimeError("Benchmark evaluation requires the current H24 and H168 served runs.")
 
+    latest = (
+        spark_session.table(serving_table)
+        .filter(F.col("horizon_hours") == HORIZON_H24)
+        .select("model_run_id").distinct().limit(2).collect()
+    )
+    if len(latest) != 1:
+        raise RuntimeError("Benchmark evaluation requires exactly one active H24 served model run.")
+    run_id = str(latest[0]["model_run_id"])
     window_start = F.current_timestamp() - F.expr("INTERVAL 180 DAYS")
-    all_forecasts = (
+    forecasts = (
         spark_session.table(forecasts_table)
         .filter(
-            (F.col("forecast_origin_utc") >= window_start)
-            & (F.col("model_run_id").isin(*[str(value) for value in latest_runs.values()]))
+            (F.col("horizon_hours") == HORIZON_H24)
+            & (F.col("model_run_id") == run_id)
+            & (F.col("forecast_origin_utc") >= window_start)
         )
+        .select("respondent", "forecast_issue_id", "forecast_origin_utc", "issued_at_utc",
+                "target_timestamp_utc", "horizon_hours", "lead_hours", "predicted_demand_mw")
         .toPandas()
     )
     actuals = (
         spark_session.table(actuals_table)
-        .filter((F.col("actual_demand_mw").isNotNull()) & (F.col("timestamp_utc") >= window_start))
+        .filter(F.col("actual_demand_mw").isNotNull() & (F.col("timestamp_utc") >= window_start))
         .select("respondent", "timestamp_utc", "actual_demand_mw")
         .toPandas()
     )
-    for frame, columns in ((all_forecasts, ("forecast_origin_utc", "target_timestamp_utc", "issued_at_utc")),
+    for frame, columns in ((forecasts, ("forecast_origin_utc", "target_timestamp_utc", "issued_at_utc")),
                            (actuals, ("timestamp_utc",))):
         for column in columns:
             if column in frame:
                 frame[column] = pd.to_datetime(frame[column], utc=True)
 
-    eia_vintages = (
-        spark_session.table(eia_table).filter(F.col("target_timestamp_utc") >= window_start).toPandas()
-        if spark_session.catalog.tableExists(eia_table)
-        else pd.DataFrame(columns=[
+    if spark_session.catalog.tableExists(eia_table):
+        eia = (
+            spark_session.table(eia_table)
+            .filter(F.col("target_timestamp_utc") >= window_start)
+            .select("benchmark_provider", "respondent", "vintage_id", "target_timestamp_utc",
+                    "forecast_mw", "published_at_utc", "first_observed_at_utc")
+            .toPandas()
+        )
+    else:
+        eia = pd.DataFrame(columns=[
             "benchmark_provider", "respondent", "vintage_id", "target_timestamp_utc",
             "forecast_mw", "published_at_utc", "first_observed_at_utc",
         ])
-    )
-    ercot_vintages = (
-        spark_session.table(ercot_table).filter(F.col("target_timestamp_utc") >= window_start).toPandas()
-        if spark_session.catalog.tableExists(ercot_table)
-        else pd.DataFrame(columns=[
-            "benchmark_provider", "respondent", "vintage_id", "target_timestamp_utc",
-            "forecast_mw", "published_at_utc", "first_observed_at_utc",
-        ])
-    )
-    for frame in (eia_vintages, ercot_vintages):
-        for column in ("target_timestamp_utc", "published_at_utc", "first_observed_at_utc"):
-            if column in frame:
-                frame[column] = pd.to_datetime(frame[column], utc=True)
+    for column in ("target_timestamp_utc", "published_at_utc", "first_observed_at_utc"):
+        if column in eia:
+            eia[column] = pd.to_datetime(eia[column], utc=True)
 
-    summary_rows = []
-    detail_frames = []
+    matched, metrics = match_h24_and_eia(forecasts, eia, actuals, headline_policy="lead_24")
     now = datetime.now(timezone.utc)
-    benchmark_jobs = (
-        (24, "EIA", eia_vintages),
-        (168, "WEEKLY_SEASONAL_NAIVE", None),
-        (168, "ERCOT", ercot_vintages),
-    )
-    for horizon, provider, vintages in benchmark_jobs:
-        run_id = latest_runs[horizon]
-        forecasts = all_forecasts[
-            (all_forecasts["horizon_hours"] == horizon)
-            & (all_forecasts["model_run_id"] == run_id)
-        ].copy()
-        if provider == "EIA":
-            matched, metrics = match_h24_and_eia(forecasts, vintages, actuals, headline_policy="lead_24")
-            benchmark_mae_key = "eia_mae_mw"
-            benchmark_rmse_key = "eia_rmse_mw"
-            benchmark_bias_key = "eia_bias_mw"
-        elif provider == "WEEKLY_SEASONAL_NAIVE":
-            matched, metrics = match_h168_and_weekly_naive(forecasts, actuals)
-            benchmark_mae_key = "weekly_naive_mae_mw"
-            benchmark_rmse_key = "weekly_naive_rmse_mw"
-            benchmark_bias_key = "weekly_naive_bias_mw"
-        else:
-            matched, metrics = match_h168_and_ercot(forecasts, vintages, actuals)
-            benchmark_mae_key = "ercot_mae_mw"
-            benchmark_rmse_key = None
-            benchmark_bias_key = None
-
-        status = metrics.get("status", "EVALUATED" if metrics.get("matched_rows", 0) else "PROSPECTIVE_PENDING_MATURED_DATA")
-        row = {
-            "benchmark_provider": provider,
-            "horizon_hours": horizon,
-            "model_run_id": str(run_id),
-            "status": status,
-            "matched_rows": int(metrics.get("matched_rows", 0)),
-            "unique_targets": int(metrics.get("unique_targets", 0)),
-            "model_mae_mw": metrics.get("model_mae_mw"),
-            "benchmark_mae_mw": metrics.get(benchmark_mae_key),
-            "model_rmse_mw": metrics.get("model_rmse_mw"),
-            "benchmark_rmse_mw": metrics.get(benchmark_rmse_key) if benchmark_rmse_key else None,
-            "model_bias_mw": metrics.get("model_bias_mw"),
-            "benchmark_bias_mw": metrics.get(benchmark_bias_key) if benchmark_bias_key else None,
-            "metrics_json": json.dumps(metrics, default=str, sort_keys=True),
-            "computed_at_utc": now,
-        }
-        summary_rows.append(row)
-        if not matched.empty:
-            matched.insert(0, "benchmark_provider", provider)
-            matched.insert(1, "horizon_hours_evaluated", horizon)
-            detail_frames.append(matched)
-
+    summary = {
+        "benchmark_provider": "EIA",
+        "horizon_hours": HORIZON_H24,
+        "model_run_id": run_id,
+        "status": metrics["status"],
+        "matched_rows": metrics["matched_rows"],
+        "unique_targets": metrics["unique_targets"],
+        "model_mae_mw": metrics["model_mae_mw"],
+        "benchmark_mae_mw": metrics["eia_mae_mw"],
+        "model_rmse_mw": metrics["model_rmse_mw"],
+        "benchmark_rmse_mw": metrics["eia_rmse_mw"],
+        "model_bias_mw": metrics["model_bias_mw"],
+        "benchmark_bias_mw": metrics["eia_bias_mw"],
+        "metrics_json": json.dumps(metrics, default=str, sort_keys=True),
+        "computed_at_utc": now,
+    }
     summary_schema = StructType([
         StructField("benchmark_provider", StringType(), False),
         StructField("horizon_hours", IntegerType(), False),
@@ -585,30 +242,29 @@ def run_benchmark_evaluation(spark_session) -> dict:
         StructField("metrics_json", StringType(), False),
         StructField("computed_at_utc", TimestampType(), False),
     ])
-    spark_session.createDataFrame(summary_rows, schema=summary_schema).write.format("delta").mode(
+    spark_session.createDataFrame([summary], schema=summary_schema).write.format("delta").mode(
         "overwrite"
     ).option("overwriteSchema", "true").saveAsTable(summary_table)
 
-    if detail_frames:
-        details = pd.concat(detail_frames, ignore_index=True)
-        for column in details.columns:
-            if pd.api.types.is_datetime64_any_dtype(details[column]):
-                details[column] = pd.to_datetime(details[column], utc=True).dt.tz_localize(None)
-        spark_session.createDataFrame(details).write.format("delta").mode("overwrite").option(
+    if not matched.empty:
+        matched.insert(0, "benchmark_provider", "EIA")
+        matched.insert(1, "horizon_hours_evaluated", HORIZON_H24)
+        for column in matched.columns:
+            if pd.api.types.is_datetime64_any_dtype(matched[column]):
+                matched[column] = pd.to_datetime(matched[column], utc=True).dt.tz_localize(None)
+        spark_session.createDataFrame(matched).write.format("delta").mode("overwrite").option(
             "overwriteSchema", "true"
         ).saveAsTable(detail_table)
     elif spark_session.catalog.tableExists(detail_table):
-        # Do not leave old comparison rows visible when today's as-of match is empty.
         from delta.tables import DeltaTable
         DeltaTable.forName(spark_session, detail_table).delete()
 
     print(
-        f"Materialized H24/EIA, H168/weekly-naive, and optional H168/ERCOT benchmark status in {summary_table}; "
-        f"matched detail rows={sum(len(frame) for frame in detail_frames)}."
+        f"Materialized H24/EIA benchmark status in {summary_table}: {metrics['status']}; "
+        f"matched detail rows={len(matched):,}."
     )
-    return {"summary_table": summary_table, "detail_table": detail_table, "rows": summary_rows}
+    return {"summary_table": summary_table, "detail_table": detail_table, "rows": [summary]}
 
 
 if __name__ == "__main__" and "spark" in globals():
     run_benchmark_evaluation(spark)
-

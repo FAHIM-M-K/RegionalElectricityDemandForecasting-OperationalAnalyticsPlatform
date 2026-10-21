@@ -1,4 +1,4 @@
-"""Small operational viewer for the persisted H24 and H168 forecast products."""
+"""Small operational viewer for the persisted rolling H24 forecast."""
 
 import plotly.express as px
 import pandas as pd
@@ -6,9 +6,11 @@ import streamlit as st
 
 from data_loader import load_operational_forecast_data
 
+MIN_MATURED_ERRORS = 7 * 24
+
 st.set_page_config(page_title="ERCOT Demand Forecast", layout="wide")
 st.title("ERCOT Demand Forecast")
-st.caption("H24 is the day-ahead forecast. H168 is a separate model forecast for all 168 hours of the week-ahead horizon.")
+st.caption("Hourly refreshed system demand forecast for the next 24 hours, using weather available at issue time.")
 
 if st.button("Refresh forecast data"):
     load_operational_forecast_data.clear()
@@ -16,7 +18,7 @@ if st.button("Refresh forecast data"):
 
 with st.spinner("Connecting to Databricks and loading the latest forecast…"):
     forecast, status, monitoring, monitoring_status = load_operational_forecast_data(
-        cache_contract_version="four-value-v2"
+        cache_contract_version="h24-only-v3"
     )
 if status.startswith("Stale"):
     st.warning(status)
@@ -29,11 +31,9 @@ if forecast.empty:
         st.info(status or "No persisted forecast is available yet.")
     st.stop()
 
-horizon = st.radio("Forecast product", [24, 168], horizontal=True,
-                   format_func=lambda h: "Day ahead (H24)" if h == 24 else "Week ahead (H168)")
-view = forecast[forecast.horizon_hours == horizon].copy()
+view = forecast[forecast.horizon_hours == 24].copy()
 if view.empty:
-    st.error(f"No H{horizon} forecast rows are available.")
+    st.error("No rolling H24 forecast rows are available.")
     st.stop()
 peak = view.loc[view.predicted_demand_mw.idxmax()]
 first, second, third, fourth = st.columns(4)
@@ -63,11 +63,7 @@ figure.update_layout(height=480, font={"size": 13}, margin={"l": 30, "r": 30, "t
 st.plotly_chart(figure, width="stretch")
 st.caption("Above-threshold flags identify high forecast demand only; they do not estimate grid-stress probability or available reserve capacity.")
 forecast_source = str(view.forecast_source.iloc[0])
-if forecast_source == "weekly_seasonal_naive_baseline":
-    st.warning("No H168 ML model has passed validation yet. This week-ahead view is the weekly seasonal-naive benchmark, not an ML forecast.")
-    st.caption(f"Source: {forecast_source} | Model: {view.model_version.iloc[0]} | Run: {view.model_run_id.iloc[0]} | Forecast origin: {view.forecast_origin_utc.iloc[0]}")
-else:
-    st.caption(f"Source: {forecast_source} | Model: {view.model_version.iloc[0]} | Run: {view.model_run_id.iloc[0]} | Forecast origin: {view.forecast_origin_utc.iloc[0]}")
+st.caption(f"Source: {forecast_source} | Model: {view.model_version.iloc[0]} | Run: {view.model_run_id.iloc[0]} | Forecast origin: {view.forecast_origin_utc.iloc[0]}")
 
 st.subheader("Observed forecast reliability")
 if monitoring.empty:
@@ -77,10 +73,7 @@ if monitoring.empty:
         st.info(monitoring_status)
 else:
     selected_run_id = view.model_run_id.iloc[0]
-    recent = monitoring[
-        (monitoring.horizon_hours == horizon)
-        & (monitoring.model_run_id == selected_run_id)
-    ].copy()
+    recent = monitoring[monitoring.model_run_id == selected_run_id].copy()
     # Older monitor output can include timestamp matches without actual values.
     # Drop incomplete KPI rows so pandas does not turn all-null sums into 0 MW.
     recent = recent.dropna(subset=["mae_mw", "rmse_mw", "bias_mw", "evaluated_rows"])
@@ -94,7 +87,7 @@ else:
         actual_label = latest_actual_utc.strftime("%Y-%m-%d %H:%M UTC")
         target_label = first_target_utc.strftime("%Y-%m-%d %H:%M UTC")
         st.info(
-            f"Current H{horizon} forecast issue has no matured errors yet: actual demand is "
+            "Current H24 forecast issue has no matured errors yet: actual demand is "
             f"available through {actual_label}, and this issue starts at {target_label}."
         )
     if not recent.empty:
@@ -117,12 +110,12 @@ else:
         reliability["bias_mw"] = reliability["signed_error_sum"] / reliability["evaluated_rows"]
         sample_rows = int(reliability["evaluated_rows"].sum())
         sample_days = int(reliability["target_date_utc"].nunique())
-        enough_monitoring_history = sample_rows >= 168 and sample_days >= 7
+        enough_monitoring_history = sample_rows >= MIN_MATURED_ERRORS and sample_days >= 7
         if not enough_monitoring_history:
             st.warning(
                 f"Preliminary reliability only: {sample_rows} matured forecast errors across "
-                f"{sample_days} target date(s) for this model. Wait for at least 168 errors "
-                "across 7 dates before treating trend charts as useful monitoring signals."
+                f"{sample_days} target date(s) for this model. Wait for at least "
+                f"{MIN_MATURED_ERRORS} hourly errors across 7 dates before treating the trend as useful."
             )
         else:
             st.caption(
@@ -139,55 +132,13 @@ else:
                 legend={"orientation": "h", "y": 1.08, "x": 1, "xanchor": "right"},
             )
             st.plotly_chart(reliability_figure, width="stretch")
-        st.caption("Daily error metrics are weighted by the number of matured forecast rows in each lead-hour bucket.")
-
-        lead_rows = recent.copy()
-        if horizon == 24:
-            lead_rows["lead_bucket"] = "1–24 hours"
-        else:
-            lead_rows["lead_bucket"] = pd.cut(
-                lead_rows["lead_hours"], bins=[0, 24, 48, 168],
-                labels=["1–24 hours", "25–48 hours", "49–168 hours"],
-            )
-        lead_rows = lead_rows.dropna(
-            subset=["lead_bucket", "mae_mw", "rmse_mw", "bias_mw", "evaluated_rows"]
-        )
-        lead_rows["absolute_error_sum"] = lead_rows["mae_mw"] * lead_rows["evaluated_rows"]
-        lead_rows["squared_error_sum"] = lead_rows["rmse_mw"].pow(2) * lead_rows["evaluated_rows"]
-        lead_rows["signed_error_sum"] = lead_rows["bias_mw"] * lead_rows["evaluated_rows"]
-        by_lead = lead_rows.groupby("lead_bucket", observed=False, as_index=False).agg(
-            evaluated_rows=("evaluated_rows", "sum"),
-            absolute_error_sum=("absolute_error_sum", "sum"),
-            squared_error_sum=("squared_error_sum", "sum"),
-            signed_error_sum=("signed_error_sum", "sum"),
-        )
-        by_lead = by_lead[by_lead["evaluated_rows"] > 0].copy()
-        by_lead["mae_mw"] = by_lead["absolute_error_sum"] / by_lead["evaluated_rows"]
-        by_lead["rmse_mw"] = (by_lead["squared_error_sum"] / by_lead["evaluated_rows"]).pow(0.5)
-        by_lead["bias_mw"] = by_lead["signed_error_sum"] / by_lead["evaluated_rows"]
-        st.subheader("Observed error by forecast lead")
-        if horizon == 168:
-            st.caption("Week-ahead errors are separated into day one, day two, and days three through seven.")
-        if enough_monitoring_history:
-            lead_figure = px.bar(
-                by_lead, x="lead_bucket", y=["mae_mw", "rmse_mw"], barmode="group",
-                labels={"lead_bucket": "Forecast lead", "value": "Error (MW)", "variable": "Metric"},
-            )
-            lead_figure.update_layout(
-                height=360, font={"size": 13},
-                legend={"orientation": "h", "y": 1.08, "x": 1, "xanchor": "right"},
-            )
-            st.plotly_chart(lead_figure, width="stretch")
-        else:
-            st.caption("Lead-bucket trend chart will appear after at least 168 matured errors across 7 target dates.")
-        st.dataframe(by_lead[["lead_bucket", "evaluated_rows", "mae_mw", "rmse_mw", "bias_mw"]],
-                     hide_index=True, width="stretch")
+        st.caption("Daily error metrics summarize the matured hourly H24 forecasts for the selected production model.")
     else:
         if current_issue_has_no_matured_targets:
             st.caption("Historical reliability will appear after this model has matured forecast errors.")
         else:
             st.info(
-                f"No matured forecast errors are available for the selected H{horizon} model yet. "
+                "No matured forecast errors are available for this H24 model yet. "
                 f"This issue contains {len(view):,} forecast hours. Check that the monitoring task "
                 "has processed actual demand for the forecast targets."
             )

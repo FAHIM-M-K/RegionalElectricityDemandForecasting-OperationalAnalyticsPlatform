@@ -5,7 +5,7 @@
 This is deliberately not part of the daily production job. It reconstructs a
 conservative historical issue cutoff (forecast origin + 65 minutes), selects
 the latest 00Z/12Z ECMWF IFS run available by that cutoff (init + 6 hours),
-and stores weighted four-station temperature for each H168 example target.
+and stores weighted four-station temperature for each H24 example target.
 The issue-time offset is an explicit proxy based on the observed daily run;
 the later comparison must report that assumption. If the selected archived
 run has a gap, only the immediately previous eligible cycle is considered as
@@ -35,8 +35,8 @@ MODEL = "ecmwf_ifs"
 ARCHIVE_START_UTC = dt.datetime(2025, 1, 15, tzinfo=dt.timezone.utc)
 ISSUE_DELAY_MINUTES = 65
 CONSERVATIVE_PUBLICATION_DELAY_HOURS = 6
-HORIZON_HOURS = 168
-FORECAST_DAYS = 9
+HORIZON_HOURS = 24
+FORECAST_DAYS = 2
 REQUEST_PAUSE_SECONDS = 1.0
 CHECKPOINT_EVERY_RUNS = 20
 # The Open-Meteo free tier allows 10,000 calls/day. Keep 1,000 calls in reserve
@@ -160,7 +160,7 @@ def request_run(run_init: dt.datetime) -> list[dict]:
     return payload
 
 
-# Only origins with labeled H168 examples are included. No future realized
+# Only origins with labeled H24 examples are included. No future realized
 # weather is read: the sole weather input is each selected archived forecast.
 origin_pdf = (
     spark.table(EXAMPLES_TABLE)
@@ -184,18 +184,18 @@ for origin, selection in selected.items():
     origins_by_run.setdefault(selection[0], []).append(origin)
 run_inits = sorted(origins_by_run)
 print(
-    f"Preparing {len(origins):,} H168 origins using {len(run_inits):,} unique archived ECMWF runs "
+    f"Preparing {len(origins):,} H24 origins using {len(run_inits):,} unique archived ECMWF runs "
     f"from {origins[0]} onward. Each request bundles all four stations; checkpoints occur every "
     f"{CHECKPOINT_EVERY_RUNS} runs and can be resumed safely."
 )
 complete_archive_origins = set()
 if spark.catalog.tableExists(TARGET_TABLE):
-    # A raw row count of 168 is not sufficient: duplicates can conceal a
-    # missing target hour, null weather features, or rows for another
-    # respondent. Only a complete ERCO lead-1..168 path is resumably complete.
+    # Existing archives may contain the retired 168-hour path. The first 24
+    # targets are sufficient for H24; validate that exact active curve.
     target_weather = spark.table(TARGET_TABLE).filter(
         (F.col("respondent") == "ERCO")
         & (F.col("forecast_origin_utc") >= F.lit(ARCHIVE_START_UTC))
+        & (F.col("target_timestamp_utc") <= F.col("forecast_origin_utc") + F.expr("INTERVAL 24 HOURS"))
     )
     complete_weather_origins = target_weather.groupBy(
         "respondent", "forecast_origin_utc"
@@ -212,7 +212,7 @@ if spark.catalog.tableExists(TARGET_TABLE):
         (F.col("distinct_targets") == HORIZON_HOURS)
         & (F.col("null_feature_rows") == 0)
         & (F.col("first_target_utc") == F.col("forecast_origin_utc") + F.expr("INTERVAL 1 HOUR"))
-        & (F.col("last_target_utc") == F.col("forecast_origin_utc") + F.expr("INTERVAL 168 HOURS"))
+        & (F.col("last_target_utc") == F.col("forecast_origin_utc") + F.expr("INTERVAL 24 HOURS"))
     )
     complete_archive_origins = {
         pd.to_datetime(row["forecast_origin_utc"], utc=True).to_pydatetime()
@@ -336,7 +336,7 @@ def temperature_map_for_run(run_init: dt.datetime) -> dict | None:
             )
         raise RuntimeError(
             f"{error} The completed work has been saved. Stop this notebook and rerun it "
-            "after the provider quota resets; it will resume from completed 168-hour origins."
+            "after the provider quota resets; it will resume from completed 24-hour origins."
         ) from error
     times_by_station = []
     temps_by_station = []
@@ -358,7 +358,7 @@ def temperature_map_for_run(run_init: dt.datetime) -> dict | None:
 
 
 def build_complete_origin(origin: dt.datetime, run_init: dt.datetime) -> tuple[list[dict] | None, dict | None]:
-    """Build a full H168 weather vintage, returning a precise gap if it is incomplete."""
+    """Build a full H24 weather vintage, returning a precise gap if incomplete."""
     available_at = run_init + dt.timedelta(hours=CONSERVATIVE_PUBLICATION_DELAY_HOURS)
     issue_proxy = selected[origin][2]
     temperatures = temperature_map_for_run(run_init)

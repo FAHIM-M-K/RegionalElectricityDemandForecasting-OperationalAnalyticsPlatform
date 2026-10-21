@@ -1,5 +1,5 @@
 # Databricks notebook source
-"""Read-only preflight for the hourly forecast pipeline.
+"""Read-only preflight for the hourly H24 forecast pipeline.
 
 Checks the data products consumed by the hourly conformation and scorer. This
 task runs after EIA Bronze/Silver refresh, before Silver conformation and Gold
@@ -115,14 +115,14 @@ def check_preflight(spark_session, mlflow_client=None, experiment_name: str = EX
     if latest_ts.tzinfo is None:
         latest_ts = latest_ts.replace(tzinfo=timezone.utc)
     required_local_date = (
-        latest_ts.astimezone(ZoneInfo("America/Chicago")) + timedelta(hours=168)
+        latest_ts.astimezone(ZoneInfo("America/Chicago")) + timedelta(hours=24)
     ).date()
     if calendar_end is None or calendar_end < required_local_date:
         raise RuntimeError(
             f"Preflight failure: Calendar ends {calendar_end}; it must cover through "
-            f"{required_local_date} for the H168 forecast."
+            f"{required_local_date} for the H24 forecast."
         )
-    report["checks"].append({"check": "calendar_covers_h168", "passed": True})
+    report["checks"].append({"check": "calendar_covers_h24", "passed": True})
 
     if mlflow_client is None:
         try:
@@ -140,24 +140,15 @@ def check_preflight(spark_session, mlflow_client=None, experiment_name: str = EX
             raise RuntimeError(f"Preflight failure: MLflow experiment {experiment_name!r} does not exist.")
         experiment_id = experiment.experiment_id
 
-    production = {}
-    for horizon in (24, 168):
-        runs = mlflow_client.search_runs(
-            [experiment_id],
-            filter_string=f"tags.pipeline_role = 'PRODUCTION' AND tags.target_horizon = 'H{horizon}'",
-            order_by=["start_time DESC"],
-            max_results=1,
-        )
-        production[horizon] = bool(runs)
-    # H24 has no safe fallback; H168's explicit weekly-naive fallback is supported.
-    if not production[24]:
+    runs = mlflow_client.search_runs(
+        [experiment_id],
+        filter_string="tags.pipeline_role = 'PRODUCTION' AND tags.target_horizon = 'H24'",
+        order_by=["start_time DESC"],
+        max_results=1,
+    )
+    if not runs:
         raise RuntimeError("Preflight failure: No promoted H24 production model is available.")
     report["checks"].append({"check": "production_h24_model", "passed": True})
-    report["checks"].append({
-        "check": "production_h168_model_or_documented_baseline",
-        "passed": True,
-        "warning": None if production[168] else "No H168 production model; scorer will use its labeled weekly-naive baseline.",
-    })
     return report
 
 

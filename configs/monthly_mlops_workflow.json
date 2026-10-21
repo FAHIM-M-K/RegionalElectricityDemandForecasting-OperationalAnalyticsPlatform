@@ -9,7 +9,7 @@
   "tasks": [
     {
       "task_key": "build_forecast_examples",
-      "description": "Builds the canonical H24/H168 point-in-time examples from the demand fact table.",
+      "description": "Builds hourly-origin point-in-time examples for the active rolling H24 forecast.",
       "notebook_task": {
         "notebook_path": "src/gold/build_hourly_forecast_examples",
         "source": "GIT"
@@ -46,7 +46,7 @@
     },
     {
       "task_key": "validate_model",
-      "description": "Promotes only candidates that beat their matching rolling-selection naive baseline; final holdout is reporting-only.",
+      "description": "Promotes the H24 candidate only when it repeatedly beats the daily-naive baseline; final holdout is reporting-only.",
       "depends_on": [
         {
           "task_key": "retrain_model"

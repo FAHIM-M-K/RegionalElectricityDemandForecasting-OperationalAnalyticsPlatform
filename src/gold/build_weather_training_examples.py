@@ -1,5 +1,5 @@
 # Databricks notebook source
-"""Attach archived, issue-time weather vintages to hourly demand examples.
+"""Attach archived, issue-time weather vintages to H24 demand examples.
 
 Only complete weather paths whose conservative publication time is no later
 than the simulated issue cutoff are eligible. This produces a separate model
@@ -18,7 +18,7 @@ EXAMPLES_TABLE = f"{CATALOG}.gold.forecast_examples_hourly"
 WEATHER_TABLE = f"{CATALOG}.silver.weather_backtest_features"
 TARGET_TABLE = f"{CATALOG}.gold.forecast_examples_hourly_weather"
 EXCLUSIONS_TABLE = f"{CATALOG}.silver.weather_backtest_exclusions"
-HORIZONS = (24, 168)
+HORIZON_HOURS = 24
 ARCHIVE_START_UTC = "2025-01-15 00:00:00"
 
 spark.conf.set("spark.sql.session.timeZone", "UTC")
@@ -32,11 +32,13 @@ if not spark.catalog.tableExists(WEATHER_TABLE):
 
 examples = (
     spark.table(EXAMPLES_TABLE)
-    .filter((F.col("respondent") == "ERCO") & F.col("horizon_hours").isin(*HORIZONS))
+    .filter((F.col("respondent") == "ERCO") & (F.col("horizon_hours") == HORIZON_HOURS))
     .filter(F.col("feature_set") == FEATURE_SET_DEMAND_FOUNDATION)
     .filter(F.col("forecast_origin_utc") >= F.lit(ARCHIVE_START_UTC).cast("timestamp"))
 )
-weather = spark.table(WEATHER_TABLE)
+weather = spark.table(WEATHER_TABLE).filter(
+    F.col("target_timestamp_utc") <= F.col("forecast_origin_utc") + F.expr("INTERVAL 24 HOURS")
+)
 weather_keys = ["respondent", "forecast_origin_utc", "target_timestamp_utc"]
 if weather.groupBy(*weather_keys).count().filter(F.col("count") > 1).limit(1).count():
     raise RuntimeError("Archived weather has duplicate respondent/origin/target keys.")
@@ -59,7 +61,7 @@ weather_paths = weather.groupBy("respondent", "forecast_origin_utc").agg(
     ).otherwise(0)).alias("weather_null_feature_rows"),
 )
 incomplete_weather = weather_paths.filter(
-    (F.col("weather_target_hours") != 168) | (F.col("weather_null_feature_rows") != 0)
+    (F.col("weather_target_hours") != HORIZON_HOURS) | (F.col("weather_null_feature_rows") != 0)
 )
 if incomplete_weather.limit(1).count():
     first_incomplete = incomplete_weather.orderBy("forecast_origin_utc").first()
@@ -69,8 +71,7 @@ if incomplete_weather.limit(1).count():
         f"{first_incomplete['weather_null_feature_rows']} rows with null features); "
         "repair/resume the vintage backfill instead of dropping the affected origin."
     )
-expected_origins = (examples.filter(F.col("horizon_hours") == 168)
-                    .select("respondent", "forecast_origin_utc").distinct())
+expected_origins = examples.select("respondent", "forecast_origin_utc").distinct()
 covered_origins = weather.select("respondent", "forecast_origin_utc").distinct()
 missing_origins = expected_origins.join(covered_origins, ["respondent", "forecast_origin_utc"], "left_anti")
 missing_origin_count = missing_origins.count()
@@ -149,11 +150,20 @@ if not target.limit(1).count():
         "No complete point-in-time weather training examples exist. Resume the archived "
         "weather backfill; no no-weather training fallback is allowed."
     )
-# This is a deterministic training snapshot. Replace it atomically so origins
-# newly classified as weather-incomplete cannot linger from an earlier build.
-target.write.format("delta").mode("overwrite").option(
-    "overwriteSchema", "true"
-).partitionBy("horizon_hours").saveAsTable(TARGET_TABLE)
+# Replace only the active H24 partition. Retired H168 training rows are
+# historical data and must not disappear as a side effect of this refactor.
+if spark.catalog.tableExists(TARGET_TABLE):
+    existing_columns = set(spark.table(TARGET_TABLE).columns)
+    if existing_columns != set(target.columns):
+        raise RuntimeError(
+            f"Training table schema mismatch for {TARGET_TABLE}; refusing to overwrite it. "
+            "Handle any schema migration explicitly so historical partitions are preserved."
+        )
+    target.write.format("delta").mode("overwrite").option(
+        "replaceWhere", f"horizon_hours = {HORIZON_HOURS}"
+    ).saveAsTable(TARGET_TABLE)
+else:
+    target.write.format("delta").mode("overwrite").partitionBy("horizon_hours").saveAsTable(TARGET_TABLE)
 
 summary = spark.table(TARGET_TABLE).groupBy("horizon_hours").agg(
     F.count("*").alias("rows"), F.countDistinct("forecast_origin_utc").alias("complete_origins"),

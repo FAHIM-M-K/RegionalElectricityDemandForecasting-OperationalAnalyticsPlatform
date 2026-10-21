@@ -10,33 +10,19 @@ import pandas as pd
 
 from src.shared.forecast_contract import EXAMPLE_GRAIN_KEYS, features_for_horizon
 
-DEFAULT_EXAMPLES_TABLE = "main.gold.forecast_examples"
 ROLLING_EXAMPLES_TABLE = "main.gold.forecast_examples_hourly"
 WEATHER_ROLLING_EXAMPLES_TABLE = "main.gold.forecast_examples_hourly_weather"
-ALLOWED_EXAMPLES_TABLES = {DEFAULT_EXAMPLES_TABLE, ROLLING_EXAMPLES_TABLE, WEATHER_ROLLING_EXAMPLES_TABLE}
+ALLOWED_EXAMPLES_TABLES = {ROLLING_EXAMPLES_TABLE, WEATHER_ROLLING_EXAMPLES_TABLE}
 
 
 def validate_examples_table(table_name: str) -> str:
-    """Allow only the established daily or rolling-example training source."""
+    """Allow only the active rolling demand or issue-time-weather source."""
     if table_name not in ALLOWED_EXAMPLES_TABLES:
         raise ValueError(
             f"Unsupported training source {table_name!r}; choose one of "
             f"{sorted(ALLOWED_EXAMPLES_TABLES)}."
         )
     return table_name
-
-
-def training_origin_stride_hours(horizon: int, table_name: str) -> int:
-    """Bound the hourly H168 driver dataset while retaining full issue curves.
-
-    The hourly H168 table has roughly seven times as many examples as the
-    daily-origin table. A deterministic 1-in-6 origin sample keeps all leads
-    for each selected origin and makes the driver-side LightGBM fit tractable.
-    H24 and the existing daily training source retain every available origin.
-    """
-    validate_examples_table(table_name)
-    features_for_horizon(horizon)  # Validate the horizon against the shared contract.
-    return 6 if table_name in {ROLLING_EXAMPLES_TABLE, WEATHER_ROLLING_EXAMPLES_TABLE} and horizon == 168 else 1
 
 
 def clean_training_examples(examples: pd.DataFrame, horizon: int) -> pd.DataFrame:

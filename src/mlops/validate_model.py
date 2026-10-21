@@ -1,5 +1,5 @@
 # Databricks notebook source
-"""Promote H24/H168 candidates only when they beat the matching naive baseline.
+"""Promote the H24 candidate only when it beats the matched daily baseline.
 
 Candidate selection uses rolling chronological validation metrics.  The final
 holdout is retained for reporting and does not affect model promotion.
@@ -41,7 +41,7 @@ def _report_retained_production(experiment_id: str, horizon: int) -> bool:
     policy = params.get("promotion_policy_version")
     policy_label = (f"policy {policy}" if policy == PROMOTION_POLICY_VERSION
                     else f"legacy/unrecorded policy {policy!r}")
-    baseline = "daily" if horizon == 24 else "weekly"
+    baseline = "daily"
     selection = metrics.get("selection_mae")
     naive = metrics.get("selection_baseline_mae")
     selection_text = f"{selection:,.1f}" if selection is not None and np.isfinite(selection) else "unavailable"
@@ -55,11 +55,11 @@ def _report_retained_production(experiment_id: str, horizon: int) -> bool:
 
 
 def validate_and_promote_horizon(horizon: int, candidate_run_id: str | None = None) -> bool:
+    if horizon not in HORIZONS:
+        raise ValueError(f"Unsupported horizon: {horizon}")
     experiment = client.get_experiment_by_name(EXPERIMENT_NAME)
     if experiment is None:
         raise RuntimeError(f"MLflow experiment is missing: {EXPERIMENT_NAME}")
-    if horizon not in HORIZONS:
-        raise ValueError(f"Unsupported horizon: {horizon}")
     if candidate_run_id is None:
         try:
             candidate_run_id = dbutils.jobs.taskValues.get(taskKey="retrain_model", key=f"candidate_run_id_h{horizon}", default=None)
@@ -121,7 +121,7 @@ def validate_and_promote_horizon(horizon: int, candidate_run_id: str | None = No
     if any(value is None or not np.isfinite(value) for value in (score, baseline, peak_score)):
         client.set_tag(candidate_run_id, "pipeline_role", "REJECTED_CANDIDATE")
         raise ValueError(f"H{horizon} candidate has incomplete rolling-selection metrics.")
-    baseline_name = "daily" if horizon == 24 else "weekly"
+    baseline_name = "daily"
     window_count = int(candidate.data.params.get("selection_windows", 0))
     window_metrics = []
     for window_index in range(1, window_count + 1):
@@ -185,22 +185,10 @@ def validate_and_promote_horizon(horizon: int, candidate_run_id: str | None = No
 
 
 if __name__ == "__main__":
-    decisions = {}
-    for horizon in HORIZONS:
-        decisions[horizon] = validate_and_promote_horizon(horizon)
-
+    decision = validate_and_promote_horizon(24)
     experiment = client.get_experiment_by_name(EXPERIMENT_NAME)
-    missing_production = []
-    for horizon in HORIZONS:
-        if not _compatible_production_runs(experiment.experiment_id, horizon):
-            missing_production.append(f"H{horizon}")
-    for horizon in HORIZONS:
-        status = "PROMOTED" if horizon not in missing_production and decisions[horizon] else (
-            "RETAINED EXISTING PRODUCTION" if horizon not in missing_production else "NO COMPATIBLE PRODUCTION MODEL"
-        )
-        print(f"Validation outcome H{horizon}: {status}.")
-    if missing_production:
-        print(
-            "Validation completed: " + ", ".join(missing_production) + " has no compatible promoted model. "
-            "Daily scoring requires H24; H168 will use the labeled weekly seasonal-naive fallback until promoted."
-        )
+    has_production = bool(_compatible_production_runs(experiment.experiment_id, 24))
+    status = "PROMOTED" if decision else ("RETAINED EXISTING PRODUCTION" if has_production else "NO COMPATIBLE PRODUCTION MODEL")
+    print(f"Validation outcome H24: {status}.")
+    if not has_production:
+        print("Validation completed without a compatible H24 production model; hourly scoring will remain blocked.")

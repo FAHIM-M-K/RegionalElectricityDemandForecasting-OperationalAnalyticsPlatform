@@ -4,25 +4,22 @@ import pytest
 
 from src.gold.forecast_example_features import generate_forecast_examples_df
 from src.mlops.training_data_contract import (
-    DEFAULT_EXAMPLES_TABLE,
     ROLLING_EXAMPLES_TABLE,
     clean_training_examples,
-    training_origin_stride_hours,
     validate_examples_table,
 )
 
 
 def test_training_source_allows_daily_and_hourly_tables_only():
-    assert validate_examples_table(DEFAULT_EXAMPLES_TABLE) == DEFAULT_EXAMPLES_TABLE
     assert validate_examples_table(ROLLING_EXAMPLES_TABLE) == ROLLING_EXAMPLES_TABLE
+    try:
+        validate_examples_table("main.gold.forecast_examples")
+    except ValueError as exc:
+        assert "Unsupported training source" in str(exc)
+    else:
+        raise AssertionError("Retired daily examples table was accepted as a training source.")
     with pytest.raises(ValueError, match="Unsupported training source"):
         validate_examples_table("main.gold.any_other_table")
-
-
-def test_training_origin_stride_bounds_only_the_hourly_h168_dataset():
-    assert training_origin_stride_hours(24, ROLLING_EXAMPLES_TABLE) == 1
-    assert training_origin_stride_hours(168, ROLLING_EXAMPLES_TABLE) == 6
-    assert training_origin_stride_hours(168, DEFAULT_EXAMPLES_TABLE) == 1
 
 
 def _examples():
@@ -64,11 +61,11 @@ def test_training_contract_rejects_target_misaligned_with_origin_and_lead():
 
 def test_training_contract_rejects_observation_after_forecast_origin():
     examples = _examples()
-    row_index = examples.index[examples.horizon_hours == 168][0]
+    row_index = examples.index[examples.horizon_hours == 24][0]
     examples.loc[row_index, "source_max_observation_utc"] += pd.Timedelta(hours=1)
 
     with pytest.raises(ValueError, match="after their forecast origin"):
-        clean_training_examples(examples, 168)
+        clean_training_examples(examples, 24)
 
 
 def test_training_contract_rejects_invalid_timestamp():

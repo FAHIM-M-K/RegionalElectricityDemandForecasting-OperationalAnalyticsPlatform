@@ -94,12 +94,7 @@ def compute_matched_metrics(y_true, forecasts: Dict[str, Any], peak_mask=None) -
 
 
 def compute_lead_bucket_metrics(df: pd.DataFrame, forecasts: Dict[str, Any], peak_mask=None) -> Dict[str, Dict[str, Dict[str, float]]]:
-    """Score forecasts by operational lead range using the same target rows.
-
-    H24 uses one 1–24 hour bucket. H168 separates day one, day two, and days
-    three through seven. The buckets are diagnostic only and do not affect
-    model promotion.
-    """
+    """Score the active 1–24 hour forecast on its target rows."""
     leads = pd.to_numeric(df["lead_hours"], errors="coerce").to_numpy(float)
     actual = pd.to_numeric(df["actual_demand_mw"], errors="coerce").to_numpy(float)
     peak = np.asarray(peak_mask, dtype=bool) if peak_mask is not None else None
@@ -107,12 +102,7 @@ def compute_lead_bucket_metrics(df: pd.DataFrame, forecasts: Dict[str, Any], pea
     if any(values.shape != actual.shape for values in predictions.values()):
         raise ValueError("Lead-bucket forecasts must have the same shape as actuals.")
     horizon = int(df["horizon_hours"].iloc[0]) if len(df) else 0
-    if horizon == 24:
-        buckets = {"lead_1_24": (1, 24)}
-    elif horizon == 168:
-        buckets = {"lead_1_24": (1, 24), "lead_25_48": (25, 48), "lead_49_168": (49, 168)}
-    else:
-        buckets = {f"lead_1_{horizon}": (1, horizon)}
+    buckets = {f"lead_1_{horizon}": (1, horizon)} if horizon > 0 else {}
 
     result = {}
     for bucket, (lower, upper) in buckets.items():
@@ -192,15 +182,9 @@ def compute_peak_event_metrics(df: pd.DataFrame, forecasts: Dict[str, Any]) -> D
     return result
 
 
-def compute_naive_baselines(df: pd.DataFrame, horizon: int | None = None):
-    """Return exact T-24 and T-168 benchmarks precomputed by the example builder.
-
-    These values are valid at the origin for their intended leads.  We do not
-    reconstruct them from an origin snapshot because that was the former bug.
-    """
-    daily = pd.to_numeric(df.get("daily_naive_mw"), errors="coerce").to_numpy(float)
-    weekly = pd.to_numeric(df.get("weekly_naive_mw"), errors="coerce").to_numpy(float)
-    return daily, weekly
+def compute_daily_naive_baseline(df: pd.DataFrame) -> np.ndarray:
+    """Return the issue-time-valid T-24 reference precomputed by the builder."""
+    return pd.to_numeric(df.get("daily_naive_mw"), errors="coerce").to_numpy(float)
 
 
 def generate_chronological_splits(origins: pd.Series, n_test_windows: int = 4, window_days: int = 30,

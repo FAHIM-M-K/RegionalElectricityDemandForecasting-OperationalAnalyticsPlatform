@@ -60,11 +60,11 @@ def test_complete_horizon_requires_every_lead_and_feature():
     assert coverage.loc[0, "complete_weather_horizon"]
 
 
-def test_daily_168_hour_vintage_cannot_supply_full_hourly_h168_issue():
+def test_daily_weather_vintage_cannot_supply_full_hourly_h24_issue():
     hourly_origin = pd.Timestamp("2026-01-01T01:00:00Z")
-    examples = _example_rows(hourly_origin.isoformat(), list(range(1, 169)), horizon=168)
-    # The archived daily issue at 00:00 contains targets through Jan 8 00:00.
-    # An hourly issue at 01:00 needs one more target hour than that vintage has.
+    examples = _example_rows(hourly_origin.isoformat(), list(range(1, 25)), horizon=24)
+    # The archived daily issue at 00:00 ends at Jan 2 00:00; the 01:00 issue
+    # needs targets through Jan 2 01:00, so one target hour is missing.
     weather = pd.DataFrame([
         _vintage(
             (pd.Timestamp("2026-01-01T00:00:00Z") + pd.Timedelta(hours=lead)).isoformat(),
@@ -72,12 +72,12 @@ def test_daily_168_hour_vintage_cannot_supply_full_hourly_h168_issue():
             "2025-12-31T18:00:00Z",
             60 + lead / 100,
         )
-        for lead in range(1, 169)
+        for lead in range(1, 25)
     ])
 
     _, coverage = attach_weather_asof_issue(examples, weather)
 
-    assert coverage.loc[0, "weather_rows_available"] == 167
+    assert coverage.loc[0, "weather_rows_available"] == 23
     assert not coverage.loc[0, "complete_weather_horizon"]
 
 

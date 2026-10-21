@@ -1,10 +1,9 @@
 # Databricks notebook source
-"""Build issue-time training examples for hourly rolling forecast research.
+"""Build issue-time training examples for the hourly rolling H24 forecast.
 
-Writes a separate Gold table so the existing daily-origin training table and
-the production model workflow keep their current contract. Demand history is
-loaded in bounded 30-day chunks with the exact 336-hour lookback and 168-hour
-future label halo needed to build each chunk's hourly H24/H168 examples.
+Writes the active rolling H24 training examples. Demand history is loaded in
+bounded 30-day chunks with the exact 336-hour historical lookback and a
+24-hour future label halo.
 """
 
 import os
@@ -19,7 +18,7 @@ TARGET_TABLE = f"{CATALOG}.gold.forecast_examples_hourly"
 RESPONDENT = "ERCO"
 CHUNK_DAYS = 30
 HISTORY_HOURS = 336
-MAX_HORIZON_HOURS = 168
+MAX_HORIZON_HOURS = 24
 
 spark.conf.set("spark.sql.session.timeZone", "UTC")
 _root = os.getcwd()
@@ -104,6 +103,7 @@ while chunk_start <= last_origin:
             replace_predicate = (
                 f"respondent = '{RESPONDENT}' "
                 f"AND feature_set = '{FEATURE_SET_DEMAND_FOUNDATION}' "
+                f"AND horizon_hours = {HORIZON_H24} "
                 f"AND forecast_origin_utc >= TIMESTAMP '{chunk_start:%Y-%m-%d %H:%M:%S}' "
                 f"AND forecast_origin_utc < TIMESTAMP '{chunk_end:%Y-%m-%d %H:%M:%S}'"
             )

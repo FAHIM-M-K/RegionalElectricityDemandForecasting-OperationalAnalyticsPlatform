@@ -108,7 +108,7 @@
     },
     {
       "task_key": "score_forecast_hourly",
-      "description": "Issues rolling H24 and H168 forecast curves from the latest valid demand origin; atomic latest publish and append-only history.",
+      "description": "Issues one rolling H24 forecast curve from the latest valid demand origin; atomically publishes the 24 active leads and appends issue history.",
       "run_if": "AT_LEAST_ONE_SUCCESS",
       "depends_on": [
         {
@@ -145,7 +145,7 @@
     },
     {
       "task_key": "evaluate_benchmarks",
-      "description": "Materializes fair as-of H24 versus EIA and H168 versus the weekly seasonal-naive baseline; adds ERCOT only when authorized issue-vintage data is available. Reports pending until matched targets mature.",
+      "description": "Materializes issue-time-matched H24 versus EIA metrics. Reports remain pending until matched forecast targets mature; no external ERCOT issue-vintage feed is configured.",
       "depends_on": [
         {
           "task_key": "monitor_forecasts"

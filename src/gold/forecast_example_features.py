@@ -5,14 +5,13 @@ the isolated hourly weather backtest can import the same implementation.
 """
 
 import math
-from typing import Iterable
 
 import numpy as np
 import pandas as pd
 
 from src.shared.forecast_contract import (
     DEMAND_MAX_VALID_MW, DEMAND_MIN_VALID_MW, EXAMPLE_GRAIN_KEYS,
-    FEATURE_SCHEMA_VERSION, FEATURE_SET_DEMAND_FOUNDATION, HORIZONS, LEAD_HOURS,
+    FEATURE_SCHEMA_VERSION, FEATURE_SET_DEMAND_FOUNDATION, HORIZON_H24, LEAD_HOURS,
     features_for_horizon,
 )
 
@@ -42,7 +41,7 @@ def _exact_window(values: dict, origin: pd.Timestamp, hours: int) -> np.ndarray 
     return np.asarray(result, dtype=float)
 
 
-def _examples_for_respondent(df: pd.DataFrame, horizons: Iterable[int], step_hours: int) -> list[dict]:
+def _examples_for_respondent(df: pd.DataFrame, step_hours: int) -> list[dict]:
     df = df.copy()
     df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
     duplicated = df.loc[df["timestamp_utc"].duplicated(keep=False), "timestamp_utc"]
@@ -60,14 +59,13 @@ def _examples_for_respondent(df: pd.DataFrame, horizons: Iterable[int], step_hou
     emergency_values = df["is_grid_emergency"] if "is_grid_emergency" in df else pd.Series(False, index=df.index)
     emergencies = dict(zip(df["timestamp_utc"], emergency_values.astype(bool)))
     respondent = str(df["respondent"].iloc[0])
-    max_horizon = max(horizons)
     origins = df["timestamp_utc"].iloc[::step_hours]
     rows: list[dict] = []
 
     for origin in origins:
         if origin - pd.Timedelta(hours=336) not in values:
             continue
-        if origin + pd.Timedelta(hours=max_horizon) not in values:
+        if origin + pd.Timedelta(hours=HORIZON_H24) not in values:
             continue
         history24, history168 = _exact_window(values, origin, 24), _exact_window(values, origin, 168)
         if history24 is None or history168 is None:
@@ -92,60 +90,53 @@ def _examples_for_respondent(df: pd.DataFrame, horizons: Iterable[int], step_hou
         ):
             continue
 
-        for horizon in horizons:
-            for lead in LEAD_HOURS[horizon]:
-                target = origin + pd.Timedelta(hours=lead)
-                actual = values.get(target, np.nan)
-                if emergencies.get(target, False):
-                    continue
-                row = {
-                    "respondent": respondent,
-                    "forecast_origin_utc": origin,
-                    "target_timestamp_utc": target,
-                    "horizon_hours": horizon,
-                    "lead_hours": lead,
-                    "feature_set": FEATURE_SET_DEMAND_FOUNDATION,
-                    "feature_schema_version": "demand_foundation_v1",
-                    "source_max_observation_utc": origin,
-                    "actual_demand_mw": actual,
-                    "daily_naive_mw": values.get(target - pd.Timedelta(hours=24), np.nan) if lead <= 24 else np.nan,
-                    "weekly_naive_mw": values.get(target - pd.Timedelta(hours=168), np.nan),
-                    "eia_day_ahead_forecast_mw": eia.get(target, np.nan),
-                    **_calendar_features(target, holidays),
-                    **snapshot,
-                }
-                row["seasonal_naive_mw"] = row["daily_naive_mw"] if horizon == 24 else row["weekly_naive_mw"]
-                # This table is the demand-only rolling example foundation.
-                # Weather is attached from archived issue-time vintages by the
-                # dedicated training-table builder, never from realized weather.
-                required = features_for_horizon(horizon, include_weather=False)
-                row["is_valid_training_example"] = bool(
-                    pd.notna(actual)
-                    and DEMAND_MIN_VALID_MW <= actual <= DEMAND_MAX_VALID_MW
-                    and not any(pd.isna(row[column]) for column in required)
-                )
-                rows.append(row)
+        for lead in LEAD_HOURS[HORIZON_H24]:
+            target = origin + pd.Timedelta(hours=lead)
+            actual = values.get(target, np.nan)
+            if emergencies.get(target, False):
+                continue
+            row = {
+                "respondent": respondent,
+                "forecast_origin_utc": origin,
+                "target_timestamp_utc": target,
+                "horizon_hours": HORIZON_H24,
+                "lead_hours": lead,
+                "feature_set": FEATURE_SET_DEMAND_FOUNDATION,
+                "feature_schema_version": "demand_foundation_v1",
+                "source_max_observation_utc": origin,
+                "actual_demand_mw": actual,
+                "daily_naive_mw": values.get(target - pd.Timedelta(hours=24), np.nan),
+                "eia_day_ahead_forecast_mw": eia.get(target, np.nan),
+                **_calendar_features(target, holidays),
+                **snapshot,
+            }
+            row["seasonal_naive_mw"] = row["daily_naive_mw"]
+            required = features_for_horizon(HORIZON_H24, include_weather=False)
+            row["is_valid_training_example"] = bool(
+                pd.notna(actual)
+                and DEMAND_MIN_VALID_MW <= actual <= DEMAND_MAX_VALID_MW
+                and not any(pd.isna(row[column]) for column in required)
+            )
+            rows.append(row)
     return rows
 
 
 def generate_forecast_examples_df(
     df_demand: pd.DataFrame,
-    horizons: list[int] | None = None,
     step_hours: int = 24,
 ) -> pd.DataFrame:
-    """Create direct H24/H168 examples at a configurable origin cadence."""
+    """Create rolling H24 examples at a configurable origin cadence."""
     required = {"respondent", "timestamp_utc", "actual_demand_mw"}
     missing = required - set(df_demand.columns)
     if missing:
         raise ValueError(f"Forecast example source is missing columns: {sorted(missing)}")
-    horizons = HORIZONS if horizons is None else horizons
-    if not set(horizons).issubset(HORIZONS) or step_hours < 1:
-        raise ValueError("Use supported horizons and a positive origin cadence.")
+    if step_hours < 1:
+        raise ValueError("Origin cadence must be a positive number of hours.")
     frame = df_demand.copy()
     frame["timestamp_utc"] = pd.to_datetime(frame["timestamp_utc"], utc=True)
     rows = []
     for _, group in frame.groupby("respondent", sort=False):
-        rows.extend(_examples_for_respondent(group, horizons, step_hours))
+        rows.extend(_examples_for_respondent(group, step_hours))
     result = pd.DataFrame(rows)
     if not result.empty and result.duplicated(EXAMPLE_GRAIN_KEYS).any():
         raise ValueError("Duplicate forecast-example natural keys were generated.")
