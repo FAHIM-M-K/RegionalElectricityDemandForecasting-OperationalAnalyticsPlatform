@@ -187,8 +187,8 @@ if not target.limit(1).count() and not target_exists:
         "weather backfill; no no-weather training fallback is allowed."
     )
 # Replace only the recent correction window in the active H24 partition.
-# Retired H168 and older H24 rows remain intact; a stale watermark naturally
-# widens this range after a missed monthly run.
+# Older origins remain intact; a stale watermark naturally widens this range
+# after a missed monthly run.
 if target_exists:
     existing_columns = set(spark.table(TARGET_TABLE).columns)
     if existing_columns != set(target.columns):

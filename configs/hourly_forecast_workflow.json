@@ -142,6 +142,21 @@
       },
       "timeout_seconds": 600,
       "max_retries": 1
+    },
+    {
+      "task_key": "evaluate_benchmarks",
+      "description": "Compares the latest served 24-hour ERCOT forecast with EIA on matched target hours after actuals mature.",
+      "depends_on": [
+        {
+          "task_key": "monitor_forecasts"
+        }
+      ],
+      "notebook_task": {
+        "notebook_path": "src/gold/benchmark_evaluation_task",
+        "source": "GIT"
+      },
+      "timeout_seconds": 900,
+      "max_retries": 1
     }
   ],
   "format": "MULTI_TASK"

@@ -182,7 +182,7 @@ def test_promotion_gate_rejects_insufficient_or_incomplete_windows():
     assert incomplete["reason"] == "selection window metrics are incomplete"
 
 
-def test_h168_candidate_is_rejected_as_unsupported(monkeypatch):
+def test_nonproduction_horizon_candidate_is_rejected(monkeypatch):
     fake_mlflow = SimpleNamespace(tracking=SimpleNamespace(MlflowClient=lambda: None))
     monkeypatch.setitem(__import__("sys").modules, "mlflow", fake_mlflow)
     module_path = Path("src/mlops/validate_model.py")
@@ -191,11 +191,11 @@ def test_h168_candidate_is_rejected_as_unsupported(monkeypatch):
     spec.loader.exec_module(validator)
 
     try:
-        validator.validate_and_promote_horizon(168, "retired-h168-run")
+        validator.validate_and_promote_horizon(48, "unsupported-run")
     except ValueError as exc:
-        assert "Unsupported horizon: 168" in str(exc)
+        assert "Unsupported horizon: 48" in str(exc)
     else:
-        raise AssertionError("The validator accepted a retired H168 candidate.")
+        raise AssertionError("The validator accepted a nonproduction horizon.")
 
 
 def test_scoring_issues_only_the_h24_product():
@@ -328,11 +328,11 @@ def test_validate_forecast_issue_frame_enforces_complete_curves_and_bounds():
     valid_h24 = issue_rows(24, 50_000.0)
     validate_forecast_issue_frame(valid_h24)
     try:
-        validate_forecast_issue_frame(issue_rows(168, 52_000.0))
+        validate_forecast_issue_frame(issue_rows(48, 52_000.0))
     except ValueError as exc:
         assert "Unsupported" in str(exc) or "Invalid" in str(exc)
     else:
-        raise AssertionError("Retired H168 forecast rows passed serving validation.")
+        raise AssertionError("Unsupported forecast rows passed serving validation.")
 
     # Incomplete curve
     try:

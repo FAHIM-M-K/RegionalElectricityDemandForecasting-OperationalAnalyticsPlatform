@@ -192,8 +192,8 @@ print(
 )
 complete_archive_origins = set()
 if spark.catalog.tableExists(TARGET_TABLE):
-    # Existing archives may contain the retired 168-hour path. The first 24
-    # targets are sufficient for H24; validate that exact active curve.
+    # Archived weather snapshots may contain extra forecast hours. Validate
+    # only the exact 24 target hours required by the active forecast.
     target_weather = spark.table(TARGET_TABLE).filter(
         (F.col("respondent") == "ERCO")
         & (F.col("forecast_origin_utc") >= F.lit(ARCHIVE_START_UTC))
