@@ -20,7 +20,7 @@ The report is designed to move from the current system outlook to historical con
 
 The current system outlook, forecast peak and timing, latest observed demand, and the available EIA reference.
 
-(![Executive Forecast](image.png))
+![Executive Forecast](ExecutiveForecast.png)
 
 ### Historical Demand and Benchmarks
 
