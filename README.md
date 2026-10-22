@@ -113,8 +113,3 @@ python -m pytest -q
 ```
 
 These checks cover deterministic local code. They do not execute Databricks workflows, validate live Unity Catalog tables, measure cloud compute, or refresh the Power BI semantic model.
-
-## Further reading
-
-- [Project guide](docs/project_guide.md) — detailed data contracts, workflows, modeling choices, and operational notes.
-- [Remaining-work handoff](docs/things_to_fix.md) — current decisions, open verification items, and the safe sequence for future changes.
