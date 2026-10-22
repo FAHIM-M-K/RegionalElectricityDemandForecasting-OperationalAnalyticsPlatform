@@ -23,31 +23,31 @@ The report uses Central Time for Texas-facing timestamps. Forecast and observed 
 
 Shows the next 24 hours of system demand, expected peak and timing, the latest observed value, and the time through which actuals are available.
 
-![Executive Forecast](1_ExecutiveForecast.png)
+![Executive Forecast](images/powerbi/1_ExecutiveForecast.png)
 
 ### Historical demand
 
 Shows long-term demand levels, annual peaks, seasonal patterns, and hourly demand shape.
 
-![Historical Demand](2_Demand.png)
+![Historical Demand](images/powerbi/2_Demand.png)
 
 ### Weather and demand patterns
 
 Explores the relationship between observed load and population-weighted weather, along with seasonal and hourly demand patterns.
 
-![Weather and Demand Patterns](3_Weather.png)
+![Weather and Demand Patterns](images/powerbi/3_Weather.png)
 
 ### Observed regional zonal demand
 
 Shows observed ERCOT weather-zone load on a Texas map and in a zone summary. Selecting a zone filters zonal visuals; the system-wide demand trend remains system-wide.
 
-![Observed Regional Zonal Demand](4_Observed.png)
+![Observed Regional Zonal Demand](images/powerbi/4_Observed.png)
 
 ### Forecast reliability
 
 Shows model error against matured actual demand by forecast lead and target period. A missing or pending score means there are not yet enough eligible forecast/actual pairs for that slice; it is not a zero-error result.
 
-![Forecast Reliability](5_Reliability.png)
+![Forecast Reliability](images/powerbi/5_Reilability.png)
 
 ## Databricks workflows
 
@@ -57,19 +57,19 @@ The workflows separate recurring forecast serving, slower supporting data update
 
 Refreshes issue-time weather and EIA actual demand, updates the conformed and Gold demand facts, checks model readiness, publishes the rolling 24-hour forecast, and refreshes forecast monitoring metrics.
 
-![Three-hour forecast and monitoring workflow](6_Job_Hour_3.png)
+![Three-hour forecast and monitoring workflow](images/databricks/Job_Hour_3.png)
 
 ### Daily supporting-data refresh
 
 Refreshes supporting weather history and observed zonal demand, then updates the zonal summary used by Power BI.
 
-![Daily data refresh workflow](7_Job_Daily.png)
+![Daily data refresh workflow](images/databricks/Job_Daily.png)
 
 ### Monthly model retraining
 
 Builds point-in-time training examples, trains a candidate model, evaluates it on chronological validation and holdout periods, and applies the configured promotion checks.
 
-![Monthly model retraining workflow](8_ERCOT_M.png)
+![Monthly model retraining workflow](images/databricks/ERCOT_M.png)
 
 ## Data flow and design
 
