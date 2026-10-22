@@ -141,7 +141,16 @@ def match_h24_and_eia(
     matched["eia_abs_error_mw"] = matched["eia_error_mw"].abs()
 
     if headline_policy == "lead_24":
-        headline = matched[matched["lead_hours"] == 24]
+        # Reissued forecasts can produce multiple lead-24 rows for one target.
+        # Score each target once, using the latest issued eligible forecast.
+        headline = matched[matched["lead_hours"] == 24].copy()
+        sort_by = ["respondent", "target_timestamp_utc", "issued_at_utc", "forecast_origin_utc"]
+        if "forecast_issue_id" in headline:
+            sort_by.append("forecast_issue_id")
+        headline = headline.sort_values(sort_by).drop_duplicates(
+            ["respondent", "target_timestamp_utc"], keep="last"
+        )
+        _require_unique(headline, ["respondent", "target_timestamp_utc"], "H24 benchmark headline")
     elif headline_policy == "all_leads":
         sort_by = ["target_timestamp_utc", "issued_at_utc", "forecast_origin_utc"]
         if "forecast_issue_id" in matched:
@@ -157,7 +166,7 @@ def match_h24_and_eia(
 
     return matched, {
         "status": "EVALUATED",
-        "matched_rows": int(len(headline)),
+        "matched_rows": int(headline["target_timestamp_utc"].nunique()),
         "unique_targets": int(headline["target_timestamp_utc"].nunique()),
         "model_mae_mw": round(float(headline["model_abs_error_mw"].mean()), 2),
         "eia_mae_mw": round(float(headline["eia_abs_error_mw"].mean()), 2),
