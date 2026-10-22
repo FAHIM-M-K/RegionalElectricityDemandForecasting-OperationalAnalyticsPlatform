@@ -20,31 +20,31 @@ The report is designed to move from the current system outlook to historical con
 
 The current system outlook, forecast peak and timing, latest observed demand, and the available EIA reference.
 
-![Executive Forecast](ExecutiveForecast.png)
+![Executive Forecast](1_ExecutiveForecast.png)
 
 ### Historical Demand and Benchmarks
 
 Longer-term demand patterns, annual peaks, seasonal context, and historical EIA forecast error.
 
-![Historical Demand and Benchmarks](image-1.png)
+![Historical Demand and Benchmarks](2_Demand.png)
 
 ### Weather and Demand Patterns
 
 Observed demand patterns across temperature ranges, seasons, and times of day.
 
-![Weather and Demand Patterns](image-2.png)
+![Weather and Demand Patterns](3_Weather.png)
 
 ### Observed Regional Zonal Demand
 
 Observed load by ERCOT weather zone, with a Texas map and zone-level summary.
 
-![Observed Regional Zonal Demand](image-3.png)
+![Observed Regional Zonal Demand](4_Observed.png)
 
 ### Forecast Reliability
 
 Forecast error by lead time and the matched comparison between the model and EIA.
 
-![Forecast Reliability](image-4.png)
+![Forecast Reliability](5_Reliability.png)
 
 ## Databricks workflows
 
@@ -54,19 +54,19 @@ The workflows separate frequent forecast serving from slower retrospective updat
 
 Refreshes issue-time inputs, updates the demand fact, checks serving readiness, publishes the H24 forecast, and updates monitoring metrics.
 
-![Three-hour forecast and monitoring workflow](image-5.png)
+![Three-hour forecast and monitoring workflow](6_Job_Hour_3.png.png)
 
 ### Daily data refresh and benchmark evaluation
 
 Refreshes weather and observed zonal data, builds zonal summaries, and evaluates the H24 forecast against EIA when matched actuals are mature.
 
-![Daily data refresh and benchmark evaluation workflow](image-6.png)
+![Daily data refresh and benchmark evaluation workflow](7_Job_Daily.png)
 
 ### Monthly model retraining
 
 Builds training examples, trains a candidate model, validates it, and promotes it only when it passes the configured selection gate.
 
-![Monthly model retraining workflow](image-7.png)
+![Monthly model retraining workflow](8_ERCOT_M.png)
 
 ## Data and architecture
 
