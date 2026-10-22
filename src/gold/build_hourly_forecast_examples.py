@@ -19,7 +19,7 @@ RESPONDENT = "ERCO"
 CHUNK_DAYS = 30
 HISTORY_HOURS = 336
 MAX_HORIZON_HOURS = 24
-CORRECTION_LOOKBACK_DAYS = 7  # EIA restatements plus 24h labels and margin
+CORRECTION_LOOKBACK_DAYS = 7  # Actual-demand revisions plus 24h labels and margin
 
 spark.conf.set("spark.sql.session.timeZone", "UTC")
 _root = os.getcwd()
@@ -40,7 +40,7 @@ def _as_utc(value) -> pd.Timestamp:
 
 
 required_columns = {
-    "respondent", "timestamp_utc", "actual_demand_mw", "day_ahead_forecast_mw",
+    "respondent", "timestamp_utc", "actual_demand_mw",
     "is_holiday", "is_grid_emergency",
 }
 available_columns = set(spark.table(SOURCE_TABLE).columns)

@@ -1,101 +1,104 @@
 # ERCOT Demand Forecasting and Operational Analytics
 
-I built this project to turn ERCOT demand, weather, and regional load data into a reliable hourly demand outlook and analysis people can use. It brings together a Databricks lakehouse, a 24-hour-ahead system-demand model, forecast monitoring, and a five-page Power BI report.
+This project builds an hourly, system-wide ERCOT electricity-demand forecast and an analytics layer for understanding observed demand. It uses a Databricks lakehouse for ingestion and processing, a LightGBM model for forecasting, and Power BI for operational and historical analysis.
 
-The forecast is for **ERCOT system-wide demand**. The regional page shows observed demand by weather zone; it does not present zonal forecasts.
+The forecast is for ERCOT as a whole. The zone page reports observed zonal load; it does not claim to forecast demand by zone.
 
-## What it does
+## What the project does
 
-- Refreshes a rolling 24-hour system-demand forecast every three hours.
-- Predicts a correction to the demand observed at the same hour on the previous day, using LightGBM, demand history, calendar features, and weather information available at forecast issue time.
-- Preserves forecast issues and checks their errors against actual demand as the actuals become available.
-- Compares the model with EIA's day-ahead forecast on the same target hours when both forecasts and actuals are available.
-- Provides historical, weather, regional-demand, and forecast-reliability views in Power BI.
+- Ingests EIA-930 actual system demand, weather forecasts, and observed ERCOT weather-zone demand.
+- Cleans and conforms source data, retaining UTC timestamps for joins and Central Time for Texas-facing reporting.
+- Produces a rolling 24-hour system-demand forecast every three hours, with issue-time weather features and historical demand context.
+- Evaluates issued forecasts against actual demand after the target hours become available, including error by forecast lead.
+- Uses chronological validation, a final holdout period, and a seasonal-naive reference during model selection.
+- Presents current forecasts, actual demand, weather patterns, observed zonal loads, and model reliability in Power BI.
+
+EIA day-ahead forecasts are not used as a model input or comparison. EIA actual demand remains the source of observed outcomes and model labels. The EIA-930 documentation distinguishes actual demand from a balancing authority's submitted day-ahead forecast, and notes that demand data can be revised after initial publication. The project therefore scores forecasts against observed actuals as they mature and keeps their timestamps explicit.
 
 ## Power BI report
 
-The report is designed to move from the current system outlook to historical context, weather relationships, observed regional load, and forecast accuracy.
+The report uses Central Time for Texas-facing timestamps. Forecast and observed values are distinct series: forecasts describe future demand, while actuals describe published outcomes.
 
-### Executive Forecast
+### Executive forecast
 
-The current system outlook, forecast peak and timing, latest observed demand, and the available EIA reference.
+Shows the next 24 hours of system demand, expected peak and timing, the latest observed value, and the time through which actuals are available.
 
 ![Executive Forecast](1_ExecutiveForecast.png)
 
-### Historical Demand and Benchmarks
+### Historical demand
 
-Longer-term demand patterns, annual peaks, seasonal context, and historical EIA forecast error.
+Shows long-term demand levels, annual peaks, seasonal patterns, and hourly demand shape.
 
-![Historical Demand and Benchmarks](2_Demand.png)
+![Historical Demand](2_Demand.png)
 
-### Weather and Demand Patterns
+### Weather and demand patterns
 
-Observed demand patterns across temperature ranges, seasons, and times of day.
+Explores the relationship between observed load and population-weighted weather, along with seasonal and hourly demand patterns.
 
 ![Weather and Demand Patterns](3_Weather.png)
 
-### Observed Regional Zonal Demand
+### Observed regional zonal demand
 
-Observed load by ERCOT weather zone, with a Texas map and zone-level summary.
+Shows observed ERCOT weather-zone load on a Texas map and in a zone summary. Selecting a zone filters zonal visuals; the system-wide demand trend remains system-wide.
 
 ![Observed Regional Zonal Demand](4_Observed.png)
 
-### Forecast Reliability
+### Forecast reliability
 
-Forecast error by lead time and the matched comparison between the model and EIA.
+Shows model error against matured actual demand by forecast lead and target period. A missing or pending score means there are not yet enough eligible forecast/actual pairs for that slice; it is not a zero-error result.
 
 ![Forecast Reliability](5_Reliability.png)
 
 ## Databricks workflows
 
-The workflows separate frequent forecast serving from slower retrospective updates and monthly model retraining.
+The workflows separate recurring forecast serving, slower supporting data updates, and model retraining.
 
 ### Three-hour forecast and monitoring
 
-Refreshes issue-time inputs, updates the demand fact, checks serving readiness, publishes the H24 forecast, and updates monitoring metrics.
+Refreshes issue-time weather and EIA actual demand, updates the conformed and Gold demand facts, checks model readiness, publishes the rolling 24-hour forecast, and refreshes forecast monitoring metrics.
 
-![Three-hour forecast and monitoring workflow](6_Job_Hour_3.png.png)
+![Three-hour forecast and monitoring workflow](6_Job_Hour_3.png)
 
-### Daily data refresh and benchmark evaluation
+### Daily supporting-data refresh
 
-Refreshes weather and observed zonal data, builds zonal summaries, and evaluates the H24 forecast against EIA when matched actuals are mature.
+Refreshes supporting weather history and observed zonal demand, then updates the zonal summary used by Power BI.
 
-![Daily data refresh and benchmark evaluation workflow](7_Job_Daily.png)
+![Daily data refresh workflow](7_Job_Daily.png)
 
 ### Monthly model retraining
 
-Builds training examples, trains a candidate model, validates it, and promotes it only when it passes the configured selection gate.
+Builds point-in-time training examples, trains a candidate model, evaluates it on chronological validation and holdout periods, and applies the configured promotion checks.
 
 ![Monthly model retraining workflow](8_ERCOT_M.png)
 
-## Data and architecture
+## Data flow and design
 
 ```text
-EIA-930 ───────────────┐
-Open-Meteo weather ────┼──> Bronze: source-aligned raw data
-ERCOT zonal demand ────┘                │
-                                        v
+EIA-930 actual demand ─┐
+Weather forecasts ─────┼──> Bronze: source-aligned records
+ERCOT zone actuals ────┘                 │
+                                         v
                               Silver: cleaned and conformed
-                                        │
-                                        v
+                                         │
+                                         v
                               Gold: analytics and serving
-                               ├─ demand and forecast facts
-                               ├─ training and scoring data
-                               ├─ forecast monitoring
-                               ├─ H24/EIA benchmark results
+                               ├─ observed demand facts
+                               ├─ point-in-time training data
+                               ├─ hourly forecast history/latest
+                               ├─ forecast monitoring metrics
                                └─ observed zonal summaries
-                                        │
-                                        v
-                                    Power BI
+                                         │
+                                         v
+                                     Power BI
 ```
 
-Spark and Delta Lake handle distributed ingestion, transformations, joins, data checks, and table writes. Processing follows Bronze, Silver, and Gold layers so raw source records remain separate from cleaned data and business-ready outputs. Forecasts retain their issue times, and model features are limited to information available at that issue time to reduce look-ahead leakage. UTC is used for storage and matching; Central Time is used for Texas-facing time labels and local calendar features.
+Spark and Delta Lake handle distributed transformations and table writes. Bronze preserves source-aligned records; Silver applies standardization and data-quality rules; Gold contains serving and analytical products. Forecast features are limited to information available at the forecast origin to reduce look-ahead leakage. UTC timestamps define storage and matching; Central Time supports local calendar features and report labels.
 
 ## Forecast evaluation
 
-The model's mean absolute error (MAE), root mean squared error (RMSE), and bias are calculated against matured actual demand. The EIA forecast is scored against those same actual target hours. Lower MAE and RMSE indicate smaller errors; negative bias means underforecasting.
+For each eligible forecast and target hour, the project compares predicted demand with the EIA-reported actual demand for that same target. MAE describes typical absolute error, RMSE gives larger misses more weight, and signed bias indicates average over- or under-forecast. Scores should be read with the number of evaluated rows, the forecast lead, the model version, and the actual-data watermark. EIA actuals may be revised after initial publication, so evaluation is retrospective and can change as corrected actuals arrive.
 
-The comparison uses the same target hours, but the forecasts have different lead times: the model is issued 24 hours ahead, while EIA's day-ahead forecast is generally available closer to delivery. It is an operational comparison, not an equal-lead model experiment. The latest saved sample contains **12 matched target hours**; in that sample, the model's errors are higher than EIA's. This is an early result and too small to establish stable long-run performance. Scores should be interpreted alongside the matched-hour count and updated as more actuals mature.
+Model selection uses chronological rolling windows and a held-out final period rather than a random row split. A seasonal-naive forecast is used as a reference during training and promotion analysis. This is not a claim that the model beats an external EIA forecast; that comparison was removed because the available EIA-930 forecast is not a verified same-issue-time, same-lead benchmark for this project's forecast.
 
 ## Technology
 
@@ -103,14 +106,15 @@ The comparison uses the same target hours, but the forecasts have different lead
 
 ## Local checks
 
-From the repository root, run the Python contract tests with:
+Run the local Python checks from the repository root:
 
 ```powershell
 python -m pytest -q
 ```
 
-These tests cover local deterministic code. They do not run Databricks jobs, verify live Unity Catalog tables, measure compute usage, or refresh the Power BI report.
+These checks cover deterministic local code. They do not execute Databricks workflows, validate live Unity Catalog tables, measure cloud compute, or refresh the Power BI semantic model.
 
-## Project guide
+## Further reading
 
-See [the project guide](docs/project_guide.md) for detailed data contracts, workflow dependencies, modeling choices, known limitations, and guidance for future changes.
+- [Project guide](docs/project_guide.md) — detailed data contracts, workflows, modeling choices, and operational notes.
+- [Remaining-work handoff](docs/things_to_fix.md) — current decisions, open verification items, and the safe sequence for future changes.

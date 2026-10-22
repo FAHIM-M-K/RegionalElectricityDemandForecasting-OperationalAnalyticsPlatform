@@ -17,7 +17,7 @@
 # MAGIC 5. **Candidate Quality Gate & Idempotent Delta MERGE:** Validate the changed slice before the atomic write; periodic full reconciliation belongs in a separate maintenance run, not every serving run.
 # MAGIC
 # MAGIC ### Design Decisions:
-# MAGIC - **No business metrics here.** `day_ahead_error_mw` and `eia_day_ahead_ape_pct` belong in Gold (analytical derivations, not conformance).
+# MAGIC - **Observed demand only.** EIA actual demand is conformed with weather and calendar data; forecast benchmark fields are not part of this product.
 # MAGIC - **BA code from config.** Weather-only rows get their respondent from `ercot_config.json`, not a hardcoded string.
 # MAGIC - **`is_valid_demand` stays NULL for absent rows.** NULL = 'no data', False = 'data exists but is invalid'. Silver doesn't interpret absence.
 # MAGIC - **Failure Semantics:** Delta MERGE is atomic. Candidate assertions run before commit; a failed assertion prevents downstream Gold tasks from consuming the candidate.
@@ -92,20 +92,18 @@ assert df_demand.filter(F.col("actual_demand_mw").isNotNull()).limit(1).count() 
 )
 
 target_exists = spark.catalog.tableExists(TARGET_TABLE)
-target_cols = spark.table(TARGET_TABLE).columns if target_exists else []
-legacy_cols = [c for c in ["eia_day_ahead_ape_pct", "day_ahead_error_mw"] if c in target_cols]
 last_actual_timestamp = None
-if target_exists and not legacy_cols:
+if target_exists:
     last_actual_timestamp = (
         spark.table(TARGET_TABLE)
         .filter(F.col("actual_demand_mw").isNotNull())
         .agg(F.max("timestamp_utc").alias("last_actual_timestamp"))
         .first()["last_actual_timestamp"]
     )
-requires_full_rebuild = not target_exists or bool(legacy_cols) or last_actual_timestamp is None
+requires_full_rebuild = not target_exists or last_actual_timestamp is None
 cutoff_utc = None
 if requires_full_rebuild:
-    print("Full conformed Silver build required for initial creation, empty target, or legacy schema migration.")
+    print("Full conformed Silver build required for initial creation or empty target.")
 else:
     cutoff_utc = last_actual_timestamp - datetime.timedelta(days=RESTATEMENT_BUFFER_DAYS)
     df_demand = df_demand.filter(F.col("timestamp_utc") >= F.lit(cutoff_utc))
@@ -150,7 +148,6 @@ def build_conformed_dataset(df_demand, df_weather, df_calendar, ba_code=BA_CODE)
 
         # Electricity Metrics & Quality Flags
         F.col("d.actual_demand_mw"),
-        F.col("d.day_ahead_forecast_mw"),
         F.when(F.col("d.actual_demand_mw").isNotNull(), F.col("d.is_valid_demand")).alias("is_valid_demand"),
         F.col("d.anomaly_flag"),
 
@@ -233,41 +230,27 @@ def upsert_conformed_table(df_conformed, target_table, spark_session):
         print(f"Initialized Silver conformed table {target_table}.")
     else:
         delta_target = DeltaTable.forName(spark_session, target_table)
-        target_cols = [c.name for c in delta_target.toDF().schema]
+        merge_condition = (
+            "target.respondent = source.respondent "
+            "AND target.timestamp_utc = source.timestamp_utc"
+        )
+        if cutoff_utc is not None:
+            merge_condition += f" AND target.timestamp_utc >= TIMESTAMP '{cutoff_utc.strftime('%Y-%m-%d %H:%M:%S')}'"
 
-        # Schema Migration Check:
-        # If legacy business metrics (e.g. eia_day_ahead_ape_pct, day_ahead_error_mw) exist in target,
-        # overwrite schema to align with Medallion rules (business metrics moved to Gold).
-        legacy_cols = [c for c in ["eia_day_ahead_ape_pct", "day_ahead_error_mw"] if c in target_cols]
-        if legacy_cols:
-            print(f"Migrating Silver conformed schema: removing {legacy_cols} from {target_table}...")
-            df_conformed.write \
-                .format("delta") \
-                .mode("overwrite") \
-                .option("overwriteSchema", "true") \
-                .saveAsTable(target_table)
-            print(f"Successfully migrated and overwritten {target_table} to clean Silver schema.")
-        else:
-            merge_condition = (
-                "target.respondent = source.respondent "
-                "AND target.timestamp_utc = source.timestamp_utc"
-            )
-            if cutoff_utc is not None:
-                merge_condition += f" AND target.timestamp_utc >= TIMESTAMP '{cutoff_utc.strftime('%Y-%m-%d %H:%M:%S')}'"
+        # Exclude keys and processing timestamp from change detection to prevent unconditional file churn (H-01)
+        business_cols = [c for c in df_conformed.columns if c not in ["respondent", "timestamp_utc", "_conformed_at_utc"]]
+        update_condition = " OR ".join([f"NOT (target.{c} <=> source.{c})" for c in business_cols])
 
-            # Exclude keys and processing timestamp from change detection to prevent unconditional file churn (H-01)
-            business_cols = [c for c in df_conformed.columns if c not in ["respondent", "timestamp_utc", "_conformed_at_utc"]]
-            update_condition = " OR ".join([f"NOT (target.{c} <=> source.{c})" for c in business_cols])
-
-            # When matched and business columns changed, refresh non-key fields.
-            merge_source_columns(
-                delta_target,
-                df_conformed,
-                merge_condition,
-                update_condition=update_condition,
-                update_exclude=("respondent", "timestamp_utc"),
-            )
-            print(f"Idempotent MERGE successfully executed on {target_table}.")
+        # Nullable legacy columns remain inert on existing rows and null on new rows;
+        # do not trigger a full-history rewrite just to remove unused physical fields.
+        merge_source_columns(
+            delta_target,
+            df_conformed,
+            merge_condition,
+            update_condition=update_condition,
+            update_exclude=("respondent", "timestamp_utc"),
+        )
+        print(f"Idempotent MERGE successfully executed on {target_table}.")
 
 
 # COMMAND ----------

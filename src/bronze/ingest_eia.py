@@ -1,12 +1,11 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # 01. EIA Electricity Load & Forecast Ingestion
+# MAGIC # EIA Actual Electricity Demand Ingestion
 # MAGIC
 # MAGIC **Source:** U.S. Energy Information Administration (EIA) Open Data API v2 (Form EIA-930)
 # MAGIC **Target:** `bronze.eia_hourly_raw`
 # MAGIC **Series:**
 # MAGIC - `D` = Actual Electricity Demand (MWh)
-# MAGIC - `DF` = Day-Ahead Demand Forecast (MWh)
 # MAGIC **Region:** ERCOT (`ERCO`)
 
 # COMMAND ----------
@@ -17,7 +16,6 @@ import time
 import datetime
 import urllib.request
 import urllib.parse
-import hashlib
 from pyspark.sql import functions as F
 from delta.tables import DeltaTable
 
@@ -59,14 +57,14 @@ for _ in range(5):
     _repo_root = _parent
 from configs.loader import load_platform_config
 from src.shared.delta_merge import merge_source_columns
-from src.shared.eia_time import operating_day_end_utc
 
 config = load_platform_config("ercot_config.json")
 eia_cfg = config.get("eia", {})
-REGION_TIMEZONE = config.get("region", {}).get("timezone", "America/Chicago")
 RESTATEMENT_BUFFER_DAYS = int(eia_cfg.get("restatement_buffer_days", 5))
 EIA_RESPONDENT = eia_cfg.get("respondent", "ERCO")
-EIA_SERIES_TYPES = eia_cfg.get("series_types", ["D", "DF"])
+EIA_SERIES_TYPES = eia_cfg.get("series_types", ["D"])
+if EIA_SERIES_TYPES != ["D"]:
+    raise ValueError("This project ingests EIA actual demand only; configure series_types as ['D'].")
 EIA_FREQUENCY = eia_cfg.get("frequency", "hourly")
 assert EIA_FREQUENCY == "hourly", "EIA timestamps must use the UTC 'hourly' frequency."
 EIA_PAGE_SIZE = eia_cfg.get("page_size", 5000)
@@ -75,7 +73,7 @@ EIA_BASE_URL = urllib.parse.urljoin(eia_cfg.get("base_url", "https://api.eia.gov
 # COMMAND ----------
 # DBTITLE 1,High-Water Mark: Auto-Detect Full Load vs Incremental
 now_utc = datetime.datetime.now(datetime.timezone.utc)
-end_utc = operating_day_end_utc(now_utc, REGION_TIMEZONE)
+end_utc = now_utc.replace(minute=0, second=0, microsecond=0)
 
 if spark.catalog.tableExists(TABLE_NAME):
     # One narrow aggregate replaces a full-history count followed by a second max scan.
@@ -97,8 +95,7 @@ start_param = f"{start_date_str}T00"
 end_param = end_utc.strftime("%Y-%m-%dT%H")
 print(
     f"EIA UTC-frequency request window: {start_param} through {end_param} UTC; "
-    f"end is the next {REGION_TIMEZONE} midnight so the full current operating-day "
-    "forecast is included."
+    "only published actual-demand observations (series D) are ingested."
 )
 
 # COMMAND ----------
@@ -115,7 +112,7 @@ def fetch_eia_dataset(api_key: str, start: str, end: str, series_types: list, re
     offset = 0
 
     while True:
-        # Build query params including explicit series facets (e.g. facets[type][]=D & facets[type][]=DF)
+        # Request only the configured EIA series (the project uses actual demand D).
         query_params = [
             ("api_key", api_key),
             ("frequency", EIA_FREQUENCY),
@@ -129,7 +126,7 @@ def fetch_eia_dataset(api_key: str, start: str, end: str, series_types: list, re
             ("length", str(page_size))
         ]
 
-        # Explicitly filter only targeted series types (D: Demand, DF: Day-ahead Forecast)
+        # Explicitly filter only the configured source series.
         for stype in series_types:
             query_params.append(("facets[type][]", stype))
 
@@ -267,66 +264,6 @@ else:
     print(f"Idempotent MERGE completed on {TABLE_NAME} (null-safe equality enabled).")
 
 # COMMAND ----------
-# DBTITLE 2,Capture an as-observed EIA day-ahead benchmark vintage
-# Reuse the response already fetched above. This preserves what the pipeline
-# actually saw at this run time without issuing a second EIA API request.
-BENCHMARK_TABLE = f"{CATALOG}.bronze.eia_forecast_vintages"
-df_eia_forecast = df_bronze.filter(F.col("type") == F.lit("DF"))
-if df_eia_forecast.limit(1).count() == 0:
-    raise RuntimeError("Benchmark capture failed: the EIA response contained no DF day-ahead forecasts.")
-
-observed_at = datetime.datetime.now(datetime.timezone.utc)
-vintage_id = f"eia_df_{observed_at.strftime('%Y%m%dT%H%M%S%fZ')}"
-forecast_payload_for_hash = [
-    (str(row["period"]), float(row["value"]))
-    for row in df_eia_forecast.select("period", "value").orderBy("period").collect()
-    if row["value"] is not None
-]
-payload_sha256 = hashlib.sha256(
-    json.dumps(forecast_payload_for_hash, separators=(",", ":")).encode("utf-8")
-).hexdigest()
-
-benchmark_rows = (
-    df_eia_forecast
-    .filter(F.col("value").isNotNull())
-    .select(
-        F.lit("EIA").alias("benchmark_provider"),
-        F.lit("EIA-930-DF").alias("product_id"),
-        F.col("respondent"),
-        F.lit(vintage_id).alias("vintage_id"),
-        F.to_timestamp(F.col("period"), "yyyy-MM-dd'T'HH").alias("target_timestamp_utc"),
-        F.col("value").cast("double").alias("forecast_mw"),
-        F.lit(None).cast("timestamp").alias("published_at_utc"),
-        F.lit(observed_at).cast("timestamp").alias("first_observed_at_utc"),
-        F.lit(payload_sha256).alias("payload_sha256"),
-        F.lit(raw_file_path).alias("raw_payload_path"),
-    )
-)
-invalid_benchmark_rows = benchmark_rows.filter(
-    F.col("respondent").isNull() | F.col("target_timestamp_utc").isNull()
-    | F.col("forecast_mw").isNull() | (F.col("forecast_mw") <= 0)
-).limit(1).count()
-if invalid_benchmark_rows:
-    raise RuntimeError("EIA benchmark vintage contains null keys or invalid forecast values.")
-
-if not spark.catalog.tableExists(BENCHMARK_TABLE):
-    benchmark_rows.write.format("delta").mode("overwrite").saveAsTable(BENCHMARK_TABLE)
-else:
-    benchmark_delta = DeltaTable.forName(spark, BENCHMARK_TABLE)
-    merge_source_columns(
-        benchmark_delta,
-        benchmark_rows,
-        "target.benchmark_provider = source.benchmark_provider "
-        "AND target.respondent = source.respondent "
-        "AND target.vintage_id = source.vintage_id "
-        "AND target.target_timestamp_utc = source.target_timestamp_utc",
-        update_matched=False,
-    )
-print(
-    f"Captured {len(forecast_payload_for_hash):,} EIA forecast vintage rows "
-    f"as observed at {observed_at.isoformat()} in {BENCHMARK_TABLE}."
-)
-
 # COMMAND ----------
 # MAGIC %sql
 # MAGIC SELECT type, type_name, count(*) as row_count, min(period) as min_period, max(period) as max_period

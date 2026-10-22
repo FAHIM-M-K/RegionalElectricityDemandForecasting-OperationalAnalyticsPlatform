@@ -24,7 +24,7 @@ print(f"Bronze Calendar Reference row count: {df_calendar.count():,}")
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## 1. EIA-930 Demand & Forecast Profiling
+# MAGIC ## 1. EIA-930 Actual Demand Profiling
 
 # COMMAND ----------
 # DBTITLE 1,EIA Schema & Sample Rows
@@ -32,7 +32,7 @@ display(df_eia.limit(10))
 
 # COMMAND ----------
 # DBTITLE 1,EIA Series Types & Row Counts
-# Verify series types present in Bronze (expected: only 'D' and 'DF')
+# The active ingestion requests actual system demand only (series D). Older Bronze history may also contain DF rows.
 display(
     df_eia.groupBy("type", "type_name", "value_units")
     .agg(
@@ -43,8 +43,8 @@ display(
 )
 
 # COMMAND ----------
-# DBTITLE 1,EIA Summary Statistics & Distribution (Actual D vs Forecast DF)
-df_eia_stats = df_eia.withColumn("value_num", F.col("value").cast(DoubleType()))
+# DBTITLE 1,EIA Actual Demand Summary Statistics
+df_eia_stats = df_eia.filter(F.col("type") == "D").withColumn("value_num", F.col("value").cast(DoubleType()))
 
 display(
     df_eia_stats.groupBy("type")

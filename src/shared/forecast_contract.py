@@ -22,10 +22,6 @@ EVALUATION_GRAIN_KEYS = [
     "respondent", "forecast_issue_id", "horizon_hours", "target_timestamp_utc",
 ]
 SERVING_GRAIN_KEYS = ["respondent", "horizon_hours", "target_timestamp_utc"]
-BENCHMARK_GRAIN_KEYS = [
-    "benchmark_provider", "respondent", "vintage_id", "target_timestamp_utc",
-]
-
 MAX_STALE_ORIGIN_HOURS = 4.0
 MAX_FAIL_ORIGIN_HOURS = 6.0
 
@@ -141,15 +137,3 @@ def validate_forecast_issue_frame(df, expected_horizons: List[int] | None = None
             raise ValueError(f"H{horizon} predictions exceed physical bounds ({DEMAND_MIN_VALID_MW}-{DEMAND_MAX_VALID_MW} MW).")
         if not all(float(value) == float(value) and abs(float(value)) != float("inf") for value in preds):
             raise ValueError(f"H{horizon} predictions contain non-finite values.")
-
-
-def validate_benchmark_vintage_record(record: Dict[str, Any]) -> None:
-    """Validate an append-only benchmark vintage record."""
-    for key in ("benchmark_provider", "respondent", "vintage_id", "target_timestamp_utc", "forecast_mw"):
-        if record.get(key) is None:
-            raise ValueError(f"Benchmark vintage missing required field: {key}")
-    if record.get("first_observed_at_utc") is None:
-        raise ValueError("Benchmark vintage requires first_observed_at_utc availability timestamp.")
-    val = float(record["forecast_mw"])
-    if not (DEMAND_MIN_VALID_MW <= val <= DEMAND_MAX_VALID_MW):
-        raise ValueError(f"Benchmark value {val} MW is outside ERCOT plausibility bounds.")

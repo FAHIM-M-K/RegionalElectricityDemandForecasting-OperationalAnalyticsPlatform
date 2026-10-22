@@ -9,7 +9,7 @@
     "route": "electricity/rto/region-data/data/",
     "subregion_route": "electricity/rto/region-sub-ba-data/data/",
     "respondent": "ERCO",
-    "series_types": ["D", "DF"],
+    "series_types": ["D"],
     "frequency": "hourly",
     "page_size": 5000,
     "restatement_buffer_days": 5,

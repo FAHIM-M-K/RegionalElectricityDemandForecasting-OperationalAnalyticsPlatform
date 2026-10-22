@@ -6,7 +6,8 @@
 
 Model selection uses rolling chronological windows.  The final 30 days are
 logged as an audit holdout and are never used to choose a candidate or promote
-it.  EIA is a comparison benchmark only; it is never an input feature.
+it. Forecast quality is measured against matured EIA actual demand and compared
+with a seasonal-naive baseline.
 """
 
 import os
@@ -26,7 +27,7 @@ for _ in range(5):
 
 from src.mlops.backtest_multihorizon import (
     MAX_PEAK_MAE_REGRESSION, MIN_SELECTION_WINDOWS, MIN_WINDOW_WIN_RATE,
-    PROMOTION_POLICY_VERSION, compute_lead_bucket_metrics, compute_matched_metrics, compute_metrics, compute_daily_naive_baseline,
+    PROMOTION_POLICY_VERSION, compute_lead_bucket_metrics, compute_metrics, compute_daily_naive_baseline,
     compute_peak_event_metrics,
     generate_chronological_splits,
 )
@@ -65,36 +66,29 @@ def _fit(train: pd.DataFrame, validation: pd.DataFrame, features: list[str]):
     return model
 
 
-def _score(model, frame: pd.DataFrame, horizon: int, include_eia: bool = False) -> Dict[str, Dict[str, float]]:
+def _score(model, frame: pd.DataFrame, horizon: int) -> Dict[str, Dict[str, float]]:
     # The booster predicts an adjustment to the forecast-origin-available
     # seasonal naive value. Score the reconstructed demand forecast.
     prediction = frame["seasonal_naive_mw"].to_numpy(dtype=float) + model.predict(frame[model.feature_name()])
     peak = frame["hour_local"].between(14, 18).to_numpy()
     daily = compute_daily_naive_baseline(frame)
-    eia = frame["eia_day_ahead_forecast_mw"] if "eia_day_ahead_forecast_mw" in frame else pd.Series(np.nan, index=frame.index)
     model_metrics = compute_metrics(frame["actual_demand_mw"], prediction, peak)
     daily_metrics = compute_metrics(frame["actual_demand_mw"], daily, peak)
     selection_baseline = daily_metrics
     if model_metrics["sample_count"] != selection_baseline["sample_count"]:
         raise ValueError(f"H{horizon} model and seasonal baseline were scored on different row counts.")
-    matched_eia = compute_matched_metrics(
-        frame["actual_demand_mw"],
-        {"model": prediction, "daily_naive": daily, "eia": eia},
-        peak_mask=peak,
-    ) if include_eia else {"sample_count": 0, "coverage_pct": 0.0, "metrics": {}}
     lead_buckets = compute_lead_bucket_metrics(
         frame, {"model": prediction, "daily": daily}, peak
     )
     peak_event_metrics = compute_peak_event_metrics(
         frame, {"model": prediction, "daily": daily}
     )
-    return {"model": model_metrics,
-            "daily": daily_metrics,
-            "lead_buckets": lead_buckets,
-            "peak_event_metrics": peak_event_metrics,
-            "eia_matched": matched_eia,
-            "eia": compute_metrics(frame["actual_demand_mw"], eia, peak) if include_eia else
-            {"mae": np.nan, "rmse": np.nan, "bias": np.nan, "smape": np.nan, "peak_mae": np.nan, "sample_count": 0}}
+    return {
+        "model": model_metrics,
+        "daily": daily_metrics,
+        "lead_buckets": lead_buckets,
+        "peak_event_metrics": peak_event_metrics,
+    }
 
 
 def _mean_metric(results: list[Dict[str, Dict[str, float]]], model_name: str, metric: str) -> float:
@@ -121,8 +115,8 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
             continue
         weather_model = _fit(fit_train, validation, features)
         control_model = _fit(fit_train, validation, control_features)
-        window_result = _score(weather_model, test, horizon, include_eia=True)
-        control_result = _score(control_model, test, horizon, include_eia=True)
+        window_result = _score(weather_model, test, horizon)
+        control_result = _score(control_model, test, horizon)
         window_result["no_weather_control"] = control_result["model"]
         window_result["test_start_utc"] = split["test_start"].isoformat()
         window_result["test_end_utc"] = split["test_end"].isoformat()
@@ -152,8 +146,8 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
         MODEL_PARAMS, lgb.Dataset(pre_holdout[control_features], label=pre_holdout["residual_target_mw"]),
         num_boost_round=selected_control_model.best_iteration,
     )
-    final_result = _score(booster, final_holdout, horizon, include_eia=True)
-    control_final = _score(control_booster, final_holdout, horizon, include_eia=True)
+    final_result = _score(booster, final_holdout, horizon)
+    control_final = _score(control_booster, final_holdout, horizon)
     final_result["no_weather_control"] = control_final["model"]
     selection_mae = _mean_metric(selection_results, "model", "mae")
     baseline_name = "daily"
@@ -234,17 +228,6 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
                     if np.isfinite(metric["mae"]):
                         logged_metrics[f"final_holdout_{bucket}_{label}_mae"] = metric["mae"]
                     logged_metrics[f"final_holdout_{bucket}_{label}_rows"] = metric["sample_count"]
-            matched = final_result["eia_matched"]
-            logged_metrics.update({
-                "final_holdout_eia_matched_rows": matched["sample_count"],
-                "final_holdout_eia_coverage_pct": matched["coverage_pct"],
-            })
-            if matched["sample_count"]:
-                logged_metrics.update({
-                    "final_holdout_model_mae_on_eia_hours": matched["metrics"]["model"]["mae"],
-                    "final_holdout_daily_naive_mae_on_eia_hours": matched["metrics"]["daily_naive"]["mae"],
-                    "final_holdout_eia_mae_on_matched_hours": matched["metrics"]["eia"]["mae"],
-                })
             logged_metrics["selection_baseline_peak_mae"] = _mean_metric(
                 selection_results, baseline_name, "peak_mae"
             )
@@ -273,17 +256,6 @@ def train_single_horizon_model(examples: pd.DataFrame, horizon: int, n_windows: 
                         if np.isfinite(metric["mae"]):
                             logged_metrics[f"selection_window_{window_index}_{bucket}_{label}_mae"] = metric["mae"]
                         logged_metrics[f"selection_window_{window_index}_{bucket}_{label}_rows"] = metric["sample_count"]
-                matched = window_result["eia_matched"]
-                logged_metrics.update({
-                    f"selection_window_{window_index}_eia_matched_rows": matched["sample_count"],
-                    f"selection_window_{window_index}_eia_coverage_pct": matched["coverage_pct"],
-                })
-                if matched["sample_count"]:
-                    logged_metrics.update({
-                        f"selection_window_{window_index}_model_mae_on_eia_hours": matched["metrics"]["model"]["mae"],
-                        f"selection_window_{window_index}_daily_naive_mae_on_eia_hours": matched["metrics"]["daily_naive"]["mae"],
-                        f"selection_window_{window_index}_eia_mae_on_matched_hours": matched["metrics"]["eia"]["mae"],
-                    })
             mlflow.log_metrics(logged_metrics)
             mlflow.log_params({"promotion_policy_version": PROMOTION_POLICY_VERSION,
                                "minimum_selection_windows": MIN_SELECTION_WINDOWS,
@@ -338,7 +310,7 @@ if __name__ == "__main__" and "spark" in globals():
         feature_columns = features_for_horizon(horizon)
         required_columns = set(EXAMPLE_GRAIN_KEYS) | set(feature_columns) | {
             "source_max_observation_utc", "actual_demand_mw", "is_valid_training_example",
-            "daily_naive_mw", "eia_day_ahead_forecast_mw",
+            "daily_naive_mw",
         }
         projected_columns = [name for name in examples_sdf.columns if name in required_columns]
         missing_columns = required_columns - set(projected_columns)
@@ -367,8 +339,6 @@ if __name__ == "__main__" and "spark" in globals():
             f"final holdout MAE {result['final']['model']['mae']:,.1f} vs "
             f"{result['final'][baseline_name]['mae']:,.1f} MW {baseline_label}."
         )
-        matched = result["final"]["eia_matched"]
-        line += f" EIA matched hours: {matched['sample_count']:,} ({matched['coverage_pct']:.1f}% coverage)."
         print(line)
         model_peak = result["final"]["peak_event_metrics"]["model"]
         baseline_peak = result["final"]["peak_event_metrics"][baseline_name]

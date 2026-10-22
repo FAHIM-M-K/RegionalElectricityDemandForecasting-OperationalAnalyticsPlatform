@@ -7,13 +7,12 @@
 # MAGIC
 # MAGIC ### Core Transformations:
 # MAGIC 1. **Timezone Normalization:** Bronze requests EIA's `hourly` (UTC) frequency. Parse `period` as the canonical UTC key, then derive Central Time for reporting; do not reinterpret the source period as local wall time.
-# MAGIC 2. **Pivoting Series:** Restructure long format (`D` = Demand, `DF` = Day-ahead Forecast) into single hourly row: `actual_demand_mw` and `day_ahead_forecast_mw`.
+# MAGIC 2. **Actual demand:** Select EIA's `D` series and retain one row per respondent and UTC hour.
 # MAGIC 3. **Physical Domain Screening:** Flag negative demand and physical operating boundary violations without silently dropping rows (`is_valid_demand`, `anomaly_flag`).
 # MAGIC 4. **Incremental Idempotency:** Null-safe Delta `MERGE` on `(respondent, timestamp_utc)` updating only when values change or restatements arrive.
 # MAGIC
 # MAGIC ### Design Decision:
-# MAGIC `day_ahead_error_mw` (actual - forecast) is NOT computed here. It is an analytical derivation, not data cleaning.
-# MAGIC Silver provides the two clean source values; Gold computes the delta. (Medallion: Silver = clean/conform, Gold = business logic).
+# MAGIC EIA day-ahead forecast data is not part of this project's product. EIA actual demand remains the observed target used for analytics and forecast evaluation.
 
 # COMMAND ----------
 # DBTITLE 1,Imports & Configuration
@@ -61,18 +60,15 @@ MAX_PLAUSIBLE_DEMAND_MW = 110000.0 # All-time record peak is ~85.5k MW; >110k is
 assert spark.catalog.tableExists(SOURCE_TABLE), f"Source table {SOURCE_TABLE} does not exist!"
 
 target_exists = spark.catalog.tableExists(TARGET_TABLE)
-target_cols = spark.table(TARGET_TABLE).columns if target_exists else []
 last_actual_timestamp = None
-if target_exists and "day_ahead_error_mw" not in target_cols:
+if target_exists:
     last_actual_timestamp = (
         spark.table(TARGET_TABLE)
         .filter(F.col("actual_demand_mw").isNotNull())
         .agg(F.max("timestamp_utc").alias("last_actual_timestamp"))
         .first()["last_actual_timestamp"]
     )
-requires_full_rebuild = (
-    not target_exists or "day_ahead_error_mw" in target_cols or last_actual_timestamp is None
-)
+requires_full_rebuild = not target_exists or last_actual_timestamp is None
 df_bronze = spark.table(SOURCE_TABLE).filter(F.col("respondent") == REGION_CODE)
 
 if requires_full_rebuild:
@@ -109,14 +105,13 @@ pre_pivot_dupe = df_parsed.groupBy("respondent", "period", "type").count().filte
 assert pre_pivot_dupe == 0, "Source Integrity Failure: duplicate (respondent, period, type) rows in Bronze."
 
 # COMMAND ----------
-# DBTITLE 1,Pivot Series: Align Actuals (D) and Day-Ahead Forecast (DF)
-# Filter only D and DF, then aggregate by (respondent, timestamp_utc, timestamp_local)
+# DBTITLE 1,Select EIA Actual Demand
+# Bronze is source-aligned; historical DF rows may exist, but Silver consumes only D.
 df_pivoted = df_parsed \
-    .filter(F.col("type").isin("D", "DF")) \
+    .filter(F.col("type") == "D") \
     .groupBy("respondent", "timestamp_utc", "timestamp_local") \
     .agg(
         F.max(F.when(F.col("type") == "D", F.col("value_num"))).alias("actual_demand_mw"),
-        F.max(F.when(F.col("type") == "DF", F.col("value_num"))).alias("day_ahead_forecast_mw"),
         F.max("_ingested_at_utc").alias("_bronze_ingested_at_utc")
     )
 
@@ -169,17 +164,14 @@ if not target_exists:
     print(f"Initialized Silver table {TARGET_TABLE} with {total_records} records.")
 else:
     delta_target = DeltaTable.forName(spark, TARGET_TABLE)
-    # Schema Migration Check:
-    # If the target table was initialized in an earlier run and still contains 'day_ahead_error_mw',
-    # overwrite the schema once to align with the Medallion rule (error metrics moved to Gold).
     if requires_full_rebuild:
-        print(f"Migrating Silver schema: dropping legacy 'day_ahead_error_mw' from {TARGET_TABLE}...")
+        print(f"Initializing Silver data because {TARGET_TABLE} has no actual-demand watermark...")
         df_screened.write \
             .format("delta") \
             .mode("overwrite") \
             .option("overwriteSchema", "true") \
             .saveAsTable(TARGET_TABLE)
-        print(f"Successfully migrated and overwritten {TARGET_TABLE} to clean Silver schema.")
+        print(f"Initialized {TARGET_TABLE} with {total_records:,} actual-demand records.")
     else:
         merge_condition = (
             "target.respondent = source.respondent "
@@ -190,7 +182,6 @@ else:
         # Update only if measurements or anomaly flags actually changed
         update_condition = (
             "NOT (target.actual_demand_mw <=> source.actual_demand_mw) OR "
-            "NOT (target.day_ahead_forecast_mw <=> source.day_ahead_forecast_mw) OR "
             "NOT (target.anomaly_flag <=> source.anomaly_flag) OR "
             "NOT (target.is_valid_demand <=> source.is_valid_demand)"
         )

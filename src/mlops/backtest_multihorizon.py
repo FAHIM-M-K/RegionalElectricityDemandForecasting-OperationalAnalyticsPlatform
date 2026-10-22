@@ -73,26 +73,6 @@ def compute_metrics(y_true, y_pred, peak_mask=None) -> Dict[str, float]:
             "peak_mae": round(peak_mae, 2) if np.isfinite(peak_mae) else np.nan, "sample_count": int(valid.sum())}
 
 
-def compute_matched_metrics(y_true, forecasts: Dict[str, Any], peak_mask=None) -> Dict[str, Any]:
-    """Score multiple forecasts on exactly the same valid target rows."""
-    actual = np.asarray(y_true, dtype=float)
-    predictions = {name: np.asarray(values, dtype=float) for name, values in forecasts.items()}
-    if any(values.shape != actual.shape for values in predictions.values()):
-        raise ValueError("Actuals and every forecast must have the same shape for matched scoring.")
-    valid = np.isfinite(actual)
-    for values in predictions.values():
-        valid &= np.isfinite(values)
-    base_valid = np.isfinite(actual)
-    coverage_pct = 100.0 * valid.sum() / base_valid.sum() if base_valid.any() else 0.0
-    peak = np.asarray(peak_mask, dtype=bool)[valid] if peak_mask is not None else None
-    metrics = {
-        name: compute_metrics(actual[valid], values[valid], peak)
-        for name, values in predictions.items()
-    }
-    return {"sample_count": int(valid.sum()), "coverage_pct": round(float(coverage_pct), 2),
-            "metrics": metrics}
-
-
 def compute_lead_bucket_metrics(df: pd.DataFrame, forecasts: Dict[str, Any], peak_mask=None) -> Dict[str, Dict[str, Dict[str, float]]]:
     """Score the active 1–24 hour forecast on its target rows."""
     leads = pd.to_numeric(df["lead_hours"], errors="coerce").to_numpy(float)

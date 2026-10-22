@@ -10,7 +10,6 @@ from src.gold.forecast_example_features import generate_forecast_examples_df
 from src.mlops.backtest_multihorizon import (
     compute_daily_naive_baseline,
     compute_lead_bucket_metrics,
-    compute_matched_metrics,
     compute_peak_event_metrics,
     evaluate_promotion_gate,
     generate_chronological_splits,
@@ -90,21 +89,6 @@ def test_chronological_splits_reserve_final_holdout():
     splits = generate_chronological_splits(pd.Series(origins), n_test_windows=3)
     assert splits[-1]["kind"] == "final_holdout"
     assert all(split["test_end"] <= splits[-1]["test_start"] for split in splits[:-1])
-
-
-def test_matched_metrics_compare_eia_and_model_on_identical_rows():
-    actual = np.array([10.0, 20.0, 30.0, 40.0])
-    result = compute_matched_metrics(
-        actual,
-        {"model": np.array([11.0, 19.0, 30.0, 41.0]),
-         "eia": np.array([12.0, np.nan, 29.0, 42.0])},
-    )
-    assert result["sample_count"] == 3
-    assert result["coverage_pct"] == 75.0
-    assert result["metrics"]["model"]["sample_count"] == 3
-    assert result["metrics"]["eia"]["sample_count"] == 3
-    assert result["metrics"]["model"]["mae"] == 0.67
-    assert result["metrics"]["eia"]["mae"] == 1.67
 
 
 def test_lead_bucket_metrics_cover_the_active_h24_curve():
@@ -353,28 +337,6 @@ def test_validate_forecast_issue_frame_enforces_complete_curves_and_bounds():
         raise AssertionError("Physical bound violation passed validation.")
 
 
-def test_validate_benchmark_vintage_record():
-    from src.shared.forecast_contract import validate_benchmark_vintage_record
-    record = {
-        "benchmark_provider": "EIA",
-        "respondent": "ERCO",
-        "vintage_id": "vintage_20240601",
-        "target_timestamp_utc": pd.Timestamp("2024-06-01 14:00", tz="UTC"),
-        "forecast_mw": 55_000.0,
-        "first_observed_at_utc": pd.Timestamp("2024-06-01 06:00", tz="UTC"),
-    }
-    validate_benchmark_vintage_record(record)
-
-    missing_field = record.copy()
-    del missing_field["vintage_id"]
-    try:
-        validate_benchmark_vintage_record(missing_field)
-    except ValueError as exc:
-        assert "missing required field" in str(exc)
-    else:
-        raise AssertionError("Record missing required field passed validation.")
-
-
 def test_forecast_issue_id_normalizes_equivalent_utc_offsets():
     from src.shared.forecast_contract import generate_forecast_issue_id
 
@@ -390,48 +352,6 @@ def test_forecast_issue_id_normalizes_equivalent_utc_offsets():
     ) != generate_forecast_issue_id(
         "ERCO", 24, "2026-10-19T05:00:00Z", "2026-10-19T06:00:00Z", "run-b"
     )
-
-
-def test_as_of_vintage_selection_keeps_one_complete_latest_row():
-    from src.gold.benchmark_evaluation import select_as_of_benchmark_vintages
-
-    target = pd.Timestamp("2026-10-20T12:00:00Z")
-    vintages = pd.DataFrame([
-        {"benchmark_provider": "EIA", "respondent": "ERCO", "vintage_id": "old",
-         "target_timestamp_utc": target, "forecast_mw": 50_000.0,
-         "published_at_utc": pd.NaT, "first_observed_at_utc": pd.Timestamp("2026-10-19T10:00:00Z"),
-         "payload_sha256": "old-hash"},
-        {"benchmark_provider": "EIA", "respondent": "ERCO", "vintage_id": "new",
-         "target_timestamp_utc": target, "forecast_mw": 51_000.0,
-         "published_at_utc": pd.NaT, "first_observed_at_utc": pd.Timestamp("2026-10-19T11:00:00Z"),
-         "payload_sha256": "new-hash"},
-    ])
-    selected = select_as_of_benchmark_vintages(vintages, pd.Timestamp("2026-10-19T12:00:00Z"))
-    assert len(selected) == 1
-    assert selected.iloc[0].vintage_id == "new"
-    assert selected.iloc[0].payload_sha256 == "new-hash"
-
-
-def test_benchmark_match_rejects_duplicate_actual_keys():
-    from src.gold.benchmark_evaluation import match_h24_and_eia
-
-    origin = pd.Timestamp("2024-06-01T00:00:00Z")
-    target = origin + pd.Timedelta(hours=24)
-    forecasts = pd.DataFrame([{
-        "respondent": "ERCO", "horizon_hours": 24, "lead_hours": 24,
-        "forecast_origin_utc": origin, "issued_at_utc": origin + pd.Timedelta(minutes=15),
-        "target_timestamp_utc": target, "predicted_demand_mw": 51_000.0,
-    }])
-    actuals = pd.DataFrame([
-        {"respondent": "ERCO", "timestamp_utc": target, "actual_demand_mw": 50_000.0},
-        {"respondent": "ERCO", "timestamp_utc": target, "actual_demand_mw": 50_100.0},
-    ])
-    try:
-        match_h24_and_eia(forecasts, pd.DataFrame(), actuals)
-    except ValueError as exc:
-        assert "Actual demand contains duplicate rows" in str(exc)
-    else:
-        raise AssertionError("Duplicate actuals were silently allowed to overweight benchmark metrics.")
 
 
 def test_scoring_attaches_issue_id_and_freshness_status():
@@ -480,122 +400,3 @@ def test_dst_spring_forward_and_fall_back_continuous_utc():
         locals_ct = [t.tz_convert("America/Chicago") for t in targets_utc]
         assert len(set(targets_utc)) == 168
         assert len(locals_ct) == 168
-
-
-def test_as_of_benchmark_selection_no_lookahead():
-    from src.gold.benchmark_evaluation import select_as_of_benchmark_vintages
-
-    target_ts = pd.Timestamp("2024-06-01 18:00:00", tz="UTC")
-    vintages = pd.DataFrame([
-        {
-            "benchmark_provider": "EIA",
-            "respondent": "ERCO",
-            "vintage_id": "v1_early",
-            "target_timestamp_utc": target_ts,
-            "forecast_mw": 50_000.0,
-            "first_observed_at_utc": pd.Timestamp("2024-06-01 06:00:00", tz="UTC"),
-        },
-        {
-            "benchmark_provider": "EIA",
-            "respondent": "ERCO",
-            "vintage_id": "v2_revision",
-            "target_timestamp_utc": target_ts,
-            "forecast_mw": 52_000.0,
-            "first_observed_at_utc": pd.Timestamp("2024-06-01 10:00:00", tz="UTC"),
-        },
-        {
-            "benchmark_provider": "EIA",
-            "respondent": "ERCO",
-            "vintage_id": "v3_future",
-            "target_timestamp_utc": target_ts,
-            "forecast_mw": 55_000.0,
-            "first_observed_at_utc": pd.Timestamp("2024-06-01 14:00:00", tz="UTC"),
-        },
-    ])
-
-    # As of 08:00 UTC: only v1 is available
-    as_of_08 = select_as_of_benchmark_vintages(vintages, pd.Timestamp("2024-06-01 08:00:00", tz="UTC"))
-    assert len(as_of_08) == 1
-    assert as_of_08.iloc[0]["vintage_id"] == "v1_early"
-    assert as_of_08.iloc[0]["forecast_mw"] == 50_000.0
-
-    # As of 11:00 UTC: v2 is available and preferred over v1; v3 is excluded (no look-ahead)
-    as_of_11 = select_as_of_benchmark_vintages(vintages, pd.Timestamp("2024-06-01 11:00:00", tz="UTC"))
-    assert len(as_of_11) == 1
-    assert as_of_11.iloc[0]["vintage_id"] == "v2_revision"
-    assert as_of_11.iloc[0]["forecast_mw"] == 52_000.0
-
-
-def test_match_h24_and_eia_metrics():
-    from src.gold.benchmark_evaluation import match_h24_and_eia
-
-    origin = pd.Timestamp("2024-06-01 00:00:00", tz="UTC")
-    issued = pd.Timestamp("2024-06-01 00:15:00", tz="UTC")
-    target = origin + pd.Timedelta(hours=24)
-
-    h24 = pd.DataFrame([{
-        "respondent": "ERCO",
-        "horizon_hours": 24,
-        "lead_hours": 24,
-        "forecast_origin_utc": origin,
-        "issued_at_utc": issued,
-        "target_timestamp_utc": target,
-        "predicted_demand_mw": 51_000.0,
-    }])
-
-    vintages = pd.DataFrame([{
-        "benchmark_provider": "EIA",
-        "respondent": "ERCO",
-        "vintage_id": "eia_v1",
-        "target_timestamp_utc": target,
-        "forecast_mw": 52_000.0,
-        "first_observed_at_utc": pd.Timestamp("2024-05-31 23:00:00", tz="UTC"),
-    }])
-
-    actuals = pd.DataFrame([{
-        "respondent": "ERCO",
-        "timestamp_utc": target,
-        "actual_demand_mw": 50_000.0,
-    }])
-
-    df_matched, summary = match_h24_and_eia(h24, vintages, actuals, headline_policy="lead_24")
-    assert len(df_matched) == 1
-    assert summary["matched_rows"] == 1
-    assert summary["unique_targets"] == 1
-    assert summary["model_mae_mw"] == 1_000.0   # |51000 - 50000|
-    assert summary["eia_mae_mw"] == 2_000.0     # |52000 - 50000|
-    assert summary["model_bias_mw"] == 1_000.0  # 51000 - 50000
-    assert summary["eia_bias_mw"] == 2_000.0    # 52000 - 50000
-
-
-def test_match_h24_and_eia_empty_overlap_has_pending_status_and_null_metrics():
-    from src.gold.benchmark_evaluation import match_h24_and_eia
-
-    origin = pd.Timestamp("2024-06-01 00:00:00", tz="UTC")
-    h24 = pd.DataFrame([{
-        "respondent": "ERCO",
-        "horizon_hours": 24,
-        "lead_hours": 24,
-        "forecast_origin_utc": origin,
-        "issued_at_utc": origin + pd.Timedelta(minutes=15),
-        "target_timestamp_utc": origin + pd.Timedelta(hours=24),
-        "predicted_demand_mw": 51_000.0,
-    }])
-
-    matched, summary = match_h24_and_eia(
-        h24,
-        pd.DataFrame(columns=["target_timestamp_utc", "forecast_mw", "first_observed_at_utc"]),
-        pd.DataFrame(columns=["respondent", "timestamp_utc", "actual_demand_mw"]),
-        headline_policy="lead_24",
-    )
-
-    assert matched.empty
-    assert summary["status"] == "PROSPECTIVE_PENDING_MATURED_DATA"
-    assert summary["matched_rows"] == 0
-    assert summary["unique_targets"] == 0
-    assert summary["model_mae_mw"] is None
-    assert summary["eia_mae_mw"] is None
-    assert summary["model_rmse_mw"] is None
-    assert summary["eia_rmse_mw"] is None
-    assert summary["model_bias_mw"] is None
-    assert summary["eia_bias_mw"] is None

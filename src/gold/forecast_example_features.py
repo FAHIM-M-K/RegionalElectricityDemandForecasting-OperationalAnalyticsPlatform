@@ -52,9 +52,7 @@ def _examples_for_respondent(df: pd.DataFrame, step_hours: int) -> list[dict]:
         )
     df = df.sort_values("timestamp_utc")
     values = dict(zip(df["timestamp_utc"], df["actual_demand_mw"]))
-    eia_values = df["day_ahead_forecast_mw"] if "day_ahead_forecast_mw" in df else pd.Series(np.nan, index=df.index)
     holiday_values = df["is_holiday"] if "is_holiday" in df else pd.Series(False, index=df.index)
-    eia = dict(zip(df["timestamp_utc"], eia_values))
     holidays = dict(zip(df["timestamp_utc"], holiday_values))
     emergency_values = df["is_grid_emergency"] if "is_grid_emergency" in df else pd.Series(False, index=df.index)
     emergencies = dict(zip(df["timestamp_utc"], emergency_values.astype(bool)))
@@ -106,7 +104,6 @@ def _examples_for_respondent(df: pd.DataFrame, step_hours: int) -> list[dict]:
                 "source_max_observation_utc": origin,
                 "actual_demand_mw": actual,
                 "daily_naive_mw": values.get(target - pd.Timedelta(hours=24), np.nan),
-                "eia_day_ahead_forecast_mw": eia.get(target, np.nan),
                 **_calendar_features(target, holidays),
                 **snapshot,
             }

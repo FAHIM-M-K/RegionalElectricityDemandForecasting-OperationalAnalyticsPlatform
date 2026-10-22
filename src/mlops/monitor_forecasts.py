@@ -27,7 +27,7 @@ CATALOG = "main"
 FORECASTS = f"{CATALOG}.gold.forecast_evaluation"
 FACT = f"{CATALOG}.gold.fact_hourly_electricity_demand"
 METRICS = f"{CATALOG}.gold.forecast_monitoring_daily"
-MONITOR_LOOKBACK_DAYS = 7  # 5-day EIA/actual correction window plus H24 lead and catch-up margin
+MONITOR_LOOKBACK_DAYS = 7  # Actual-demand correction window plus H24 lead and catch-up margin
 INITIAL_MONITOR_LOOKBACK_DAYS = 180  # Bounded first materialization when no metrics watermark exists
 
 

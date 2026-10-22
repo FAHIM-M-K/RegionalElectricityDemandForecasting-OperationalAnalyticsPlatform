@@ -1,23 +1,21 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Gold Layer: Fact Hourly Electricity Demand & Benchmark Analytics
+# MAGIC # Gold Layer: Observed Hourly Electricity Demand
 # MAGIC
 # MAGIC **Input Table:** `main.silver.grid_hourly_conformed`  
 # MAGIC **Output Table:** `main.gold.fact_hourly_electricity_demand`  
 # MAGIC
 # MAGIC ### Core Responsibilities:
-# MAGIC 1. **Business Metric Derivations:** Calculates analytical error KPIs (`eia_error_mw`, `eia_abs_error_mw`, `eia_ape_pct`) comparing EIA Day-Ahead Forecast against actual ground truth.
-# MAGIC 2. **Calendar & Seasonal Dimensions:** Adds meteorological season (`Winter`, `Spring`, `Summer`, `Fall`), peak window indicators, and federal holiday classifications.
-# MAGIC 3. **Grid Emergency Flagging:** Explicitly isolates supply-constrained blackout periods (Winter Storm Uri Feb 15–18, 2021) with `is_grid_emergency`.
-# MAGIC 4. **Pre-Write Data Quality Gate:** Validates key uniqueness, non-negative demand, metric calculation consistency, and error magnitude bounds.
-# MAGIC 5. **Incremental Delta MERGE:** Rebuild the restatement window after the last materialized actual; assert the candidate before the atomic upsert.
+# MAGIC 1. **Business dimensions:** Adds seasonal and peak-window classifications to observed demand.
+# MAGIC 2. **Grid emergency flagging:** Explicitly identifies the February 2021 Winter Storm Uri period.
+# MAGIC 3. **Pre-write quality gate:** Validates keys, observed demand, and emergency flags.
+# MAGIC 4. **Incremental Delta MERGE:** Reprocesses the actual-demand correction window before atomic upsert.
 
 # COMMAND ----------
 # DBTITLE 1,Imports & Setup
 import os
 import datetime
 from pyspark.sql import functions as F
-from pyspark.sql.types import DoubleType
 from delta.tables import DeltaTable
 
 CATALOG = "main"
@@ -74,7 +72,7 @@ else:
 def build_gold_fact_dataset(df_silver, ba_code=BA_CODE):
     """
     Transforms silver conformed grid records into the business analytics fact table.
-    Enriches with EIA benchmark error metrics, operational peak indicators, and grid emergency flags.
+    Enriches observed demand with operational peak indicators and grid emergency flags.
     """
     df_fact = (
         df_silver
@@ -87,38 +85,13 @@ def build_gold_fact_dataset(df_silver, ba_code=BA_CODE):
              .otherwise(F.lit("Fall"))
         )
         
-        # 2. Benchmark Forecast Error Metrics (Gold analytical derivations)
-        # SIGNED ERROR CONVENTION:
-        # eia_error_mw = day_ahead_forecast_mw - actual_demand_mw
-        # Positive (> 0) denotes an OVERFORECAST (operator predicted higher than realized).
-        # Negative (< 0) denotes an UNDERFORECAST (operator predicted lower than realized).
-        .withColumn(
-            "eia_error_mw",
-            F.when(
-                F.col("actual_demand_mw").isNotNull() & F.col("day_ahead_forecast_mw").isNotNull(),
-                F.round(F.col("day_ahead_forecast_mw") - F.col("actual_demand_mw"), 1)
-            ).otherwise(F.lit(None).cast(DoubleType()))
-        )
-        .withColumn(
-            "eia_abs_error_mw",
-            F.when(F.col("eia_error_mw").isNotNull(), F.abs(F.col("eia_error_mw")))
-             .otherwise(F.lit(None).cast(DoubleType()))
-        )
-        .withColumn(
-            "eia_ape_pct",
-            F.when(
-                F.col("eia_abs_error_mw").isNotNull() & (F.col("actual_demand_mw") > 0.0),
-                F.round((F.col("eia_abs_error_mw") / F.col("actual_demand_mw")) * 100.0, 3)
-            ).otherwise(F.lit(None).cast(DoubleType()))
-        )
-        
-        # 3. Operational time-window indicator
+        # 2. Operational time-window indicator
         .withColumn(
             "is_afternoon_ramp_window",
             F.col("hour_local").between(14, 18)
         )
         
-        # 4. Grid Emergency Flag (Winter Storm Uri Involuntary Load Shedding)
+        # 3. Grid Emergency Flag (Winter Storm Uri)
         .withColumn(
             "is_grid_emergency",
             F.when(
@@ -128,7 +101,7 @@ def build_gold_fact_dataset(df_silver, ba_code=BA_CODE):
             ).otherwise(F.lit(False))
         )
         
-        # 5. Metadata Lineage
+        # 4. Metadata Lineage
         .withColumn("_gold_processed_at_utc", F.current_timestamp())
     )
     
@@ -141,18 +114,12 @@ def validate_gold_fact_candidate(df_fact):
     Asserts structural and business logic invariants before persisting:
     1. Zero null composite primary keys (respondent, timestamp_utc)
     2. Zero duplicate timestamps
-    3. Mathematical consistency of error calculations
-    4. Non-negative actual demand bounds
-    5. Correct assignment of Winter Storm Uri emergency flag
+    3. Non-negative actual demand bounds
+    4. Correct assignment of Winter Storm Uri emergency flag
     """
     quality = df_fact.agg(
         F.count(F.lit(1)).alias("rows"),
         F.sum(F.when(F.col("respondent").isNull() | F.col("timestamp_utc").isNull(), 1).otherwise(0)).alias("null_keys"),
-        F.sum(F.when(
-            F.col("eia_error_mw").isNotNull() &
-            (F.abs(F.col("eia_error_mw") - (F.col("day_ahead_forecast_mw") - F.col("actual_demand_mw"))) > 0.15), 1
-        ).otherwise(0)).alias("error_mismatch"),
-        F.sum(F.when(F.col("eia_ape_pct") < 0.0, 1).otherwise(0)).alias("negative_ape"),
         F.sum(F.when(F.col("actual_demand_mw") < 0.0, 1).otherwise(0)).alias("negative_actual"),
         F.sum(F.when(
             F.col("is_grid_emergency") != (
@@ -165,8 +132,6 @@ def validate_gold_fact_candidate(df_fact):
         print("No conformed source rows in the correction window; the idempotent MERGE will be a no-op.")
         return
     assert not quality["null_keys"], f"Integrity Failure: {quality['null_keys']} null keys in Gold fact candidate."
-    assert not quality["error_mismatch"], f"Computation Failure: {quality['error_mismatch']} inconsistent error rows."
-    assert not quality["negative_ape"], f"Bound Failure: {quality['negative_ape']} negative percentage errors."
     assert not quality["negative_actual"], f"Bound Failure: {quality['negative_actual']} negative actual demand rows."
     assert not quality["emergency_mismatch"], f"Regime flag failure: {quality['emergency_mismatch']} incorrect flags."
     duplicate_key = df_fact.groupBy("respondent", "timestamp_utc").count().filter("count > 1").limit(1).count()
