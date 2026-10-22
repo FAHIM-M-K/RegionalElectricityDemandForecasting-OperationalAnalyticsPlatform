@@ -1,4 +1,4 @@
-"""Fair issue-time-matched evaluation of the active rolling H24 forecast against EIA."""
+"""Compare matured H24 forecasts with EIA day-ahead vintages for the same target hours."""
 
 import json
 from datetime import datetime, timezone
@@ -56,7 +56,16 @@ def match_h24_and_eia(
     df_actuals: pd.DataFrame,
     headline_policy: str = "lead_24",
 ) -> Tuple[pd.DataFrame, Dict[str, object]]:
-    """Match model, EIA and matured actuals on target hour and issue-time availability."""
+    """Match each H24 lead-24 forecast to EIA's latest vintage available by the target hour.
+
+    EIA-930's day-ahead forecast is published for the target operating day, not
+    24 hours before each target. Therefore, requiring the EIA vintage to exist
+    at the model's issue time systematically removes the intended comparison.
+    This policy compares the same target hour using the model's 24-hour forecast
+    and the latest EIA vintage actually observed by that target hour. The two
+    products have different information lead times, so the report must describe
+    them as same-target, different-issue-time forecasts.
+    """
     forecasts = df_h24_forecasts[
         df_h24_forecasts["horizon_hours"] == HORIZON_H24
     ].copy()
@@ -72,25 +81,44 @@ def match_h24_and_eia(
     actuals = actuals[actuals["actual_demand_mw"].notna()]
     _require_unique(actuals, ["respondent", "timestamp_utc"], "Actual demand")
 
-    matched_issues = []
-    issue_keys = ["forecast_origin_utc", "issued_at_utc"]
+    forecast_keys = ["respondent", "horizon_hours", "forecast_origin_utc", "issued_at_utc", "target_timestamp_utc"]
     if "forecast_issue_id" in forecasts:
-        issue_keys.append("forecast_issue_id")
-    for _, issue in forecasts.groupby(issue_keys, dropna=False):
-        vintages = select_as_of_benchmark_vintages(df_eia_vintages, issue["issued_at_utc"].iloc[0])
-        if vintages.empty:
-            continue
-        matched = issue.merge(
-            vintages[["target_timestamp_utc", "forecast_mw"]].rename(
-                columns={"forecast_mw": "eia_forecast_mw"}
-            ),
+        forecast_keys.insert(1, "forecast_issue_id")
+
+    vintages = df_eia_vintages.copy()
+    if not vintages.empty:
+        vintages["target_timestamp_utc"] = pd.to_datetime(vintages["target_timestamp_utc"], utc=True)
+        vintages["first_observed_at_utc"] = pd.to_datetime(vintages["first_observed_at_utc"], utc=True)
+        if "published_at_utc" not in vintages:
+            vintages["published_at_utc"] = pd.NaT
+        else:
+            vintages["published_at_utc"] = pd.to_datetime(vintages["published_at_utc"], utc=True)
+        eligible = vintages[
+            (vintages["benchmark_provider"] == "EIA")
+            & (vintages["respondent"] == "ERCO")
+            & vintages["forecast_mw"].notna()
+        ].copy()
+        candidates = forecasts.merge(
+            eligible[["target_timestamp_utc", "forecast_mw", "first_observed_at_utc", "published_at_utc", "vintage_id"]],
             on="target_timestamp_utc", how="inner",
-        ).merge(
+        )
+        candidates = candidates[
+            (candidates["first_observed_at_utc"] <= candidates["target_timestamp_utc"])
+            & (
+                candidates["published_at_utc"].isna()
+                | (candidates["published_at_utc"] <= candidates["target_timestamp_utc"])
+            )
+        ].copy()
+        candidates = candidates.sort_values(
+            [*forecast_keys, "first_observed_at_utc", "vintage_id"]
+        ).drop_duplicates(forecast_keys, keep="last")
+        candidates = candidates.rename(columns={"forecast_mw": "eia_forecast_mw"})
+        matched = candidates.merge(
             actuals.rename(columns={"timestamp_utc": "target_timestamp_utc"}),
             on=["respondent", "target_timestamp_utc"], how="inner",
         )
-        if not matched.empty:
-            matched_issues.append(matched)
+    else:
+        matched = pd.DataFrame()
 
     pending = {
         "status": "PROSPECTIVE_PENDING_MATURED_DATA",
@@ -102,12 +130,11 @@ def match_h24_and_eia(
         "eia_rmse_mw": None,
         "model_bias_mw": None,
         "eia_bias_mw": None,
-        "notice": "No H24 targets have both an issue-time-available EIA vintage and a matured actual; metrics are pending, not zero.",
+        "notice": "No H24 lead-24 targets have both an EIA day-ahead vintage observed by the target hour and a matured actual; metrics are pending, not zero.",
     }
-    if not matched_issues:
+    if matched.empty:
         return pd.DataFrame(), pending
 
-    matched = pd.concat(matched_issues, ignore_index=True)
     matched["model_error_mw"] = matched["predicted_demand_mw"] - matched["actual_demand_mw"]
     matched["model_abs_error_mw"] = matched["model_error_mw"].abs()
     matched["eia_error_mw"] = matched["eia_forecast_mw"] - matched["actual_demand_mw"]
