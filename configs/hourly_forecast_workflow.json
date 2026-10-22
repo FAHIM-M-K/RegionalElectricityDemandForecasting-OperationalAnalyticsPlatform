@@ -1,5 +1,5 @@
 {
-  "name": "ERCOT_Hourly_Forecast_and_Monitoring",
+  "name": "ERCOT_3H_Forecast_and_Monitoring",
   "schedule": {
     "quartz_cron_expression": "0 15 */3 * * ?",
     "timezone_id": "UTC",
