@@ -1,5 +1,6 @@
 {
   "name": "ERCOT_3H_Forecast_and_Monitoring",
+  "description": "Issues and monitors rolling H24 ERCOT demand forecasts every three hours. Daily historical weather and zonal-demand refreshes run in ERCOT_D.",
   "schedule": {
     "quartz_cron_expression": "0 15 */3 * * ?",
     "timezone_id": "UTC",
