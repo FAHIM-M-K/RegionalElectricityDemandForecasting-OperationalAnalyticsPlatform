@@ -73,24 +73,7 @@ Constructs point-in-time training examples with issue-aligned weather vintage se
 
 ## Data flow and architecture
 
-```text
-EIA-930 actual demand ─┐
-Weather forecasts ─────┼──> Bronze: source-aligned raw records (high-water-mark, restatement buffer)
-ERCOT zone actuals ────┘                 │
-                                         v
-                              Silver: conformed, standardized, quality-gated
-                                         │
-                                         v
-                              Gold: analytics and serving layer
-                               ├─ observed demand facts (idempotent Delta MERGE)
-                               ├─ point-in-time training examples
-                               ├─ rolling 24-hour forecast history and latest
-                               ├─ forecast monitoring metrics (MAE, RMSE, Bias by lead)
-                               └─ observed zonal demand summaries
-                                         │
-                                         v
-                                     Power BI semantic model
-```
+![Platform Architecture](images/architecture_diagram.png)
 
 PySpark and Delta Lake handle distributed transformations and all table writes. Bronze preserves source-aligned records with raw API envelope archival for lineage and replay. Silver applies standardization, null-safe data-quality rules, and availability-state columns (`AVAILABLE` / `NOT_YET_PUBLISHED` / `MISSING_HISTORICAL`). Gold contains analytics-ready serving and modeling products. All forecast features are bounded to information available at the forecast origin timestamp to prevent look-ahead leakage. UTC defines storage, joins, and model training; Central Time is applied only at the reporting boundary.
 
