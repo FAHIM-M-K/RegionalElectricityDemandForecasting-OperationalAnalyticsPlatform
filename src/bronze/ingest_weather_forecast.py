@@ -29,8 +29,14 @@ from pyspark.sql import functions as F
 CATALOG = "main"
 TARGET_TABLE = f"{CATALOG}.bronze.weather_forecast_snapshots"
 RAW_DIR = f"/Volumes/{CATALOG}/bronze/raw_landing/weather_forecasts"
-SNAPSHOT_HOURS = 24
-FORECAST_DAYS = 2  # Request enough provider coverage to retain the next 24 complete target hours.
+# A scorer may receive the latest actual demand up to six hours after its
+# operating hour. Retain two serving intervals beyond H24 so the newest prior
+# snapshot still covers that shifted 24-hour curve. This is only extra rows in
+# the existing request; it does not add API calls or relax completeness gates.
+SERVING_CADENCE_HOURS = 3
+FORECAST_HOURS = 24
+RETAINED_TARGET_HOURS = FORECAST_HOURS + (2 * SERVING_CADENCE_HOURS)
+FORECAST_DAYS = 2  # Enough provider coverage for the retained 30 target hours.
 MAX_ATTEMPTS = 2  # Retry a transient transport/server failure once; never retry 429.
 
 spark.conf.set("spark.sql.session.timeZone", "UTC")
@@ -119,10 +125,11 @@ params = {
 }
 location_payloads, raw_payload, requested_at, available_at = request_weather_forecast(params)
 
-# Keep exactly the next 24 complete target hours after this snapshot became
-# available. This preserves the forecast vintage and excludes already-started hours.
+# Keep the next 30 complete target hours after this snapshot becomes available.
+# The first 24 are the issued curve; the six-hour overlap lets a later serving
+# run use a fully point-in-time snapshot when observed demand is published late.
 first_target = available_at.replace(minute=0, second=0, microsecond=0) + dt.timedelta(hours=1)
-last_target = available_at + dt.timedelta(hours=SNAPSHOT_HOURS)
+last_target = available_at + dt.timedelta(hours=RETAINED_TARGET_HOURS)
 batch_rows = []
 target_sets = {}
 
@@ -163,12 +170,12 @@ for station, location in zip(stations, location_payloads):
     target_sets[station_id] = station_targets
 
 expected_targets = set.intersection(*(target_sets[sid] for sid in station_ids)) if target_sets else set()
-if len(expected_targets) != SNAPSHOT_HOURS or any(
+if len(expected_targets) != RETAINED_TARGET_HOURS or any(
     target_sets[sid] != expected_targets for sid in station_ids
 ):
     counts = {station_id: len(targets) for station_id, targets in target_sets.items()}
     raise RuntimeError(
-        f"Expected the same {SNAPSHOT_HOURS} future hours for all stations; got {counts}. "
+        f"Expected the same {RETAINED_TARGET_HOURS} future hours for all stations; got {counts}. "
         "No partial snapshot was written."
     )
 if any(row["temperature_2m"] is None for row in batch_rows):

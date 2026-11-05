@@ -283,6 +283,7 @@ date_ranges = list(date_windows(start_date_str, end_date_str))
 checkpoint_dir = f"/Volumes/{CATALOG}/bronze/raw_landing/ercot_zonal/checkpoints"
 os.makedirs(checkpoint_dir, exist_ok=True)
 resume_backfill = (not table_has_rows) or legacy_table_schema
+unpublished_trailing_windows = []
 for window_index, (window_start, window_end) in enumerate(date_ranges, start=1):
     checkpoint_path = os.path.join(checkpoint_dir, f"{window_start}_{window_end}.json")
     window_records, window_payloads = [], []
@@ -318,7 +319,27 @@ for window_index, (window_start, window_end) in enumerate(date_ranges, start=1):
     else:
         print(f"[BACKFILL] Fetching date window {window_index}/{len(date_ranges)}: {window_start} to {window_end}.")
         window_records, window_payloads = fetch_window_with_split_fallback(window_start, window_end)
-        validate_window_subregions(window_records, window_start, window_end)
+        try:
+            validate_window_subregions(window_records, window_start, window_end)
+        except IncompleteEIAWindowError:
+            # EIA can publish zonal observations after the daily job begins.
+            # An entirely empty *current-day* window contains no correction to
+            # apply, so preserve the last good Bronze table and retry it on the
+            # next scheduled run. Never apply this exception to historical or
+            # partially populated windows: those remain fail-closed.
+            is_empty_current_day = (
+                table_has_rows
+                and not window_records
+                and window_start == window_end == end_date_str
+            )
+            if not is_empty_current_day:
+                raise
+            unpublished_trailing_windows.append((window_start, window_end))
+            print(
+                f"[SOURCE DELAY] No zonal observations are published yet for {window_start}. "
+                "Existing Bronze data is unchanged; a later scheduled run will retry this day."
+            )
+            continue
         if resume_backfill and window_records:
             temp_path = f"{checkpoint_path}.tmp"
             with open(temp_path, "w", encoding="utf-8") as checkpoint_file:
@@ -331,6 +352,8 @@ for window_index, (window_start, window_end) in enumerate(date_ranges, start=1):
     print(f"  Retrieved {len(window_records):,} records across configured ERCOT subregions.")
 
 print(f"Total authentic subregion records extracted: {len(records)} across {len(raw_payloads)} API pages.")
+if unpublished_trailing_windows:
+    print(f"Skipped unpublished trailing zonal windows: {unpublished_trailing_windows}.")
 
 if records:
     # Report source publication freshness separately from ingestion success.
