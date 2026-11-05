@@ -61,26 +61,42 @@ def date_chunks(start_date: str, end_date: str, days: int = 30):
         current = chunk_end + datetime.timedelta(days=1)
 
 
-def fetch_weather_chunk(url: str, params: dict, station_id: str) -> dict:
+def fetch_weather_chunk(url: str, params: dict) -> list[dict]:
+    """Fetch all configured sites in one request; never retry a quota rejection."""
     request_url = f"{url}?{urllib.parse.urlencode(params)}"
     request = urllib.request.Request(request_url, headers={"User-Agent": "ERCOT-Platform/1.0"})
     for attempt in range(1, 4):
         try:
             with urllib.request.urlopen(request, timeout=40) as response:
-                return json.loads(response.read().decode("utf-8"))
+                payload = json.loads(response.read().decode("utf-8"))
+            locations = payload if isinstance(payload, list) else [payload]
+            if len(locations) != len(weather_stations):
+                raise RuntimeError(
+                    f"Open-Meteo returned {len(locations)} locations; "
+                    f"expected {len(weather_stations)} configured stations."
+                )
+            return locations
         except urllib.error.HTTPError as error:
             body = error.read().decode("utf-8", errors="replace")[:1000]
-            if error.code < 500 and error.code != 429:
-                raise RuntimeError(f"Open-Meteo rejected {station_id} request (HTTP {error.code}): {body}") from error
+            # Retrying 429 only consumes more of the daily allowance. Fail
+            # before any write so the existing Bronze weather history remains
+            # the last known good state until the next scheduled attempt.
+            if error.code == 429:
+                raise RuntimeError(
+                    f"Open-Meteo daily request limit reached (HTTP 429): {body}. "
+                    "No weather rows were written; retry on the next source-availability window."
+                ) from error
+            if error.code < 500:
+                raise RuntimeError(f"Open-Meteo rejected batched weather request (HTTP {error.code}): {body}") from error
             if attempt == 3:
-                raise RuntimeError(f"Open-Meteo request failed for {station_id} after 3 attempts (HTTP {error.code}): {body}") from error
+                raise RuntimeError(f"Open-Meteo batched weather request failed after 3 attempts (HTTP {error.code}): {body}") from error
         except Exception as error:
             if attempt == 3:
-                raise RuntimeError(f"Open-Meteo request failed for {station_id} after 3 attempts: {error}") from error
+                raise RuntimeError(f"Open-Meteo batched weather request failed after 3 attempts: {error}") from error
         wait_time = 2 * attempt
-        print(f"  Attempt {attempt} failed for {station_id}; retrying in {wait_time}s...")
+        print(f"  Batched weather attempt {attempt} failed; retrying in {wait_time}s...")
         time.sleep(wait_time)
-    raise RuntimeError(f"Open-Meteo request failed for {station_id}.")
+    raise RuntimeError("Open-Meteo batched weather request failed.")
 
 # COMMAND ----------
 # DBTITLE 1,High-Water Mark: Auto-Detect Full Load vs Incremental
@@ -113,26 +129,34 @@ else:
 # COMMAND ----------
 # DBTITLE 1,Fetch Multi-Site Weather with Retries & Raw Response Preservation
 all_weather_rows = []
-raw_api_responses = {}
+raw_api_responses = []
+station_ids = [station["station_id"] for station in weather_stations]
+latitudes = ",".join(str(station["latitude"]) for station in weather_stations)
+longitudes = ",".join(str(station["longitude"]) for station in weather_stations)
 
-for st in weather_stations:
-    station_id = st["station_id"]
-    lat = st["latitude"]
-    lon = st["longitude"]
-    print(f"Fetching weather for {st['name']} ({station_id})...")
-    
-    raw_api_responses[station_id] = []
-    for chunk_start, chunk_end in date_chunks(start_date_str, end_date_str):
-        params = {"latitude": lat, "longitude": lon, "start_date": chunk_start, "end_date": chunk_end,
-                  "hourly": vars_param, "timezone": "UTC"}
-        w_data = fetch_weather_chunk(ARCHIVE_BASE_URL, params, station_id)
-        raw_api_responses[station_id].append({
-            "request_params": params,
-            "fetched_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "response_envelope": w_data,
-        })
+for chunk_start, chunk_end in date_chunks(start_date_str, end_date_str):
+    params = {
+        "latitude": latitudes,
+        "longitude": longitudes,
+        "start_date": chunk_start,
+        "end_date": chunk_end,
+        "hourly": vars_param,
+        "timezone": "UTC",
+    }
+    print(f"Fetching all {len(weather_stations)} weather sites for {chunk_start} to {chunk_end} in one request...")
+    location_payloads = fetch_weather_chunk(ARCHIVE_BASE_URL, params)
+    raw_api_responses.append({
+        "station_ids": station_ids,
+        "request_params": params,
+        "fetched_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "response_envelope": location_payloads,
+    })
+    for st, w_data in zip(weather_stations, location_payloads):
+        station_id = st["station_id"]
+        lat = st["latitude"]
+        lon = st["longitude"]
         if w_data.get("error"):
-            raise RuntimeError(f"Open-Meteo rejected {station_id} request: {w_data.get('reason', 'unknown API error')}")
+            raise RuntimeError(f"Open-Meteo rejected {station_id} in the batched request: {w_data.get('reason', 'unknown API error')}")
         hourly = w_data.get("hourly", {})
         timestamps = hourly.get("time", [])
         for i, timestamp in enumerate(timestamps):
@@ -146,9 +170,9 @@ for st in weather_stations:
                 "wind_speed_10m": hourly.get("wind_speed_10m", [])[i] if i < len(hourly.get("wind_speed_10m", [])) else None,
                 "direct_normal_irradiance": hourly.get("direct_normal_irradiance", [])[i] if i < len(hourly.get("direct_normal_irradiance", [])) else None,
             })
-        time.sleep(0.5)
+    time.sleep(0.5)
 
-print(f"Total weather station hourly records extracted: {len(all_weather_rows)} across {len(raw_api_responses)} stations.")
+print(f"Total weather station hourly records extracted: {len(all_weather_rows)} across {len(raw_api_responses)} batched API requests.")
 
 # COMMAND ----------
 # DBTITLE 1,Land Raw to Volume & Append to Bronze Delta Table
